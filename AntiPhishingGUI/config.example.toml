@@ -1,0 +1,23 @@
+[imap]
+host = "imap.example.com"
+port = 993
+protocol = "imaps"
+username = "you@example.com"
+password = "請使用應用程式密碼"
+source_mailbox = "INBOX"
+phishing_mailbox = "Phishing"
+
+[detection]
+threshold = 5
+suspicious_sender_domains = ["evil.example"]
+trusted_sender_domains = []
+suspicious_keywords = ["verify", "urgent", "password", "login", "帳戶", "驗證", "緊急", "密碼"]
+external_word_image_score = 5
+
+[gui]
+check_interval_minutes = 10
+minimize_to_tray = true
+hide_taskbar_when_minimized = true
+start_minimized_to_tray = false
+# 可選：Noto Sans TC、微軟正黑體、Microsoft JhengHei，或本機 .ttf/.ttc/.otf 完整路徑。
+font_family = "Noto Sans TC"

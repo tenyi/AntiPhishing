@@ -1,0 +1,18 @@
+[imap]
+host = "imap.example.com"
+port = 993
+# 可選值：imaps 或 starttls
+protocol = "imaps"
+username = "you@example.com"
+password = "請改用應用程式密碼"
+source_mailbox = "INBOX"
+phishing_mailbox = "Phishing"
+
+[detection]
+# 建議先執行 --dry-run，依結果調整門檻與清單。
+threshold = 5
+suspicious_sender_domains = ["evil.example"]
+trusted_sender_domains = ["company.example"]
+suspicious_keywords = ["verify", "urgent", "password", "login", "帳戶", "驗證", "緊急", "密碼"]
+# Word 附件以外部圖片追蹤開啟行為時加分；預設 5，會單獨達到預設門檻。
+external_word_image_score = 5
