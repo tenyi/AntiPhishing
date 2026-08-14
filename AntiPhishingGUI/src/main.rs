@@ -18,6 +18,7 @@ use mailparse::{MailHeaderMap, parse_mail};
 use quick_xml::{Reader, events::Event};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use single_instance::SingleInstance;
 use tray_icon::{
     TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuItem},
@@ -132,6 +133,13 @@ fn load_app_icon() -> Result<(Vec<u8>, u32, u32)> {
 }
 
 fn main() -> eframe::Result {
+    let single_instance = SingleInstance::new("anti-phishing-gui-instance-lock").ok();
+    if let Some(ref instance) = single_instance {
+        if !instance.is_single() {
+            return Ok(());
+        }
+    }
+
     let (config, status) = match load_config() {
         Ok(config) => (config, "已載入設定檔。".into()),
         Err(error) => (Config::default(), format!("使用預設設定：{error}")),

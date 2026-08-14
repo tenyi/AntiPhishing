@@ -16,6 +16,7 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
 tray-icon = "0.24.2"
+single-instance = "0.3"
 zip = "9.0.0-pre.2"
 
 [build-dependencies]
