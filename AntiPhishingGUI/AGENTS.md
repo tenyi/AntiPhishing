@@ -6,10 +6,10 @@
 
 - **專案名稱**：AntiPhishing GUI (`anti-phishing-gui`)
 - **專案類型**：Windows 桌面 GUI 應用程式 (Rust 2024 edition)
-- **核心功能**：透過 IMAP 讀取指定日期的郵件，依關鍵字、寄件者網域、DOCX 外部圖片追蹤等偵測疑似釣魚郵件，並將達門檻者搬移至指定資料夾。
+- **核心功能**：透過 IMAP 讀取指定日期的郵件，逐封送地端 LLM（OpenAI 相容 API）判定是否釣魚，判定為真者搬移至指定資料夾；既有關鍵字/評分規則僅保留為 log 參考。
 - **技術棧**：
   - GUI 與系統：`eframe` (wgpu 圖形後端) + `tray-icon` (Windows 系統匣支援) + `single-instance` (防重複執行)
-  - 網路與解析：`imap`, `native-tls`, `mailparse`, `quick-xml`, `zip`
+  - 網路與解析：`imap`, `native-tls`, `mailparse`, `quick-xml`, `zip`, `ureq` (LLM HTTP 客戶端)
   - 設定：`toml`, `serde`
 
 ---

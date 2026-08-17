@@ -58,6 +58,7 @@ font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整
 - `hide_taskbar_when_minimized` 開啟後，縮小至系統匣時隱藏工作列項目。
 - `start_minimized_to_tray` 開啟後，下次啟動時不顯示主視窗，直接留在 Windows 系統匣。
 - `font_family` 可填 `Noto Sans TC`、`微軟正黑體`、`Microsoft JhengHei`，或 `.ttf/.ttc/.otf` 字型檔完整路徑；變更後需重新啟動程式。
+- `[llm]` 為地端 LLM 釣魚判定（OpenAI 相容 API，如 Ollama / LM Studio）；`base_url` 須以 `/v1` 結尾。`base_url` 或 `model` 留空即停用 LLM 判定，掃描不會搬移任何郵件；LLM 失敗時該封跳過並記於執行紀錄。
 
 程式不會開啟 Word 或連線下載附件內容；DOCX 僅檢查 ZIP 內的 Word relationship XML，找出外部 HTTP(S) 圖片連結。
 

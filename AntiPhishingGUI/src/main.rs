@@ -5,7 +5,7 @@ use std::{
     io::{Cursor, Read},
     path::Path,
     sync::Arc,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
 };
@@ -66,6 +66,9 @@ struct GuiConfig {
     check_interval_minutes: u64,
     #[serde(default = "default_true")]
     minimize_to_tray: bool,
+    /// 每輪掃描後、搬移前顯示確認對話框（預設 true）
+    #[serde(default = "default_true")]
+    confirm_before_move: bool,
     #[serde(default)]
     hide_taskbar_when_minimized: bool,
     #[serde(default)]
@@ -118,6 +121,7 @@ impl Default for Config {
             gui: GuiConfig {
                 check_interval_minutes: 10,
                 minimize_to_tray: true,
+                confirm_before_move: true,
                 hide_taskbar_when_minimized: true,
                 start_minimized_to_tray: false,
                 font_family: default_font_family(),
@@ -179,6 +183,12 @@ struct App {
     date_text: String,
     next_check: Instant,
     receiver: Option<Receiver<Vec<String>>>,
+    /// 搬移確認：worker 送出的待搬移清單（主旨、理由）
+    ask_receiver: Option<Receiver<Vec<(String, String)>>>,
+    /// 搬移確認：回覆 worker 的決定
+    reply_sender: Option<Sender<bool>>,
+    /// 目前顯示中的待確認清單與回覆 Sender
+    pending_move: Option<(Vec<(String, String)>, Sender<bool>)>,
     tray: Option<Tray>,
     allow_exit: bool,
     startup_scan_pending: bool,
@@ -208,6 +218,9 @@ impl App {
             logs: Vec::new(),
             date_text: Local::now().date_naive().to_string(),
             receiver: None,
+            ask_receiver: None,
+            reply_sender: None,
+            pending_move: None,
             tray,
             allow_exit: false,
             startup_scan_pending: true,
@@ -245,6 +258,11 @@ impl App {
         let config = self.config.clone();
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
+        // 搬移確認通道：worker 於掃描結束前送出待搬移清單並阻塞等待決定
+        let (ask, ask_receiver) = mpsc::channel::<Vec<(String, String)>>();
+        let (reply_sender, reply_receiver) = mpsc::channel::<bool>();
+        self.ask_receiver = Some(ask_receiver);
+        self.reply_sender = Some(reply_sender);
         self.status = if dates.len() > 1 {
             "啟動掃描前一日與今日郵件中…".into()
         } else if scheduled {
@@ -254,7 +272,7 @@ impl App {
         };
         thread::spawn(move || {
             let _ = sender.send(
-                scan_mail(&config, &dates)
+                scan_mail(&config, &dates, &ask, &reply_receiver)
                     .unwrap_or_else(|error| vec![format!("掃描失敗：{error:#}")]),
             );
         });
@@ -270,7 +288,21 @@ impl App {
                 self.logs.extend(results.iter().cloned());
                 self.status = results.last().cloned().unwrap_or_default();
                 self.receiver = None;
+                self.ask_receiver = None;
+                self.reply_sender = None;
+                self.pending_move = None;
                 self.next_check = Instant::now() + interval(&self.config);
+            }
+        }
+        // worker 請求確認搬移：先暫存，視窗顯示時由 Dialog 呈現（eframe 不允許在 logic 繪製 UI）
+        if let Some(ask) = &self.ask_receiver {
+            if let Ok(list) = ask.try_recv() {
+                if let Some(reply) = self.reply_sender.clone() {
+                    self.status =
+                        format!("掃描完成：{} 封疑似釣魚郵件，請確認是否搬移", list.len());
+                    self.pending_move = Some((list, reply));
+                }
+                // reply_sender 不存在時，worker 的 recv() 會失敗 → 視為跳過
             }
         }
         if self.receiver.is_none() && self.startup_scan_pending {
@@ -303,6 +335,49 @@ impl App {
         }
         ctx.request_repaint_after(Duration::from_secs(1));
     }
+
+    /// 搬移確認對話框；回傳 true 表示使用者已決定（全部搬移／全部跳過）。
+    fn show_move_confirmation(
+        ctx: &egui::Context,
+        list: &[(String, String)],
+        reply: &Sender<bool>,
+    ) -> bool {
+        let mut decided = false;
+        egui::Window::new("搬移確認")
+            .title_bar(false) // 無標題列＝無關閉鈕，只能以兩個按鈕決定
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_size([560.0, 360.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "以下 {} 封郵件被判定為疑似釣魚。要搬移至釣魚信箱嗎？",
+                    list.len()
+                ));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (subject, reason) in list {
+                            ui.strong(subject.as_str());
+                            ui.label(format!("理由：{reason}"));
+                            ui.add_space(8.0);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("全部搬移").clicked() {
+                        let _ = reply.send(true);
+                        decided = true;
+                    }
+                    if ui.button("全部跳過").clicked() {
+                        let _ = reply.send(false);
+                        decided = true;
+                    }
+                });
+            });
+        decided
+    }
 }
 
 impl eframe::App for App {
@@ -323,41 +398,104 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("AntiPhishing 郵件防護");
-            ui.label(&self.status);
-            ui.separator();
-            ui.heading("IMAP 信箱");
-            egui::Grid::new("imap").num_columns(2).show(ui, |ui| {
-                field(ui, "伺服器", &mut self.config.imap.host);
-                ui.label("連接埠");
-                ui.add(egui::DragValue::new(&mut self.config.imap.port).range(1..=65535));
-                ui.end_row();
-                ui.label("協定"); ui.horizontal(|ui| { ui.radio_value(&mut self.config.imap.protocol, "imaps".into(), "IMAPS"); ui.radio_value(&mut self.config.imap.protocol, "starttls".into(), "STARTTLS"); }); ui.end_row();
-                field(ui, "帳號", &mut self.config.imap.username); ui.end_row();
-                ui.label("密碼 / App Password"); ui.add(egui::TextEdit::singleline(&mut self.config.imap.password).password(true)); ui.end_row();
-                field(ui, "來源信箱", &mut self.config.imap.source_mailbox); ui.end_row();
-                field(ui, "釣魚信箱", &mut self.config.imap.phishing_mailbox); ui.end_row();
+        // 上方最多 2/3：設定區（可捲動，恆顯示垂直捲軸）
+        let settings_max = ui.available_height() * 2.0 / 3.0;
+        egui::ScrollArea::vertical()
+            .id_salt("settings_scroll_area")
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .max_height(settings_max)
+            .show(ui, |ui| {
+                ui.heading("AntiPhishing 郵件防護");
+                ui.label(&self.status);
+                ui.separator();
+                ui.heading("IMAP 信箱");
+                egui::Grid::new("imap").num_columns(2).show(ui, |ui| {
+                    field(ui, "伺服器", &mut self.config.imap.host);
+                    ui.label("連接埠");
+                    ui.add(egui::DragValue::new(&mut self.config.imap.port).range(1..=65535));
+                    ui.end_row();
+                    ui.label("協定");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.config.imap.protocol, "imaps".into(), "IMAPS");
+                        ui.radio_value(&mut self.config.imap.protocol, "starttls".into(), "STARTTLS");
+                    });
+                    ui.end_row();
+                    field(ui, "帳號", &mut self.config.imap.username);
+                    ui.end_row();
+                    ui.label("密碼 / App Password");
+                    ui.add(egui::TextEdit::singleline(&mut self.config.imap.password).password(true));
+                    ui.end_row();
+                    field(ui, "來源信箱", &mut self.config.imap.source_mailbox);
+                    ui.end_row();
+                    field(ui, "釣魚信箱", &mut self.config.imap.phishing_mailbox);
+                    ui.end_row();
+                });
+                ui.separator();
+                ui.heading("偵測規則");
+                ui.horizontal(|ui| {
+                    ui.label("判定門檻");
+                    ui.add(egui::DragValue::new(&mut self.config.detection.threshold).range(1..=100));
+                    ui.label("Word 外部圖片分數");
+                    ui.add(egui::DragValue::new(&mut self.config.detection.external_word_image_score).range(0..=100));
+                });
+                multiline(ui, "可疑寄件網域（每行一個）", &mut self.config.detection.suspicious_sender_domains);
+                multiline(ui, "信任寄件網域（每行一個）", &mut self.config.detection.trusted_sender_domains);
+                multiline(ui, "可疑關鍵字（每行一個）", &mut self.config.detection.suspicious_keywords);
+                ui.separator();
+                ui.heading("排程與系統匣");
+                ui.horizontal(|ui| {
+                    ui.label("每隔（分鐘）");
+                    ui.add(egui::DragValue::new(&mut self.config.gui.check_interval_minutes).range(1..=1440));
+                    ui.label(format!(
+                        "下次檢查：{} 秒後",
+                        self.next_check.saturating_duration_since(Instant::now()).as_secs()
+                    ));
+                });
+                ui.checkbox(&mut self.config.gui.minimize_to_tray, "關閉視窗時縮小至 Windows 系統匣");
+                ui.checkbox(&mut self.config.gui.hide_taskbar_when_minimized, "縮小至系統匣時隱藏工作列項目");
+                ui.checkbox(&mut self.config.gui.start_minimized_to_tray, "啟動時直接縮小至 Windows 系統匣（下次啟動生效）");
+                ui.checkbox(&mut self.config.gui.confirm_before_move, "搬移前先確認（全部搬移／全部跳過）");
+                ui.horizontal(|ui| {
+                    ui.label("中文字型（重啟後套用）");
+                    ui.text_edit_singleline(&mut self.config.gui.font_family);
+                });
+                ui.small("系統匣選單提供顯示視窗、立即掃描與結束程式。密碼會以明文儲存在 config.toml，請使用 App Password 並保護該檔案。");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("儲存設定").clicked() {
+                        self.save();
+                    }
+                    if ui.button("立即掃描指定日期").clicked() {
+                        self.start_scan(false);
+                    }
+                    ui.label("日期");
+                    ui.text_edit_singleline(&mut self.date_text);
+                });
             });
-            ui.separator(); ui.heading("偵測規則");
-            ui.horizontal(|ui| { ui.label("判定門檻"); ui.add(egui::DragValue::new(&mut self.config.detection.threshold).range(1..=100)); ui.label("Word 外部圖片分數"); ui.add(egui::DragValue::new(&mut self.config.detection.external_word_image_score).range(0..=100)); });
-            multiline(ui, "可疑寄件網域（每行一個）", &mut self.config.detection.suspicious_sender_domains);
-            multiline(ui, "信任寄件網域（每行一個）", &mut self.config.detection.trusted_sender_domains);
-            multiline(ui, "可疑關鍵字（每行一個）", &mut self.config.detection.suspicious_keywords);
-            ui.separator(); ui.heading("排程與系統匣");
-            ui.horizontal(|ui| { ui.label("每隔（分鐘）"); ui.add(egui::DragValue::new(&mut self.config.gui.check_interval_minutes).range(1..=1440)); ui.label(format!("下次檢查：{} 秒後", self.next_check.saturating_duration_since(Instant::now()).as_secs())); });
-            ui.checkbox(&mut self.config.gui.minimize_to_tray, "關閉視窗時縮小至 Windows 系統匣");
-            ui.checkbox(&mut self.config.gui.hide_taskbar_when_minimized, "縮小至系統匣時隱藏工作列項目");
-            ui.checkbox(&mut self.config.gui.start_minimized_to_tray, "啟動時直接縮小至 Windows 系統匣（下次啟動生效）");
-            ui.horizontal(|ui| {
-                ui.label("中文字型（重啟後套用）");
-                ui.text_edit_singleline(&mut self.config.gui.font_family);
+        // 下方 1/3：執行紀錄（恆顯示，最新優先）
+        ui.separator();
+        ui.heading("執行紀錄");
+        egui::ScrollArea::vertical()
+            .id_salt("logs_scroll_area")
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .max_height(ui.available_height())
+            .show(ui, |ui| {
+                if self.logs.is_empty() {
+                    ui.small("尚無執行紀錄");
+                } else {
+                    for log in self.logs.iter().rev().take(20) {
+                        ui.label(log);
+                    }
+                }
             });
-            ui.small("系統匣選單提供顯示視窗、立即掃描與結束程式。密碼會以明文儲存在 config.toml，請使用 App Password 並保護該檔案。");
-            ui.separator();
-            ui.horizontal(|ui| { if ui.button("儲存設定").clicked() { self.save(); } if ui.button("立即掃描指定日期").clicked() { self.start_scan(false); } ui.label("日期"); ui.text_edit_singleline(&mut self.date_text); });
-            if !self.logs.is_empty() { ui.separator(); ui.heading("執行紀錄"); egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| for log in self.logs.iter().rev().take(20) { ui.label(log); }); }
-        });
+        // 搬移確認對話框：使用者決定後清空，未決定則保留等下次繪製
+        if let Some((list, reply)) = self.pending_move.take() {
+            if !Self::show_move_confirmation(ui.ctx(), &list, &reply) {
+                self.pending_move = Some((list, reply));
+            }
+        }
     }
 }
 
@@ -680,9 +818,33 @@ fn llm_judge(
     parse_llm_verdict(content)
 }
 
-/// 掃描指定日期郵件：逐封送 LLM 判定，判定為釣魚者搬移至 phishing_mailbox。
+/// 搬移前確認：未啟用或無待搬移郵件 → 直接核准（與舊行為一致）；
+/// 否則向 UI 送出清單並阻塞等待決定；送出失敗（UI 已關閉）或無回覆 → 視為跳過（不搬移）。
+fn confirm_move(
+    enabled: bool,
+    pending: &[(u32, String, u32, String)],
+    ask: &mpsc::Sender<Vec<(String, String)>>,
+    reply: &mpsc::Receiver<bool>,
+) -> bool {
+    if !enabled || pending.is_empty() {
+        return true;
+    }
+    let list = pending
+        .iter()
+        .map(|(_, subject, _, reason)| (subject.clone(), reason.clone()))
+        .collect();
+    ask.send(list).is_ok() && reply.recv().unwrap_or(false)
+}
+
+/// 掃描指定日期郵件：逐封送 LLM 判定；判定為釣魚者先暫存，
+/// 該輪結束後依 `confirm_before_move` 向 UI 請求確認，核准才搬移至 phishing_mailbox。
 /// 回傳逐封 log 行（最後一行為總計）。LLM 未設定或判定失敗時不搬移。
-fn scan_mail(config: &Config, dates: &[NaiveDate]) -> Result<Vec<String>> {
+fn scan_mail(
+    config: &Config,
+    dates: &[NaiveDate],
+    ask: &mpsc::Sender<Vec<(String, String)>>,
+    reply: &mpsc::Receiver<bool>,
+) -> Result<Vec<String>> {
     let mut session = connect(&config.imap)?;
     session
         .select(&config.imap.source_mailbox)
@@ -690,7 +852,8 @@ fn scan_mail(config: &Config, dates: &[NaiveDate]) -> Result<Vec<String>> {
     let llm = llm_config(config);
     let mut lines: Vec<String> = Vec::new();
     let mut scanned = 0;
-    let mut moved = 0;
+    // 疑似釣魚郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
+    let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
     for date in dates {
         let uids = session
             .uid_search(format!("ON {}", date.format("%d-%b-%Y")))
@@ -715,12 +878,7 @@ fn scan_mail(config: &Config, dates: &[NaiveDate]) -> Result<Vec<String>> {
             };
             match llm_judge(llm_config, &from, &subject, &body, &targets) {
                 Ok(verdict) if verdict.is_phishing => {
-                    move_message(&mut session, uid, &config.imap.phishing_mailbox)?;
-                    moved += 1;
-                    lines.push(format!(
-                        "搬移〈{}〉（評分 {}；LLM：{}）",
-                        subject, score, verdict.reason
-                    ));
+                    pending.push((uid, subject.clone(), score, verdict.reason));
                 }
                 Ok(verdict) => {
                     lines.push(format!(
@@ -734,8 +892,28 @@ fn scan_mail(config: &Config, dates: &[NaiveDate]) -> Result<Vec<String>> {
             }
         }
     }
-    if moved > 0 {
-        session.expunge().context("刪除來源信箱中已搬移郵件失敗")?;
+    // 該輪結束、搬移前：依設定向 UI 請求確認；核准才搬移
+    let approve = confirm_move(config.gui.confirm_before_move, &pending, ask, reply);
+    let mut moved = 0;
+    if approve {
+        for (uid, subject, score, reason) in &pending {
+            move_message(&mut session, *uid, &config.imap.phishing_mailbox)?;
+            lines.push(format!(
+                "搬移〈{}〉（評分 {}；LLM：{}）",
+                subject, score, reason
+            ));
+            moved += 1;
+        }
+        if moved > 0 {
+            session.expunge().context("刪除來源信箱中已搬移郵件失敗")?;
+        }
+    } else {
+        for (_, subject, score, reason) in &pending {
+            lines.push(format!(
+                "跳過搬移〈{}〉（評分 {}；LLM：{}）",
+                subject, score, reason
+            ));
+        }
     }
     session.logout().ok();
     let scanned_dates = dates
@@ -747,9 +925,14 @@ fn scan_mail(config: &Config, dates: &[NaiveDate]) -> Result<Vec<String>> {
         lines.push(format!(
             "LLM 未設定（config.toml 的 [llm] base_url 或 model 為空）。{scanned_dates}：已掃描 {scanned} 封，未搬移。"
         ));
-    } else {
+    } else if approve {
         lines.push(format!(
             "{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封疑似釣魚郵件。"
+        ));
+    } else {
+        lines.push(format!(
+            "{scanned_dates}：已掃描 {scanned} 封，跳過搬移 {} 封疑似釣魚郵件。",
+            pending.len()
         ));
     }
     Ok(lines)
@@ -1074,5 +1257,69 @@ mod tests {
             &test_detection_config(),
         );
         assert!(!reasons.iter().any(|r| r.contains("品牌偽裝")));
+    }
+
+    // ===== 搬移確認 =====
+
+    #[test]
+    fn gui_confirm_before_move_defaults_to_true_when_absent() {
+        // 既有 config.toml 缺此欄位時，預設應為「要確認」
+        let gui: GuiConfig = toml::from_str("").expect("所有欄位皆有 serde 預設值");
+        assert!(gui.confirm_before_move);
+    }
+
+    #[test]
+    fn gui_confirm_before_move_can_be_disabled() {
+        let gui: GuiConfig = toml::from_str("confirm_before_move = false").expect("應可解析");
+        assert!(!gui.confirm_before_move);
+    }
+
+    #[test]
+    fn confirm_move_auto_approves_when_disabled_or_empty() {
+        let (ask, _ask_rx) = mpsc::channel::<Vec<(String, String)>>();
+        let (_reply_tx, reply_rx) = mpsc::channel::<bool>();
+        assert!(confirm_move(false, &[], &ask, &reply_rx));
+        let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
+        // 未啟用確認＝自動搬移（舊行為）
+        assert!(confirm_move(false, &pending, &ask, &reply_rx));
+        // 無待搬移郵件不需確認
+        assert!(confirm_move(true, &[], &ask, &reply_rx));
+    }
+
+    #[test]
+    fn confirm_move_rejects_when_ui_receiver_dropped() {
+        // UI 已關閉：send 失敗 → 視為跳過（不搬移）
+        let (ask, ask_rx) = mpsc::channel::<Vec<(String, String)>>();
+        drop(ask_rx);
+        let (_reply_tx, reply_rx) = mpsc::channel::<bool>();
+        let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
+        assert!(!confirm_move(true, &pending, &ask, &reply_rx));
+    }
+
+    #[test]
+    fn confirm_move_round_trip_approve() {
+        let (ask, ask_rx) = mpsc::channel::<Vec<(String, String)>>();
+        let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+        let pending = vec![(1, "主旨A".to_string(), 3, "理由A".to_string())];
+        let worker = thread::spawn(move || confirm_move(true, &pending, &ask, &reply_rx));
+        // 模擬 UI：收到清單後回覆核准
+        assert_eq!(
+            ask_rx.recv().expect("應收到待搬移清單"),
+            [("主旨A".to_string(), "理由A".to_string())]
+        );
+        reply_tx.send(true).expect("應可回覆");
+        assert!(worker.join().expect("worker 應結束"));
+    }
+
+    #[test]
+    fn confirm_move_round_trip_reject() {
+        let (ask, ask_rx) = mpsc::channel::<Vec<(String, String)>>();
+        let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+        let pending = vec![(1, "主旨A".to_string(), 3, "理由A".to_string())];
+        let worker = thread::spawn(move || confirm_move(true, &pending, &ask, &reply_rx));
+        // 模擬 UI：收到清單後回覆跳過
+        assert!(ask_rx.recv().is_ok());
+        reply_tx.send(false).expect("應可回覆");
+        assert!(!worker.join().expect("worker 應結束"));
     }
 }
