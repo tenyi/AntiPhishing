@@ -193,6 +193,10 @@ struct App {
     allow_exit: bool,
     startup_scan_pending: bool,
     hide_window_on_startup: bool,
+    /// 從 IMAP 伺服器取得的信箱清單（原始 UTF-7 名稱）
+    mailboxes: Vec<String>,
+    /// 背景取得信箱清單的 receiver
+    mailbox_receiver: Option<Receiver<Result<Vec<String>>>>,
 }
 
 struct Tray {
@@ -225,7 +229,30 @@ impl App {
             allow_exit: false,
             startup_scan_pending: true,
             hide_window_on_startup,
+            mailboxes: Vec::new(),
+            mailbox_receiver: None,
         }
+    }
+
+    fn fetch_mailboxes(&mut self) {
+        if self.mailbox_receiver.is_some() {
+            return;
+        }
+        if self.config.imap.host.trim().is_empty()
+            || self.config.imap.username.trim().is_empty()
+            || self.config.imap.password.trim().is_empty()
+        {
+            self.status = "請先填寫 IMAP 伺服器、帳號及密碼以取得信箱清單。".into();
+            return;
+        }
+        let config = self.config.imap.clone();
+        let (tx, rx) = mpsc::channel();
+        self.mailbox_receiver = Some(rx);
+        self.status = "連線取得信箱清單中…".into();
+        thread::spawn(move || {
+            let res = fetch_mailbox_list(&config);
+            let _ = tx.send(res);
+        });
     }
 
     fn save(&mut self) {
@@ -302,7 +329,22 @@ impl App {
                         format!("掃描完成：{} 封疑似釣魚郵件，請確認是否搬移", list.len());
                     self.pending_move = Some((list, reply));
                 }
-                // reply_sender 不存在時，worker 的 recv() 會失敗 → 視為跳過
+            }
+        }
+        // 處理信箱清單接收
+        if let Some(receiver) = &self.mailbox_receiver {
+            if let Ok(result) = receiver.try_recv() {
+                match result {
+                    Ok(mailboxes) => {
+                        let count = mailboxes.len();
+                        self.mailboxes = mailboxes;
+                        self.status = format!("已成功取得 {count} 個信箱。");
+                    }
+                    Err(err) => {
+                        self.status = format!("取得信箱清單失敗：{err:#}");
+                    }
+                }
+                self.mailbox_receiver = None;
             }
         }
         if self.receiver.is_none() && self.startup_scan_pending {
@@ -426,9 +468,37 @@ impl eframe::App for App {
                     ui.label("密碼 / App Password");
                     ui.add(egui::TextEdit::singleline(&mut self.config.imap.password).password(true));
                     ui.end_row();
-                    field(ui, "來源信箱", &mut self.config.imap.source_mailbox);
+                    ui.label("信箱清單");
+                    ui.horizontal(|ui| {
+                        let is_fetching = self.mailbox_receiver.is_some();
+                        let btn_text = if is_fetching {
+                            "取得中…"
+                        } else {
+                            "從伺服器取得信箱清單"
+                        };
+                        if ui.add_enabled(!is_fetching, egui::Button::new(btn_text)).clicked() {
+                            self.fetch_mailboxes();
+                        }
+                        if !self.mailboxes.is_empty() {
+                            ui.label(format!("（已載入 {} 個信箱）", self.mailboxes.len()));
+                        }
+                    });
                     ui.end_row();
-                    field(ui, "釣魚信箱", &mut self.config.imap.phishing_mailbox);
+                    mailbox_field(
+                        ui,
+                        "來源信箱",
+                        "source_mailbox_combo",
+                        &mut self.config.imap.source_mailbox,
+                        &self.mailboxes,
+                    );
+                    ui.end_row();
+                    mailbox_field(
+                        ui,
+                        "釣魚信箱",
+                        "phishing_mailbox_combo",
+                        &mut self.config.imap.phishing_mailbox,
+                        &self.mailboxes,
+                    );
                     ui.end_row();
                 });
                 ui.separator();
@@ -502,6 +572,44 @@ impl eframe::App for App {
 fn field(ui: &mut egui::Ui, name: &str, value: &mut String) {
     ui.label(name);
     ui.text_edit_singleline(value);
+}
+
+fn mailbox_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    combo_id: &str,
+    selected: &mut String,
+    mailboxes: &[String],
+) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        if !mailboxes.is_empty() {
+            let current_display = if selected.is_empty() {
+                "（請選擇）".to_string()
+            } else {
+                let decoded = decode_imap_utf7(selected);
+                if decoded == *selected {
+                    selected.clone()
+                } else {
+                    format!("{decoded} ({selected})")
+                }
+            };
+            egui::ComboBox::from_id_salt(combo_id)
+                .selected_text(current_display)
+                .show_ui(ui, |ui| {
+                    for mb in mailboxes {
+                        let decoded = decode_imap_utf7(mb);
+                        let text = if decoded == *mb {
+                            mb.clone()
+                        } else {
+                            format!("{decoded} ({mb})")
+                        };
+                        ui.selectable_value(selected, mb.clone(), text);
+                    }
+                });
+        }
+        ui.text_edit_singleline(selected);
+    });
 }
 fn multiline(ui: &mut egui::Ui, label: &str, items: &mut Vec<String>) {
     ui.label(label);
@@ -963,6 +1071,99 @@ fn move_message(session: &mut Session<imap::Connection>, uid: u32, target: &str)
     session.uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")?;
     Ok(())
 }
+
+/// 從 IMAP 伺服器取得所有 mailbox 清單（原始名稱）。
+fn fetch_mailbox_list(config: &ImapConfig) -> Result<Vec<String>> {
+    let mut session = connect(config)?;
+    let names = session
+        .list(Some(""), Some("*"))
+        .context("無法取得信箱清單")?;
+    let mut list: Vec<String> = names.iter().map(|n| n.name().to_string()).collect();
+    session.logout().ok();
+    list.sort();
+    list.dedup();
+    Ok(list)
+}
+
+/// 將 IMAP Modified Base64 解碼為 bytes。
+/// IMAP Modified Base64 使用 ',' 取代 '/'，且不含 '=' padding。
+fn imap_modified_base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut table = [255u8; 256];
+    for (i, &b) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+"
+        .iter()
+        .enumerate()
+    {
+        table[b as usize] = i as u8;
+    }
+    table[b',' as usize] = 63;
+    table[b'/' as usize] = 63;
+
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'=' && !b.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0;
+
+    for &b in &clean {
+        let val = table[b as usize];
+        if val == 255 {
+            return None;
+        }
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// 將 UTF-16BE bytes 轉換為 UTF-8 String。
+fn utf16be_bytes_to_string(bytes: &[u8]) -> String {
+    let mut u16_vec = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        u16_vec.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    String::from_utf16_lossy(&u16_vec)
+}
+
+/// 將 IMAP modified UTF-7 字串解碼為 UTF-8 Unicode 字串（例如將 Mail2000 的 &...- 解回中文）。
+pub fn decode_imap_utf7(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+
+    while let Some(start_idx) = rest.find('&') {
+        result.push_str(&rest[..start_idx]);
+        let after_amp = &rest[start_idx + 1..];
+        if let Some(end_idx) = after_amp.find('-') {
+            let inner = &after_amp[..end_idx];
+            if inner.is_empty() {
+                // "&-" 表示字元 '&'
+                result.push('&');
+            } else if let Some(bytes) = imap_modified_base64_decode(inner) {
+                result.push_str(&utf16be_bytes_to_string(&bytes));
+            } else {
+                // 解碼失敗時保留原始字串
+                result.push('&');
+                result.push_str(inner);
+                result.push('-');
+            }
+            rest = &after_amp[end_idx + 1..];
+        } else {
+            // 沒有找到結尾 '-'，保留剩餘字串
+            result.push('&');
+            result.push_str(after_amp);
+            rest = "";
+            break;
+        }
+    }
+    result.push_str(rest);
+    result
+}
 /// 常見快遞品牌及其官方網域（小寫）：用於偵測 From 顯示名稱偽裝。
 const BRAND_OFFICIAL_DOMAINS: [(&str, &str); 3] = [
     ("dhl", "dhl.com"),
@@ -1321,5 +1522,41 @@ mod tests {
         assert!(ask_rx.recv().is_ok());
         reply_tx.send(false).expect("應可回覆");
         assert!(!worker.join().expect("worker 應結束"));
+    }
+
+    // ===== IMAP UTF-7 解碼測試 =====
+
+    #[test]
+    fn decodes_plain_ascii_mailbox_names() {
+        assert_eq!(decode_imap_utf7("INBOX"), "INBOX");
+        assert_eq!(decode_imap_utf7("Sent Items"), "Sent Items");
+        assert_eq!(decode_imap_utf7("Drafts/2026"), "Drafts/2026");
+    }
+
+    #[test]
+    fn decodes_ampersand_escape() {
+        assert_eq!(decode_imap_utf7("&-"), "&");
+        assert_eq!(decode_imap_utf7("a&-b"), "a&b");
+    }
+
+    #[test]
+    fn decodes_utf7_chinese_mailbox_names() {
+        // "垃圾信件" -> &V4NXPk,hTvb-
+        assert_eq!(decode_imap_utf7("&V4NXPk,hTvb-"), "垃圾信件");
+        // 中英路徑組合
+        assert_eq!(decode_imap_utf7("INBOX/&V4NXPk,hTvb-"), "INBOX/垃圾信件");
+        // 多個區段
+        assert_eq!(
+            decode_imap_utf7("&V4NXPk,hTvb-/&V4NXPk,hTvb-"),
+            "垃圾信件/垃圾信件"
+        );
+    }
+
+    #[test]
+    fn handles_malformed_utf7_gracefully() {
+        // 沒有結尾 '-'
+        assert_eq!(decode_imap_utf7("&V4NX"), "&V4NX");
+        // 空字串
+        assert_eq!(decode_imap_utf7(""), "");
     }
 }
