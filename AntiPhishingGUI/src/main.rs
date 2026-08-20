@@ -176,6 +176,28 @@ fn main() -> eframe::Result {
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingMoveMail {
+    uid: u32,
+    subject: String,
+    score: u32,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct MoveCandidateItem {
+    uid: u32,
+    subject: String,
+    score: u32,
+    reason: String,
+    selected: bool,
+}
+
+struct PendingMoveDialog {
+    candidates: Vec<MoveCandidateItem>,
+    reply: Sender<Vec<u32>>,
+}
+
 struct App {
     config: Config,
     status: String,
@@ -183,12 +205,12 @@ struct App {
     date_text: String,
     next_check: Instant,
     receiver: Option<Receiver<Vec<String>>>,
-    /// 搬移確認：worker 送出的待搬移清單（主旨、理由）
-    ask_receiver: Option<Receiver<Vec<(String, String)>>>,
-    /// 搬移確認：回覆 worker 的決定
-    reply_sender: Option<Sender<bool>>,
-    /// 目前顯示中的待確認清單與回覆 Sender
-    pending_move: Option<(Vec<(String, String)>, Sender<bool>)>,
+    /// 搬移確認：worker 送出的待搬移清單（uid、主旨、評分、理由）
+    ask_receiver: Option<Receiver<Vec<PendingMoveMail>>>,
+    /// 搬移確認：回覆 worker 決定搬移的 uid 清單
+    reply_sender: Option<Sender<Vec<u32>>>,
+    /// 目前顯示中的待確認對話框狀態
+    pending_move: Option<PendingMoveDialog>,
     tray: Option<Tray>,
     allow_exit: bool,
     startup_scan_pending: bool,
@@ -286,8 +308,8 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         // 搬移確認通道：worker 於掃描結束前送出待搬移清單並阻塞等待決定
-        let (ask, ask_receiver) = mpsc::channel::<Vec<(String, String)>>();
-        let (reply_sender, reply_receiver) = mpsc::channel::<bool>();
+        let (ask, ask_receiver) = mpsc::channel::<Vec<PendingMoveMail>>();
+        let (reply_sender, reply_receiver) = mpsc::channel::<Vec<u32>>();
         self.ask_receiver = Some(ask_receiver);
         self.reply_sender = Some(reply_sender);
         self.status = if dates.len() > 1 {
@@ -325,9 +347,31 @@ impl App {
         if let Some(ask) = &self.ask_receiver {
             if let Ok(list) = ask.try_recv() {
                 if let Some(reply) = self.reply_sender.clone() {
-                    self.status =
-                        format!("掃描完成：{} 封疑似釣魚郵件，請確認是否搬移", list.len());
-                    self.pending_move = Some((list, reply));
+                    self.status = format!(
+                        "掃描完成：{} 封疑似釣魚／惡意廣告郵件，請確認是否隔離",
+                        list.len()
+                    );
+                    let candidates = list
+                        .into_iter()
+                        .map(|m| MoveCandidateItem {
+                            uid: m.uid,
+                            subject: m.subject,
+                            score: m.score,
+                            reason: m.reason,
+                            selected: true,
+                        })
+                        .collect();
+                    self.pending_move = Some(PendingMoveDialog { candidates, reply });
+                    // 偵測到疑似釣魚／惡意廣告郵件需確認時：解除系統匣縮小/隱藏狀態，顯示視窗並置中螢幕
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Critical,
+                    ));
+                    if let Some(cmd) = ViewportCommand::center_on_screen(ctx) {
+                        ctx.send_viewport_cmd(cmd);
+                    }
                 }
             }
         }
@@ -363,7 +407,11 @@ impl App {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == show_id {
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    if let Some(cmd) = ViewportCommand::center_on_screen(ctx) {
+                        ctx.send_viewport_cmd(cmd);
+                    }
                 }
                 if event.id == scan_id {
                     self.date_text = Local::now().date_naive().to_string();
@@ -378,42 +426,169 @@ impl App {
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
-    /// 搬移確認對話框；回傳 true 表示使用者已決定（全部搬移／全部跳過）。
-    fn show_move_confirmation(
-        ctx: &egui::Context,
-        list: &[(String, String)],
-        reply: &Sender<bool>,
-    ) -> bool {
+    /// 搬移確認對話框；回傳 true 表示使用者已做出決定（隔離選取項／全部跳過）。
+    fn show_move_confirmation(ctx: &egui::Context, dialog: &mut PendingMoveDialog) -> bool {
         let mut decided = false;
-        egui::Window::new("搬移確認")
-            .title_bar(false) // 無標題列＝無關閉鈕，只能以兩個按鈕決定
+
+        // 繪製半透明全螢幕暗色背景遮罩，突顯對話框
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("modal_backdrop"),
+        ));
+        let screen_rect = ctx
+            .input(|i| i.viewport().inner_rect)
+            .unwrap_or(egui::Rect::EVERYTHING);
+        painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(170));
+
+        let frame = egui::Frame::default()
+            .fill(egui::Color32::from_rgb(32, 34, 38))
+            .inner_margin(egui::Margin::same(20))
+            .corner_radius(8)
+            .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(230, 80, 80)))
+            .shadow(egui::Shadow {
+                offset: [0, 8],
+                blur: 16,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(180),
+            });
+
+        egui::Window::new("隔離確認")
+            .title_bar(false) // 無標題列＝無關閉鈕，只能以按鈕決定
             .collapsible(false)
             .resizable(false)
+            .frame(frame)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_size([560.0, 360.0])
+            .default_size([650.0, 460.0])
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "以下 {} 封郵件被判定為疑似釣魚。要搬移至釣魚信箱嗎？",
-                    list.len()
-                ));
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("⚠️ 偵測到疑似釣魚／惡意廣告郵件！")
+                            .size(22.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(240, 80, 80)),
+                    );
+                });
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "本次掃描共發現 {} 封疑似釣魚／惡意廣告郵件，請勾選要隔離（搬移至指定信箱）的項目，未勾選的郵件將保留：",
+                        dialog.candidates.len()
+                    ))
+                    .size(15.0)
+                    .strong(),
+                );
+
+                // 批次勾選快捷按鈕列
+                ui.horizontal(|ui| {
+                    if ui.button("全選").clicked() {
+                        for item in &mut dialog.candidates {
+                            item.selected = true;
+                        }
+                    }
+                    if ui.button("全不選").clicked() {
+                        for item in &mut dialog.candidates {
+                            item.selected = false;
+                        }
+                    }
+                    if ui.button("反選").clicked() {
+                        for item in &mut dialog.candidates {
+                            item.selected = !item.selected;
+                        }
+                    }
+                    let selected_count = dialog.candidates.iter().filter(|i| i.selected).count();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "（已選取 {} / {} 封）",
+                            selected_count,
+                            dialog.candidates.len()
+                        ))
+                        .color(egui::Color32::LIGHT_GRAY),
+                    );
+                });
+
                 ui.separator();
+
                 egui::ScrollArea::vertical()
-                    .max_height(240.0)
+                    .max_height(250.0)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (subject, reason) in list {
-                            ui.strong(subject.as_str());
-                            ui.label(format!("理由：{reason}"));
-                            ui.add_space(8.0);
+                        for (idx, item) in dialog.candidates.iter_mut().enumerate() {
+                            let item_frame = egui::Frame::group(ui.style())
+                                .inner_margin(egui::Margin::symmetric(12, 8))
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if item.selected {
+                                        egui::Color32::from_rgb(230, 80, 80)
+                                    } else {
+                                        egui::Color32::from_white_alpha(30)
+                                    },
+                                ));
+
+                            item_frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut item.selected, "");
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}. 主旨：{}（評分：{}）",
+                                                idx + 1,
+                                                item.subject,
+                                                item.score
+                                            ))
+                                            .size(15.0)
+                                            .strong(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!("   理由：{}", item.reason))
+                                                .size(14.0)
+                                                .color(egui::Color32::from_rgb(230, 170, 70)),
+                                        );
+                                    });
+                                });
+                            });
+                            ui.add_space(4.0);
                         }
                     });
+
                 ui.separator();
+
                 ui.horizontal(|ui| {
-                    if ui.button("全部搬移").clicked() {
-                        let _ = reply.send(true);
+                    let selected_count = dialog.candidates.iter().filter(|i| i.selected).count();
+                    let move_btn = egui::Button::new(
+                        egui::RichText::new(format!("  🚨 隔離選取郵件 ({} 封)  ", selected_count))
+                            .size(16.0)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(if selected_count > 0 {
+                        egui::Color32::from_rgb(180, 40, 40)
+                    } else {
+                        egui::Color32::from_rgb(100, 100, 100)
+                    })
+                    .min_size(egui::vec2(220.0, 38.0));
+
+                    if ui.add_enabled(selected_count > 0, move_btn).clicked() {
+                        let selected_uids: Vec<u32> = dialog
+                            .candidates
+                            .iter()
+                            .filter(|i| i.selected)
+                            .map(|i| i.uid)
+                            .collect();
+                        let _ = dialog.reply.send(selected_uids);
                         decided = true;
                     }
-                    if ui.button("全部跳過").clicked() {
-                        let _ = reply.send(false);
+
+                    ui.add_space(12.0);
+
+                    let skip_btn =
+                        egui::Button::new(egui::RichText::new("  全部跳過（不隔離）  ").size(15.0))
+                            .min_size(egui::vec2(160.0, 38.0));
+
+                    if ui.add(skip_btn).clicked() {
+                        let _ = dialog.reply.send(Vec::new());
                         decided = true;
                     }
                 });
@@ -525,7 +700,7 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.config.gui.minimize_to_tray, "關閉視窗時縮小至 Windows 系統匣");
                 ui.checkbox(&mut self.config.gui.hide_taskbar_when_minimized, "縮小至系統匣時隱藏工作列項目");
                 ui.checkbox(&mut self.config.gui.start_minimized_to_tray, "啟動時直接縮小至 Windows 系統匣（下次啟動生效）");
-                ui.checkbox(&mut self.config.gui.confirm_before_move, "搬移前先確認（全部搬移／全部跳過）");
+                ui.checkbox(&mut self.config.gui.confirm_before_move, "搬移前先確認（可個別選取要隔離的郵件）");
                 ui.horizontal(|ui| {
                     ui.label("中文字型（重啟後套用）");
                     ui.text_edit_singleline(&mut self.config.gui.font_family);
@@ -561,9 +736,9 @@ impl eframe::App for App {
                 }
             });
         // 搬移確認對話框：使用者決定後清空，未決定則保留等下次繪製
-        if let Some((list, reply)) = self.pending_move.take() {
-            if !Self::show_move_confirmation(ui.ctx(), &list, &reply) {
-                self.pending_move = Some((list, reply));
+        if let Some(mut dialog) = self.pending_move.take() {
+            if !Self::show_move_confirmation(ui.ctx(), &mut dialog) {
+                self.pending_move = Some(dialog);
             }
         }
     }
@@ -755,8 +930,15 @@ fn llm_config(config: &Config) -> Option<LlmConfig> {
     Some(config.llm.clone())
 }
 
-/// 送 LLM 判斷的 system 提示：要求嚴格 JSON 輸出，不確定一律判 false。
-const LLM_SYSTEM_PROMPT: &str = "你是郵件安全判官。根據使用者提供的郵件內容，判斷該郵件是否為釣魚、詐欺或詐騙郵件。高風險訊號包括：偽裝機構（寄件網域非其所稱品牌如 DHL、FedEx、快遞、銀行的官方網域）、要求付款或繳費（關稅、手續費、驗證費）、要求提供帳號密碼、緊急施壓、可疑連結、附件追蹤、內含 QR code 或要求用手機掃描（quishing）、籠統稱呼（如「親愛的顧客」）搭配假單號或要求更新地址/電話。僅輸出嚴格 JSON，不要任何其他文字：{\"is_phishing\": true 或 false, \"reason\": \"簡短理由\"}。若證據不足或不確定，is_phishing 必須為 false。";
+/// 送 LLM 判斷的 system 提示：要求嚴格 JSON 輸出，判定釣魚/詐欺/惡意行銷廣告/垃圾推銷/仿冒品牌。
+const LLM_SYSTEM_PROMPT: &str = "你是郵件安全判官。根據使用者提供的郵件內容，判斷該郵件是否為「釣魚、詐欺、詐騙郵件」或「惡意行銷廣告、垃圾推銷、仿冒知名品牌或販賣一般性物品的垃圾廣告郵件」。\
+高風險與排除目標訊號包括：\
+1. 惡意行銷與垃圾廣告：未經請求的推銷廣告、仿冒知名品牌促銷、販賣一般性物品或商品（如香薰瀑布、健康器材、保健品、手錶名品等）、含可疑轉址或假退訂連結（Opt Out）、寄件者與商品內容不合的垃圾郵件。\
+2. 偽裝機構或品牌：寄件網域非其所稱品牌（如 DHL、FedEx、快遞、銀行或知名企業）的官方網域。\
+3. 詐騙與個資竊取：要求付款或繳費（關稅、手續費、驗證費）、要求提供帳號密碼、緊急施壓、可疑連結、附件追蹤、內含 QR code 或要求用手機掃描（quishing）、籠統稱呼（如「親愛的顧客」）搭配假單號或要求更新地址/電話。\
+\
+僅輸出嚴格 JSON，不要任何其他文字：{\"is_phishing\": true 或 false, \"reason\": \"簡短理由\"}。\
+只要符合上述釣魚、詐騙或惡意推銷廣告/垃圾信特徵，is_phishing 必須為 true；若為正常商務或私人往來郵件（非垃圾廣告與釣魚），is_phishing 必須為 false。若證據不足或不確定，is_phishing 設為 false。";
 
 /// 組裝送 LLM 的郵件內容：From/Subject/內文（截斷），並附 Word 外部圖片提示。
 fn llm_user_prompt(
@@ -906,15 +1088,43 @@ fn llm_judge(
         ]
     });
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    // ureq 3.x 的逾時設在 Agent 上（timeout_global 涵蓋整個請求）
+    // ureq 3.x 的逾時設在 Agent 上；max_redirects(0) 避免 POST 被自動重定向時拋出 redirect failed
     let agent_config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(config.timeout_secs)))
+        .max_redirects(0)
+        .http_status_as_error(false)
         .build();
     let agent = ureq::Agent::new_with_config(agent_config);
     let mut response = agent
         .post(&url)
         .send_json(payload)
         .map_err(|error| anyhow::anyhow!("LLM 請求失敗：{error}"))?;
+
+    let status = response.status();
+    if (300..=399).contains(&status.as_u16()) {
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("未知");
+        anyhow::bail!(
+            "LLM 伺服器回傳重定向 (HTTP {}) 至 {}，請檢查 [llm].base_url 設定",
+            status.as_u16(),
+            location
+        );
+    }
+    if !status.is_success() {
+        let err_body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|_| "(無法讀取回應內文)".into());
+        anyhow::bail!(
+            "LLM 伺服器回傳錯誤 (HTTP {})：{}",
+            status.as_u16(),
+            err_body
+        );
+    }
+
     let response: serde_json::Value = response
         .body_mut()
         .read_json()
@@ -926,32 +1136,41 @@ fn llm_judge(
     parse_llm_verdict(content)
 }
 
-/// 搬移前確認：未啟用或無待搬移郵件 → 直接核准（與舊行為一致）；
-/// 否則向 UI 送出清單並阻塞等待決定；送出失敗（UI 已關閉）或無回覆 → 視為跳過（不搬移）。
+/// 搬移前確認：未啟用或無待搬移郵件 → 直接核准全部 uid（與舊行為一致）；
+/// 否則向 UI 送出清單並阻塞等待決定；送出失敗（UI 已關閉）或無回覆 → 視為跳過（回傳空清單，不搬移）。
 fn confirm_move(
     enabled: bool,
     pending: &[(u32, String, u32, String)],
-    ask: &mpsc::Sender<Vec<(String, String)>>,
-    reply: &mpsc::Receiver<bool>,
-) -> bool {
+    ask: &mpsc::Sender<Vec<PendingMoveMail>>,
+    reply: &mpsc::Receiver<Vec<u32>>,
+) -> Vec<u32> {
     if !enabled || pending.is_empty() {
-        return true;
+        return pending.iter().map(|(uid, _, _, _)| *uid).collect();
     }
     let list = pending
         .iter()
-        .map(|(_, subject, _, reason)| (subject.clone(), reason.clone()))
+        .map(|(uid, subject, score, reason)| PendingMoveMail {
+            uid: *uid,
+            subject: subject.clone(),
+            score: *score,
+            reason: reason.clone(),
+        })
         .collect();
-    ask.send(list).is_ok() && reply.recv().unwrap_or(false)
+    if ask.send(list).is_ok() {
+        reply.recv().unwrap_or_default()
+    } else {
+        Vec::new()
+    }
 }
 
-/// 掃描指定日期郵件：逐封送 LLM 判定；判定為釣魚者先暫存，
-/// 該輪結束後依 `confirm_before_move` 向 UI 請求確認，核准才搬移至 phishing_mailbox。
+/// 掃描指定日期郵件：逐封送 LLM 判定；判定為釣魚/惡意廣告者先暫存，
+/// 該輪結束後依 `confirm_before_move` 向 UI 請求確認，核准之個別郵件才搬移至 phishing_mailbox。
 /// 回傳逐封 log 行（最後一行為總計）。LLM 未設定或判定失敗時不搬移。
 fn scan_mail(
     config: &Config,
     dates: &[NaiveDate],
-    ask: &mpsc::Sender<Vec<(String, String)>>,
-    reply: &mpsc::Receiver<bool>,
+    ask: &mpsc::Sender<Vec<PendingMoveMail>>,
+    reply: &mpsc::Receiver<Vec<u32>>,
 ) -> Result<Vec<String>> {
     let mut session = connect(&config.imap)?;
     session
@@ -960,7 +1179,7 @@ fn scan_mail(
     let llm = llm_config(config);
     let mut lines: Vec<String> = Vec::new();
     let mut scanned = 0;
-    // 疑似釣魚郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
+    // 疑似釣魚/惡意廣告郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
     for date in dates {
         let uids = session
@@ -1000,28 +1219,27 @@ fn scan_mail(
             }
         }
     }
-    // 該輪結束、搬移前：依設定向 UI 請求確認；核准才搬移
-    let approve = confirm_move(config.gui.confirm_before_move, &pending, ask, reply);
+    // 該輪結束、搬移前：依設定向 UI 請求確認；核准選取的 uid 才搬移
+    let approved_uids = confirm_move(config.gui.confirm_before_move, &pending, ask, reply);
+    let approved_set: std::collections::HashSet<u32> = approved_uids.into_iter().collect();
     let mut moved = 0;
-    if approve {
-        for (uid, subject, score, reason) in &pending {
+    for (uid, subject, score, reason) in &pending {
+        if approved_set.contains(uid) {
             move_message(&mut session, *uid, &config.imap.phishing_mailbox)?;
             lines.push(format!(
                 "搬移〈{}〉（評分 {}；LLM：{}）",
                 subject, score, reason
             ));
             moved += 1;
-        }
-        if moved > 0 {
-            session.expunge().context("刪除來源信箱中已搬移郵件失敗")?;
-        }
-    } else {
-        for (_, subject, score, reason) in &pending {
+        } else {
             lines.push(format!(
                 "跳過搬移〈{}〉（評分 {}；LLM：{}）",
                 subject, score, reason
             ));
         }
+    }
+    if moved > 0 {
+        session.expunge().context("刪除來源信箱中已搬移郵件失敗")?;
     }
     session.logout().ok();
     let scanned_dates = dates
@@ -1033,15 +1251,17 @@ fn scan_mail(
         lines.push(format!(
             "LLM 未設定（config.toml 的 [llm] base_url 或 model 為空）。{scanned_dates}：已掃描 {scanned} 封，未搬移。"
         ));
-    } else if approve {
-        lines.push(format!(
-            "{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封疑似釣魚郵件。"
-        ));
     } else {
-        lines.push(format!(
-            "{scanned_dates}：已掃描 {scanned} 封，跳過搬移 {} 封疑似釣魚郵件。",
-            pending.len()
-        ));
+        let skipped = pending.len().saturating_sub(moved);
+        if skipped > 0 {
+            lines.push(format!(
+                "{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封，保留 {skipped} 封疑似釣魚／惡意廣告郵件。"
+            ));
+        } else {
+            lines.push(format!(
+                "{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封疑似釣魚／惡意廣告郵件。"
+            ));
+        }
     }
     Ok(lines)
 }
@@ -1348,6 +1568,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_spam_marketing_json_verdict() {
+        let verdict =
+            parse_llm_verdict(r#"{"is_phishing": true, "reason": "惡意行銷廣告與推銷商品"}"#)
+                .expect("純 JSON 應可解析");
+        assert!(verdict.is_phishing);
+        assert_eq!(verdict.reason, "惡意行銷廣告與推銷商品");
+    }
+
+    #[test]
+    fn extracts_spam_eml_content() {
+        if let Ok(bytes) = std::fs::read("Spam.eml") {
+            let mail = parse_mail(&bytes).expect("Spam.eml 應可解析");
+            let from = mail.headers.get_first_value("From").unwrap_or_default();
+            let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
+            let (llm_body, _) = extract_body_text(&mail);
+            assert!(from.contains("fote-hotel.biz") || from.contains("Waterfal"));
+            assert!(subject.contains("裝飾") || subject.contains("健康"));
+            assert!(llm_body.contains("Spirual") || llm_body.contains("香薰"));
+            let prompt = llm_user_prompt(&from, &subject, &llm_body, 6000, &[]);
+            assert!(prompt.contains("From:"));
+            assert!(prompt.contains("Subject:"));
+            assert!(prompt.contains("Body:"));
+        }
+    }
+
+    #[test]
     fn parses_fenced_json_verdict() {
         let text = "```json\n{\"is_phishing\": false, \"reason\": \"正常\"}\n```";
         let verdict = parse_llm_verdict(text).expect("圍欄 JSON 應可解析");
@@ -1477,51 +1723,59 @@ mod tests {
 
     #[test]
     fn confirm_move_auto_approves_when_disabled_or_empty() {
-        let (ask, _ask_rx) = mpsc::channel::<Vec<(String, String)>>();
-        let (_reply_tx, reply_rx) = mpsc::channel::<bool>();
-        assert!(confirm_move(false, &[], &ask, &reply_rx));
+        let (ask, _ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
+        let (_reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
+        assert_eq!(confirm_move(false, &[], &ask, &reply_rx), Vec::<u32>::new());
         let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
-        // 未啟用確認＝自動搬移（舊行為）
-        assert!(confirm_move(false, &pending, &ask, &reply_rx));
+        // 未啟用確認＝自動搬移（核准全部 uid）
+        assert_eq!(confirm_move(false, &pending, &ask, &reply_rx), vec![1]);
         // 無待搬移郵件不需確認
-        assert!(confirm_move(true, &[], &ask, &reply_rx));
+        assert_eq!(confirm_move(true, &[], &ask, &reply_rx), Vec::<u32>::new());
     }
 
     #[test]
     fn confirm_move_rejects_when_ui_receiver_dropped() {
         // UI 已關閉：send 失敗 → 視為跳過（不搬移）
-        let (ask, ask_rx) = mpsc::channel::<Vec<(String, String)>>();
+        let (ask, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
         drop(ask_rx);
-        let (_reply_tx, reply_rx) = mpsc::channel::<bool>();
+        let (_reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
         let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
-        assert!(!confirm_move(true, &pending, &ask, &reply_rx));
+        assert_eq!(
+            confirm_move(true, &pending, &ask, &reply_rx),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
-    fn confirm_move_round_trip_approve() {
-        let (ask, ask_rx) = mpsc::channel::<Vec<(String, String)>>();
-        let (reply_tx, reply_rx) = mpsc::channel::<bool>();
-        let pending = vec![(1, "主旨A".to_string(), 3, "理由A".to_string())];
+    fn confirm_move_round_trip_partial_selection() {
+        let (ask, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
+        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
+        let pending = vec![
+            (101, "主旨A".to_string(), 3, "理由A".to_string()),
+            (102, "主旨B".to_string(), 4, "理由B".to_string()),
+        ];
         let worker = thread::spawn(move || confirm_move(true, &pending, &ask, &reply_rx));
-        // 模擬 UI：收到清單後回覆核准
-        assert_eq!(
-            ask_rx.recv().expect("應收到待搬移清單"),
-            [("主旨A".to_string(), "理由A".to_string())]
-        );
-        reply_tx.send(true).expect("應可回覆");
-        assert!(worker.join().expect("worker 應結束"));
+        // 模擬 UI：收到清單後，只選取 102 進行隔離
+        let received = ask_rx.recv().expect("應收到待搬移清單");
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].uid, 101);
+        assert_eq!(received[1].uid, 102);
+        reply_tx.send(vec![102]).expect("應可回覆");
+        let approved = worker.join().expect("worker 應結束");
+        assert_eq!(approved, vec![102]);
     }
 
     #[test]
     fn confirm_move_round_trip_reject() {
-        let (ask, ask_rx) = mpsc::channel::<Vec<(String, String)>>();
-        let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+        let (ask, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
+        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
         let pending = vec![(1, "主旨A".to_string(), 3, "理由A".to_string())];
         let worker = thread::spawn(move || confirm_move(true, &pending, &ask, &reply_rx));
-        // 模擬 UI：收到清單後回覆跳過
+        // 模擬 UI：收到清單後回覆跳過（空清單）
         assert!(ask_rx.recv().is_ok());
-        reply_tx.send(false).expect("應可回覆");
-        assert!(!worker.join().expect("worker 應結束"));
+        reply_tx.send(Vec::new()).expect("應可回覆");
+        let approved = worker.join().expect("worker 應結束");
+        assert!(approved.is_empty());
     }
 
     // ===== IMAP UTF-7 解碼測試 =====
@@ -1558,5 +1812,33 @@ mod tests {
         assert_eq!(decode_imap_utf7("&V4NX"), "&V4NX");
         // 空字串
         assert_eq!(decode_imap_utf7(""), "");
+    }
+
+    #[test]
+    #[ignore = "需連線真實 IMAP 與 LLM 進行測試"]
+    fn test_scan_live_date() {
+        let config_str = std::fs::read_to_string("config.toml").expect("需有 config.toml");
+        let config: Config = toml::from_str(&config_str).expect("需可解析 config.toml");
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 19).unwrap();
+        let (ask_tx, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
+        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
+
+        // 背景 thread：收到待搬移清單後印出，並回傳空清單（不搬移，僅測試判定）
+        thread::spawn(move || {
+            if let Ok(pending) = ask_rx.recv() {
+                println!("\n[測試] 待搬移釣魚郵件清單（本次測試不執行搬移）：");
+                for item in pending {
+                    println!("  - 主旨：{}，原因：{}", item.subject, item.reason);
+                }
+                reply_tx.send(Vec::new()).ok();
+            }
+        });
+
+        let logs = scan_mail(&config, &[date], &ask_tx, &reply_rx).expect("scan_mail 應成功執行");
+        println!("\n=== 2026-08-19 掃描日誌結果 ===");
+        for log in logs {
+            println!("{log}");
+        }
+        println!("===============================\n");
     }
 }
