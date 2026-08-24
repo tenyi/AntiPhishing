@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
 use eframe::egui::{self, ViewportCommand};
 use imap::Session;
 use mailparse::{MailHeaderMap, parse_mail};
@@ -274,10 +274,21 @@ struct PendingMoveDialog {
 
 /// 掃描工作執行緒送往 UI 的事件：
 /// `Progress`＝目前檢查進度（顯示於狀態列下方，完成即消失）；
-/// `Done`＝整輪掃描結束（含失敗與異常中止），攜帶全部日誌行。
+/// `Done`＝整輪掃描結束（含失敗與異常中止），攜帶掃描結果。
 enum ScanEvent {
     Progress(String),
-    Done(Vec<String>),
+    Done(ScanOutcome),
+}
+
+/// 單輪掃描結果：日誌行與檢查進度（最後檢查到的 UID），供 UI 更新最後檢查狀態。
+struct ScanOutcome {
+    lines: Vec<String>,
+    /// 掃描當下來源信箱的 UIDVALIDITY（信箱世代）
+    uidvalidity: u32,
+    /// 本輪實際檢查過的最大 UID（含判定略過者）；未檢查任何郵件時為 None
+    max_checked_uid: Option<u32>,
+    /// 全部日期皆無新郵件（皆已於前輪檢查過）；不寫入執行紀錄，僅更新最後檢查時間
+    no_new_mail: bool,
 }
 
 struct App {
@@ -303,6 +314,10 @@ struct App {
     mailboxes: Vec<String>,
     /// 背景取得信箱清單的 receiver
     mailbox_receiver: Option<Receiver<Result<Vec<String>>>>,
+    /// 上次檢查到的最後一封郵件（UIDVALIDITY、最大 UID）；排程掃描藉此跳過無新郵件的一輪
+    last_seen: Option<(u32, u32)>,
+    /// 上次完成掃描的時間（含無新郵件的空掃），顯示於狀態列下方
+    last_check: Option<DateTime<Local>>,
 }
 
 struct Tray {
@@ -338,6 +353,8 @@ impl App {
             hide_window_on_startup,
             mailboxes: Vec::new(),
             mailbox_receiver: None,
+            last_seen: None,
+            last_check: None,
         }
     }
 
@@ -400,6 +417,7 @@ impl App {
             return;
         }
         let config = self.config.clone();
+        let last_seen = self.last_seen;
         let (sender, receiver) = mpsc::channel::<ScanEvent>();
         self.receiver = Some(receiver);
         // 搬移確認通道：worker 於掃描結束前送出待搬移清單並阻塞等待決定
@@ -417,21 +435,31 @@ impl App {
         };
         thread::spawn(move || {
             // catch_unwind：worker panic 時仍回傳結果，避免 UI 端 receiver 永久卡住
-            let lines = match catch_unwind(AssertUnwindSafe(|| {
-                scan_mail(&config, &dates, &ask, &reply_receiver, &sender)
+            let outcome = match catch_unwind(AssertUnwindSafe(|| {
+                scan_mail(&config, &dates, last_seen, &ask, &reply_receiver, &sender)
             })) {
-                Ok(Ok(lines)) => lines,
-                Ok(Err(error)) => vec![format!("掃描失敗：{error:#}")],
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => ScanOutcome {
+                    lines: vec![format!("掃描失敗：{error:#}")],
+                    uidvalidity: 0,
+                    max_checked_uid: None,
+                    no_new_mail: false,
+                },
                 Err(panic) => {
                     let detail = panic
                         .downcast_ref::<&str>()
                         .map(|s| (*s).to_string())
                         .or_else(|| panic.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "未知原因".into());
-                    vec![format!("掃描執行緒異常中止：{detail}")]
+                    ScanOutcome {
+                        lines: vec![format!("掃描執行緒異常中止：{detail}")],
+                        uidvalidity: 0,
+                        max_checked_uid: None,
+                        no_new_mail: false,
+                    }
                 }
             };
-            let _ = sender.send(ScanEvent::Done(lines));
+            let _ = sender.send(ScanEvent::Done(outcome));
         });
     }
 
@@ -442,14 +470,14 @@ impl App {
         }
         // 掃描事件排水：Progress 更新進度行；Done＝整輪結束。
         // Disconnected＝worker 結束但未送結果（理論上已被 catch_unwind 攔住）
-        let mut done: Option<Vec<String>> = None;
+        let mut done: Option<ScanOutcome> = None;
         let mut worker_lost = false;
         if let Some(receiver) = &self.receiver {
             loop {
                 match receiver.try_recv() {
                     Ok(ScanEvent::Progress(text)) => self.scan_progress = text,
-                    Ok(ScanEvent::Done(results)) => {
-                        done = Some(results);
+                    Ok(ScanEvent::Done(outcome)) => {
+                        done = Some(outcome);
                         break;
                     }
                     Err(TryRecvError::Disconnected) => {
@@ -471,11 +499,23 @@ impl App {
                     "AntiPhishing 掃描失敗",
                     "掃描執行緒異常結束，未回傳任何結果。",
                 );
-            } else if let Some(results) = done {
-                self.logs.extend(results.iter().cloned());
-                self.status = results.last().cloned().unwrap_or_default();
+            } else if let Some(outcome) = done {
+                self.last_check = Some(Local::now());
+                if outcome.no_new_mail {
+                    // 無新郵件的排程空掃：只更新最後檢查時間，不洗版執行紀錄
+                    self.status =
+                        format!("最後檢查 {}：無新郵件。", Local::now().format("%H:%M:%S"));
+                } else {
+                    self.logs.extend(outcome.lines.iter().cloned());
+                    self.status = outcome.lines.last().cloned().unwrap_or_default();
+                    // 記住本輪檢查進度，下輪排程掃描只檢查其後的新信
+                    if let Some(max_uid) = outcome.max_checked_uid {
+                        self.last_seen = Some((outcome.uidvalidity, max_uid));
+                    }
+                }
                 // 失敗時以系統匣通知提醒（視窗可能縮在系統匣看不到）
-                if let Some(first_failure) = results
+                if let Some(first_failure) = outcome
+                    .lines
                     .iter()
                     .find(|line| line.starts_with("掃描失敗") || line.starts_with("掃描執行緒異常"))
                 {
@@ -795,6 +835,13 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.heading("AntiPhishing 郵件防護");
                 ui.label(&self.status);
+                // 上次完成掃描的時間（含無新郵件的空掃）；空掃不寫執行紀錄，只更新此處
+                if let Some(last_check) = self.last_check {
+                    ui.small(format!(
+                        "最後檢查時間：{}",
+                        last_check.format("%Y-%m-%d %H:%M:%S")
+                    ));
+                }
                 // 掃描進行中顯示即時進度（目前檢查哪封信）；完成後自動消失
                 if !self.scan_progress.is_empty() {
                     ui.horizontal(|ui| {
@@ -1422,23 +1469,28 @@ fn confirm_move_with_timeout(
 
 /// 掃描指定日期郵件：逐封送 LLM 判定；判定為釣魚/惡意廣告者先暫存，
 /// 該輪結束後依 `confirm_before_move` 向 UI 請求確認，核准之個別郵件才搬移至 phishing_mailbox。
-/// 回傳逐封 log 行（最後一行為總計）。LLM 未設定或判定失敗時不搬移。
+/// `last_seen` 為上次檢查到的最後一封郵件（UIDVALIDITY、最大 UID），同信箱世代下只檢查其後的新信。
+/// 回傳掃描結果（日誌行與檢查進度）。LLM 未設定或判定失敗時不搬移。
 /// 掃描期間透過 `progress` 回報目前檢查進度供狀態列顯示。
 fn scan_mail(
     config: &Config,
     dates: &[NaiveDate],
+    last_seen: Option<(u32, u32)>,
     ask: &mpsc::Sender<Vec<PendingMoveMail>>,
     reply: &mpsc::Receiver<Vec<u32>>,
     progress: &mpsc::Sender<ScanEvent>,
-) -> Result<Vec<String>> {
+) -> Result<ScanOutcome> {
     let mut session = connect(&config.imap)?;
     let selected = session
         .select(&config.imap.source_mailbox)
         .with_context(|| format!("無法開啟來源信箱：{}", config.imap.source_mailbox))?;
-    let original_uidvalidity = selected.uid_validity;
+    // 伺服器未回報 UIDVALIDITY 時以 0 代稱（仍可與搬移前重查的值比對）
+    let original_uidvalidity = selected.uid_validity.unwrap_or(0);
     let llm = llm_config(config);
     let mut lines: Vec<String> = Vec::new();
     let mut scanned = 0;
+    // 本輪實際檢查過（完成判定）的最大 UID；LLM 判定失敗的信不列入，下輪會重試
+    let mut max_checked_uid: Option<u32> = None;
     let mut aborted_by_llm_error = false;
     // 疑似釣魚/惡意廣告郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
@@ -1450,12 +1502,16 @@ fn scan_mail(
             .collect();
         // 由小到大排序：處理順序穩定，進度計數也與 UID 對應
         uids.sort_unstable();
-        progress
-            .send(ScanEvent::Progress(format!(
-                "搜尋 {date}：找到 {} 封待檢查",
-                uids.len()
-            )))
-            .ok();
+        // 只檢查上次之後的新信：同信箱世代（UIDVALIDITY）下捨棄已檢查過的 UID
+        uids = filter_new_uids(uids, last_seen, original_uidvalidity);
+        if !uids.is_empty() {
+            progress
+                .send(ScanEvent::Progress(format!(
+                    "搜尋 {date}：找到 {} 封待檢查",
+                    uids.len()
+                )))
+                .ok();
+        }
         let total = uids.len();
         for (index, uid) in uids.into_iter().enumerate() {
             let messages = session.uid_fetch(uid.to_string(), "RFC822")?;
@@ -1480,30 +1536,49 @@ fn scan_mail(
             // 現行啟發式評分僅供 log 參考，不再作為搬移依據
             let (score, _) =
                 phishing_score(&from, &subject, &score_body, &targets, &config.detection);
-            let Some(llm_config) = &llm else {
-                continue;
-            };
-            match llm_judge(llm_config, &from, &subject, &body, &targets) {
-                Ok(verdict) if verdict.is_phishing => {
-                    pending.push((uid, subject.clone(), score, verdict.reason));
+            match &llm {
+                Some(llm_config) => {
+                    match llm_judge(llm_config, &from, &subject, &body, &targets) {
+                        Ok(verdict) => {
+                            // 本封已完成判定（不論結果），記住檢查進度
+                            max_checked_uid =
+                                Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                            if verdict.is_phishing {
+                                pending.push((uid, subject.clone(), score, verdict.reason));
+                            } else {
+                                lines.push(format!(
+                                    "略過〈{}〉（評分 {score}；LLM：{}）",
+                                    subject, verdict.reason
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            // LLM 判定失敗多半是 API 設定錯誤或服務不可用：提前中止本輪，
+                            // 避免每封信都等滿逾時、整輪耗時數小時且全部略過
+                            lines.push(format!(
+                                "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
+                            ));
+                            aborted_by_llm_error = true;
+                            break 'dates;
+                        }
+                    }
                 }
-                Ok(verdict) => {
-                    lines.push(format!(
-                        "略過〈{}〉（評分 {}；LLM：{}）",
-                        subject, score, verdict.reason
-                    ));
-                }
-                Err(error) => {
-                    // LLM 判定失敗多半是 API 設定錯誤或服務不可用：提前中止本輪，
-                    // 避免每封信都等滿逾時、整輪耗時數小時且全部略過
-                    lines.push(format!(
-                        "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
-                    ));
-                    aborted_by_llm_error = true;
-                    break 'dates;
+                None => {
+                    // LLM 未設定：僅計數不判定；仍記住進度，完整警告只在首輪顯示
+                    max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                 }
             }
         }
+    }
+    // 全部日期皆無新郵件：不搬移、不寫日誌，僅回報空掃讓 UI 更新最後檢查時間
+    if scanned == 0 {
+        session.logout().ok();
+        return Ok(ScanOutcome {
+            lines: Vec::new(),
+            uidvalidity: original_uidvalidity,
+            max_checked_uid: None,
+            no_new_mail: true,
+        });
     }
     if aborted_by_llm_error && llm.is_some() {
         session.logout().ok();
@@ -1511,7 +1586,12 @@ fn scan_mail(
             "{}：已掃描 {scanned} 封後因 LLM 判定失敗中止，未搬移。",
             dates_summary(dates)
         ));
-        return Ok(lines);
+        return Ok(ScanOutcome {
+            lines,
+            uidvalidity: original_uidvalidity,
+            max_checked_uid,
+            no_new_mail: false,
+        });
     }
     // 該輪結束、搬移前：依設定向 UI 請求確認；核准選取的 uid 才搬移
     if !pending.is_empty() && config.gui.confirm_before_move {
@@ -1527,7 +1607,7 @@ fn scan_mail(
     if !approved_set.is_empty() {
         // 搬移前重新 SELECT 刷新狀態並比對 UIDVALIDITY，避免信箱重建後搬錯信
         match session.select(&config.imap.source_mailbox) {
-            Ok(refreshed) if refreshed.uid_validity == original_uidvalidity => {}
+            Ok(refreshed) if refreshed.uid_validity == Some(original_uidvalidity) => {}
             Ok(_) => {
                 lines.push("來源信箱 UIDVALIDITY 已變更，為避免誤搬本輪取消搬移。".into());
                 approved_set.clear();
@@ -1600,7 +1680,23 @@ fn scan_mail(
         summary.push('。');
         lines.push(summary);
     }
-    Ok(lines)
+    Ok(ScanOutcome {
+        lines,
+        uidvalidity: original_uidvalidity,
+        max_checked_uid,
+        no_new_mail: false,
+    })
+}
+
+/// 過濾掉已檢查過的 UID：僅在相同 UIDVALIDITY（信箱世代）下，捨棄 ≤ 上次最大 UID 的舊信。
+/// 信箱世代不同（重建、換信箱）時保留全部，避免誤跳過。
+fn filter_new_uids(uids: Vec<u32>, last_seen: Option<(u32, u32)>, uidvalidity: u32) -> Vec<u32> {
+    match last_seen {
+        Some((seen_validity, seen_max)) if seen_validity == uidvalidity => {
+            uids.into_iter().filter(|&uid| uid > seen_max).collect()
+        }
+        _ => uids,
+    }
 }
 
 fn dates_summary(dates: &[NaiveDate]) -> String {
@@ -2380,12 +2476,33 @@ mod tests {
             }
         });
 
-        let logs = scan_mail(&config, &[date], &ask_tx, &reply_rx, &progress_tx)
+        let outcome = scan_mail(&config, &[date], None, &ask_tx, &reply_rx, &progress_tx)
             .expect("scan_mail 應成功執行");
         println!("\n=== 2026-08-19 掃描日誌結果 ===");
-        for log in logs {
+        for log in outcome.lines {
             println!("{log}");
         }
         println!("===============================\n");
+    }
+
+    // ===== 無新郵件過濾 =====
+
+    #[test]
+    fn filters_already_checked_uids_within_same_validity() {
+        let uids = vec![3, 7, 9];
+        // 上輪檢查到 UID 7：只剩 9 是新信
+        assert_eq!(filter_new_uids(uids, Some((42, 7)), 42), [9]);
+        // 上輪檢查到 UID 3：7、9 皆為新信
+        assert_eq!(filter_new_uids(vec![3, 7, 9], Some((42, 3)), 42), [7, 9]);
+        // 全部都檢查過：空掃
+        assert!(filter_new_uids(vec![3, 7], Some((42, 9)), 42).is_empty());
+    }
+
+    #[test]
+    fn keeps_all_uids_when_validity_changes_or_unknown() {
+        // 信箱重建（UIDVALIDITY 改變）：保留全部，避免誤跳過新信
+        assert_eq!(filter_new_uids(vec![3, 7], Some((42, 9)), 43), [3, 7]);
+        // 從未掃描過：保留全部
+        assert_eq!(filter_new_uids(vec![3, 7], None, 42), [3, 7]);
     }
 }
