@@ -40,4 +40,5 @@ Release 執行檔：`.\target\release\anti-phishing-gui.exe`。執行檔旁需�
 - UI 文字、日誌、註解一律 **zh-TW 繁體中文**；KISS 原則，不引入多餘抽象。
 - 帳密僅存 `config.toml`（已在 `.gitignore`），不得寫死程式碼或提交版本控制。
 - 附件偵測不可連網下載外部資源或啟動外部 Office 程式。
+- **每次修改完成後必須更新 `Cargo.toml` 的版號**再提交：新功能升 minor（0.3.0 → 0.4.0）、錯誤修正升 patch（0.3.0 → 0.3.1）；版號同步更新 `Cargo.lock`（跑一次 `cargo check` 即可）。
 - 修改後驗證：`cargo check` + `cargo fmt --check` + `cargo test` 皆須通過。
