@@ -195,7 +195,12 @@ fn show_already_running_notice() -> eframe::Result {
     eframe::run_native(
         "AntiPhishing",
         options,
-        Box::new(|_| {
+        Box::new(|cc| {
+            // 提示視窗也必須載入中文字型，否則 egui 內建字型缺 CJK 字符會顯示方框
+            let font_family = load_config()
+                .map(|config| config.gui.font_family)
+                .unwrap_or_default();
+            apply_configured_font(&cc.egui_ctx, &font_family);
             Ok(Box::new(AlreadyRunningApp {
                 deadline: Instant::now() + Duration::from_secs(5),
             }))
@@ -1102,7 +1107,7 @@ fn apply_configured_font(ctx: &egui::Context, requested: &str) -> String {
 
 fn find_font(requested: &str) -> Option<(String, Vec<u8>)> {
     let requested = requested.trim();
-    let candidates = if Path::new(requested).is_file() {
+    let mut candidates = if Path::new(requested).is_file() {
         vec![(requested.to_owned(), requested.to_owned())]
     } else if requested.eq_ignore_ascii_case("noto sans tc") {
         vec![(
@@ -1118,6 +1123,12 @@ fn find_font(requested: &str) -> Option<(String, Vec<u8>)> {
     } else {
         Vec::new()
     };
+    // 指定字型不存在時，退回系統內建的繁體中文字型，避免中文顯示為方框
+    candidates.push((
+        "Microsoft JhengHei".into(),
+        r"C:\Windows\Fonts\msjh.ttc".into(),
+    ));
+    candidates.push(("DFKai-SB".into(), r"C:\Windows\Fonts\kaiu.ttf".into()));
     candidates
         .into_iter()
         .find_map(|(name, path)| fs::read(&path).ok().map(|bytes| (name, bytes)))
