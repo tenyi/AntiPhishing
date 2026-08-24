@@ -3,9 +3,11 @@
 use std::{
     fs,
     io::{Cursor, Read},
-    path::Path,
-    sync::Arc,
-    sync::mpsc::{self, Receiver, Sender},
+    net::{TcpStream, ToSocketAddrs},
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+    sync::{Arc, LazyLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -25,7 +27,15 @@ use tray_icon::{
 };
 use zip::ZipArchive;
 
-const CONFIG_PATH: &str = "config.toml";
+const CONFIG_FILE_NAME: &str = "config.toml";
+/// IMAP TCP 連線逾時
+const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// IMAP 讀寫逾時（避免伺服器停滯時 worker 永久卡死）
+const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
+/// 搬移確認對話框的最長等待時間；逾時視為全部跳過（不搬移）
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(600);
+/// 單一 .rels 檔案的解壓上限（Word 關聯檔極小，僅防壓縮炸彈）
+const MAX_DOCX_RELS_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
@@ -140,18 +150,82 @@ fn load_app_icon() -> Result<(Vec<u8>, u32, u32)> {
     Ok((img.into_raw(), width, height))
 }
 
-fn main() -> eframe::Result {
-    let single_instance = SingleInstance::new("anti-phishing-gui-instance-lock").ok();
-    if let Some(ref instance) = single_instance {
-        if !instance.is_single() {
-            return Ok(());
+/// 設定檔完整路徑：與執行檔同目錄（避免捷徑／排程器啟動時 CWD 不同而找不到設定）。
+fn config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join(CONFIG_FILE_NAME)))
+        .unwrap_or_else(|| PathBuf::from(CONFIG_FILE_NAME))
+}
+
+/// 已有另一個執行個體時顯示的提示視窗，數秒後自動關閉。
+struct AlreadyRunningApp {
+    deadline: Instant,
+}
+
+impl eframe::App for AlreadyRunningApp {
+    fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if Instant::now() >= self.deadline || ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
-    let (config, status) = match load_config() {
-        Ok(config) => (config, "已載入設定檔。".into()),
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        ui.heading("AntiPhishing 已在執行中");
+        ui.label("請從系統匣開啟現有的視窗；本提示視窗將自動關閉。");
+    }
+}
+
+fn show_already_running_notice() -> eframe::Result {
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([400.0, 150.0]);
+    if let Ok((rgba, width, height)) = load_app_icon() {
+        viewport = viewport.with_icon(egui::IconData {
+            rgba,
+            width,
+            height,
+        });
+    }
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "AntiPhishing",
+        options,
+        Box::new(|_| {
+            Ok(Box::new(AlreadyRunningApp {
+                deadline: Instant::now() + Duration::from_secs(5),
+            }))
+        }),
+    )
+}
+
+fn main() -> eframe::Result {
+    let (single_instance, instance_warning) =
+        match SingleInstance::new("anti-phishing-gui-instance-lock") {
+            Ok(instance) => (Some(instance), None),
+            Err(error) => (
+                None,
+                Some(format!("單一實例鎖建立失敗（可能重複啟動）：{error}")),
+            ),
+        };
+    if let Some(ref instance) = single_instance
+        && !instance.is_single()
+    {
+        return show_already_running_notice();
+    }
+
+    let (config, load_status) = match load_config() {
+        Ok(config) => (config, "已載入設定檔。".to_string()),
         Err(error) => (Config::default(), format!("使用預設設定：{error}")),
     };
+    let mut status = load_status;
+    if let Some(warning) = instance_warning {
+        status.push_str(&format!(" {warning}"));
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([760.0, 720.0])
         .with_min_inner_size([620.0, 500.0]);
@@ -198,13 +272,23 @@ struct PendingMoveDialog {
     reply: Sender<Vec<u32>>,
 }
 
+/// 掃描工作執行緒送往 UI 的事件：
+/// `Progress`＝目前檢查進度（顯示於狀態列下方，完成即消失）；
+/// `Done`＝整輪掃描結束（含失敗與異常中止），攜帶全部日誌行。
+enum ScanEvent {
+    Progress(String),
+    Done(Vec<String>),
+}
+
 struct App {
     config: Config,
     status: String,
+    /// 掃描進行中的即時進度（目前檢查哪封信）；空字串表示無掃描進行
+    scan_progress: String,
     logs: Vec<String>,
     date_text: String,
     next_check: Instant,
-    receiver: Option<Receiver<Vec<String>>>,
+    receiver: Option<Receiver<ScanEvent>>,
     /// 搬移確認：worker 送出的待搬移清單（uid、主旨、評分、理由）
     ask_receiver: Option<Receiver<Vec<PendingMoveMail>>>,
     /// 搬移確認：回覆 worker 決定搬移的 uid 清單
@@ -241,6 +325,7 @@ impl App {
             next_check: Instant::now() + interval(&config),
             config,
             status: format!("{status} {font_status}"),
+            scan_progress: String::new(),
             logs: Vec::new(),
             date_text: Local::now().date_naive().to_string(),
             receiver: None,
@@ -260,11 +345,8 @@ impl App {
         if self.mailbox_receiver.is_some() {
             return;
         }
-        if self.config.imap.host.trim().is_empty()
-            || self.config.imap.username.trim().is_empty()
-            || self.config.imap.password.trim().is_empty()
-        {
-            self.status = "請先填寫 IMAP 伺服器、帳號及密碼以取得信箱清單。".into();
+        if let Some(problem) = imap_credentials_problem(&self.config.imap) {
+            self.status = problem;
             return;
         }
         let config = self.config.imap.clone();
@@ -280,7 +362,7 @@ impl App {
     fn save(&mut self) {
         let result: Result<()> = (|| {
             let text = toml::to_string_pretty(&self.config)?;
-            fs::write(CONFIG_PATH, text)?;
+            fs::write(config_path(), text)?;
             Ok(())
         })();
         match result {
@@ -301,17 +383,31 @@ impl App {
     }
 
     fn start_scan_dates(&mut self, dates: Vec<NaiveDate>, scheduled: bool) {
-        if self.receiver.is_some() || dates.is_empty() {
+        if self.receiver.is_some() {
+            self.status = "已有掃描進行中，請稍候。".into();
+            return;
+        }
+        if dates.is_empty() {
+            return;
+        }
+        // 掃描前先驗證設定，避免啟動時帶著空設定連線失敗卻無明確提示
+        if let Some(problem) = imap_credentials_problem(&self.config.imap) {
+            self.status = problem;
+            return;
+        }
+        if let Some(problem) = imap_mailbox_problem(&self.config.imap) {
+            self.status = problem;
             return;
         }
         let config = self.config.clone();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel::<ScanEvent>();
         self.receiver = Some(receiver);
         // 搬移確認通道：worker 於掃描結束前送出待搬移清單並阻塞等待決定
         let (ask, ask_receiver) = mpsc::channel::<Vec<PendingMoveMail>>();
         let (reply_sender, reply_receiver) = mpsc::channel::<Vec<u32>>();
         self.ask_receiver = Some(ask_receiver);
         self.reply_sender = Some(reply_sender);
+        self.scan_progress.clear();
         self.status = if dates.len() > 1 {
             "啟動掃描前一日與今日郵件中…".into()
         } else if scheduled {
@@ -320,10 +416,22 @@ impl App {
             "手動掃描中…".into()
         };
         thread::spawn(move || {
-            let _ = sender.send(
-                scan_mail(&config, &dates, &ask, &reply_receiver)
-                    .unwrap_or_else(|error| vec![format!("掃描失敗：{error:#}")]),
-            );
+            // catch_unwind：worker panic 時仍回傳結果，避免 UI 端 receiver 永久卡住
+            let lines = match catch_unwind(AssertUnwindSafe(|| {
+                scan_mail(&config, &dates, &ask, &reply_receiver, &sender)
+            })) {
+                Ok(Ok(lines)) => lines,
+                Ok(Err(error)) => vec![format!("掃描失敗：{error:#}")],
+                Err(panic) => {
+                    let detail = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "未知原因".into());
+                    vec![format!("掃描執行緒異常中止：{detail}")]
+                }
+            };
+            let _ = sender.send(ScanEvent::Done(lines));
         });
     }
 
@@ -332,63 +440,120 @@ impl App {
             self.hide_window_on_startup = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
+        // 掃描事件排水：Progress 更新進度行；Done＝整輪結束。
+        // Disconnected＝worker 結束但未送結果（理論上已被 catch_unwind 攔住）
+        let mut done: Option<Vec<String>> = None;
+        let mut worker_lost = false;
         if let Some(receiver) = &self.receiver {
-            if let Ok(results) = receiver.try_recv() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(ScanEvent::Progress(text)) => self.scan_progress = text,
+                    Ok(ScanEvent::Done(results)) => {
+                        done = Some(results);
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        worker_lost = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+        }
+        if worker_lost || done.is_some() {
+            if worker_lost {
+                self.status = "掃描執行緒異常結束，未回傳任何結果。".into();
+                self.logs.push(format!(
+                    "[{}] 掃描執行緒異常結束，未回傳任何結果。",
+                    Local::now().format("%H:%M:%S")
+                ));
+                send_notification(
+                    "AntiPhishing 掃描失敗",
+                    "掃描執行緒異常結束，未回傳任何結果。",
+                );
+            } else if let Some(results) = done {
                 self.logs.extend(results.iter().cloned());
                 self.status = results.last().cloned().unwrap_or_default();
-                self.receiver = None;
-                self.ask_receiver = None;
-                self.reply_sender = None;
-                self.pending_move = None;
-                self.next_check = Instant::now() + interval(&self.config);
+                // 失敗時以系統匣通知提醒（視窗可能縮在系統匣看不到）
+                if let Some(first_failure) = results
+                    .iter()
+                    .find(|line| line.starts_with("掃描失敗") || line.starts_with("掃描執行緒異常"))
+                {
+                    send_notification("AntiPhishing 掃描失敗", first_failure);
+                }
             }
+            self.receiver = None;
+            self.ask_receiver = None;
+            self.reply_sender = None;
+            self.pending_move = None;
+            self.scan_progress.clear();
+            self.next_check = Instant::now() + interval(&self.config);
         }
         // worker 請求確認搬移：先暫存，視窗顯示時由 Dialog 呈現（eframe 不允許在 logic 繪製 UI）
         if let Some(ask) = &self.ask_receiver {
-            if let Ok(list) = ask.try_recv() {
-                if let Some(reply) = self.reply_sender.clone() {
-                    self.status = format!(
-                        "掃描完成：{} 封疑似釣魚／惡意廣告郵件，請確認是否隔離",
-                        list.len()
-                    );
-                    let candidates = list
-                        .into_iter()
-                        .map(|m| MoveCandidateItem {
-                            uid: m.uid,
-                            subject: m.subject,
-                            score: m.score,
-                            reason: m.reason,
-                            selected: true,
-                        })
-                        .collect();
-                    self.pending_move = Some(PendingMoveDialog { candidates, reply });
-                    // 偵測到疑似釣魚／惡意廣告郵件需確認時：解除系統匣縮小/隱藏狀態，顯示視窗並置中螢幕
-                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(ViewportCommand::Focus);
-                    ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Critical,
-                    ));
-                    if let Some(cmd) = ViewportCommand::center_on_screen(ctx) {
-                        ctx.send_viewport_cmd(cmd);
+            match ask.try_recv() {
+                Ok(list) => {
+                    let detected = list.len();
+                    if let Some(reply) = self.reply_sender.clone() {
+                        self.status = format!(
+                            "掃描完成：{detected} 封疑似釣魚／惡意廣告郵件，請確認是否隔離"
+                        );
+                        send_notification(
+                            "AntiPhishing 偵測警告",
+                            &format!(
+                                "偵測到 {detected} 封疑似釣魚／惡意廣告郵件，請確認是否隔離。"
+                            ),
+                        );
+                        let candidates = list
+                            .into_iter()
+                            .map(|m| MoveCandidateItem {
+                                uid: m.uid,
+                                subject: m.subject,
+                                score: m.score,
+                                reason: m.reason,
+                                selected: true,
+                            })
+                            .collect();
+                        self.pending_move = Some(PendingMoveDialog { candidates, reply });
+                        // 偵測到疑似釣魚／惡意廣告郵件需確認時：解除系統匣縮小/隱藏狀態，顯示視窗並置中螢幕
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(ViewportCommand::Focus);
+                        ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Critical,
+                        ));
+                        if let Some(cmd) = ViewportCommand::center_on_screen(ctx) {
+                            ctx.send_viewport_cmd(cmd);
+                        }
                     }
                 }
+                Err(TryRecvError::Disconnected) => {
+                    // worker 在等待確認前異常結束：清空確認狀態，等 receiver 分支收尾
+                    self.ask_receiver = None;
+                    self.reply_sender = None;
+                    self.pending_move = None;
+                }
+                Err(TryRecvError::Empty) => {}
             }
         }
         // 處理信箱清單接收
         if let Some(receiver) = &self.mailbox_receiver {
-            if let Ok(result) = receiver.try_recv() {
-                match result {
-                    Ok(mailboxes) => {
-                        let count = mailboxes.len();
-                        self.mailboxes = mailboxes;
-                        self.status = format!("已成功取得 {count} 個信箱。");
-                    }
-                    Err(err) => {
-                        self.status = format!("取得信箱清單失敗：{err:#}");
-                    }
+            match receiver.try_recv() {
+                Ok(Ok(mailboxes)) => {
+                    let count = mailboxes.len();
+                    self.mailboxes = mailboxes;
+                    self.status = format!("已成功取得 {count} 個信箱。");
+                    self.mailbox_receiver = None;
                 }
-                self.mailbox_receiver = None;
+                Ok(Err(err)) => {
+                    self.status = format!("取得信箱清單失敗：{err:#}");
+                    self.mailbox_receiver = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "取得信箱清單失敗：背景執行緒異常結束。".into();
+                    self.mailbox_receiver = None;
+                }
+                Err(TryRecvError::Empty) => {}
             }
         }
         if self.receiver.is_none() && self.startup_scan_pending {
@@ -423,7 +588,12 @@ impl App {
                 }
             }
         }
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // 掃描中提高重繪頻率，讓進度行即時更新；閒置維持每秒一次
+        ctx.request_repaint_after(if self.receiver.is_some() {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_secs(1)
+        });
     }
 
     /// 搬移確認對話框；回傳 true 表示使用者已做出決定（隔離選取項／全部跳過）。
@@ -625,6 +795,13 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.heading("AntiPhishing 郵件防護");
                 ui.label(&self.status);
+                // 掃描進行中顯示即時進度（目前檢查哪封信）；完成後自動消失
+                if !self.scan_progress.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(&self.scan_progress).small().strong());
+                    });
+                }
                 ui.separator();
                 ui.heading("IMAP 信箱");
                 egui::Grid::new("imap").num_columns(2).show(ui, |ui| {
@@ -711,8 +888,16 @@ impl eframe::App for App {
                     if ui.button("儲存設定").clicked() {
                         self.save();
                     }
-                    if ui.button("立即掃描指定日期").clicked() {
+                    // 掃描進行中停用按鈕，避免按下被靜默忽略
+                    let scan_busy = self.receiver.is_some();
+                    let scan_button = egui::Button::new("立即掃描指定日期");
+                    if ui
+                        .add_enabled(!scan_busy, scan_button)
+                        .clicked()
+                    {
                         self.start_scan(false);
+                    } else if scan_busy {
+                        ui.small("掃描進行中…");
                     }
                     ui.label("日期");
                     ui.text_edit_singleline(&mut self.date_text);
@@ -736,10 +921,10 @@ impl eframe::App for App {
                 }
             });
         // 搬移確認對話框：使用者決定後清空，未決定則保留等下次繪製
-        if let Some(mut dialog) = self.pending_move.take() {
-            if !Self::show_move_confirmation(ui.ctx(), &mut dialog) {
-                self.pending_move = Some(dialog);
-            }
+        if let Some(mut dialog) = self.pending_move.take()
+            && !Self::show_move_confirmation(ui.ctx(), &mut dialog)
+        {
+            self.pending_move = Some(dialog);
         }
     }
 }
@@ -804,9 +989,48 @@ fn multiline(ui: &mut egui::Ui, label: &str, items: &mut Vec<String>) {
 fn interval(config: &Config) -> Duration {
     Duration::from_secs(config.gui.check_interval_minutes.max(1) * 60)
 }
+
+/// IMAP 帳號相關設定檢查；回傳錯誤訊息表示設定不完整。
+fn imap_credentials_problem(config: &ImapConfig) -> Option<String> {
+    if config.host.trim().is_empty() {
+        Some("請先填寫 IMAP 伺服器。".into())
+    } else if config.username.trim().is_empty() {
+        Some("請先填寫 IMAP 帳號。".into())
+    } else if config.password.trim().is_empty() {
+        Some("請先填寫 IMAP 密碼。".into())
+    } else {
+        None
+    }
+}
+
+/// 信箱名稱設定檢查；回傳錯誤訊息表示設定不完整。
+fn imap_mailbox_problem(config: &ImapConfig) -> Option<String> {
+    if config.source_mailbox.trim().is_empty() {
+        Some("請先設定來源信箱。".into())
+    } else if config.phishing_mailbox.trim().is_empty() {
+        Some("請先設定釣魚信箱（隔離目標）。".into())
+    } else {
+        None
+    }
+}
+
+/// 送出系統匣通知（背景執行緒，避免阻塞 UI）。
+fn send_notification(summary: &str, body: &str) {
+    let summary = summary.to_string();
+    let body = body.chars().take(200).collect::<String>();
+    thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .appname("AntiPhishing")
+            .summary(&summary)
+            .body(&body)
+            .show();
+    });
+}
 fn load_config() -> Result<Config> {
-    let text = fs::read_to_string(CONFIG_PATH).context("找不到 config.toml")?;
-    toml::from_str(&text).context("config.toml 格式不正確")
+    let path = config_path();
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("找不到設定檔：{}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("{} 格式不正確", path.display()))
 }
 
 fn apply_configured_font(ctx: &egui::Context, requested: &str) -> String {
@@ -989,14 +1213,14 @@ fn collect_text_parts(mail: &mailparse::ParsedMail<'_>, plain: &mut String, html
         .unwrap_or(false);
     if !is_attachment {
         let mime = mail.ctype.mimetype.to_ascii_lowercase();
-        if let Some(body) = decode_part_text(mail) {
-            if !body.is_empty() {
-                if mime == "text/plain" {
-                    plain.push_str(&body);
-                    plain.push('\n');
-                } else if mime == "text/html" {
-                    html.push_str(&body);
-                }
+        if let Some(body) = decode_part_text(mail)
+            && !body.is_empty()
+        {
+            if mime == "text/plain" {
+                plain.push_str(&body);
+                plain.push('\n');
+            } else if mime == "text/html" {
+                html.push_str(&body);
             }
         }
     }
@@ -1005,37 +1229,49 @@ fn collect_text_parts(mail: &mailparse::ParsedMail<'_>, plain: &mut String, html
     }
 }
 
+// 固定正規表示式集中為靜態編譯，避免每封郵件重複編譯
+static RE_STYLE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<style\b.*?</style>|<script\b.*?</script>").expect("固定正規表示式")
+});
+static RE_DATA_URI: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"data:[^"'\s>]+"#).expect("固定正規表示式"));
+static RE_IMG_ALT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<img\b[^>]*?\balt="([^"]*)"[^>]*>"#).expect("固定正規表示式")
+});
+static RE_HTML_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]+>").expect("固定正規表示式"));
+static RE_INLINE_WS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[ \t\r\f\v]+").expect("固定正規表示式"));
+static RE_MULTIPLE_NEWLINES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n{3,}").expect("固定正規表示式"));
+static RE_ANY_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://").expect("固定正規表示式"));
+static RE_LINK_WITH_AT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://[^\s]*@").expect("固定正規表示式"));
+static RE_QR_IMAGE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"img[^>]*alt=["'][^"']*qr"#).expect("固定正規表示式"));
+static RE_EMAIL_DOMAIN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@([a-z0-9.-]+\.[a-z]{2,})").expect("固定正規表示式"));
+
 /// HTML 轉純文字：移除 style/script、base64 內嵌圖（保留 img 的 alt 文字，
 /// 例如「QR Code」），剝離其餘標籤並解譯常見實體字。
 fn html_to_text(html: &str) -> String {
-    let text = Regex::new(r"(?is)<style\b.*?</style>|<script\b.*?</script>")
-        .expect("固定正規表示式")
-        .replace_all(html, " ");
+    let text = RE_STYLE_SCRIPT.replace_all(html, " ");
     // base64 內嵌圖（data: URI）是巨量噪音，先移除
-    let text = Regex::new(r#"data:[^"'\s>]+"#)
-        .expect("固定正規表示式")
-        .replace_all(&text, " ");
+    let text = RE_DATA_URI.replace_all(&text, " ");
     // 保留 img 的 alt 文字（如 QR Code），其餘屬性丟棄
-    let text = Regex::new(r#"(?is)<img\b[^>]*?\balt="([^"]*)"[^>]*>"#)
-        .expect("固定正規表示式")
-        .replace_all(&text, " [$1] ");
-    let text = Regex::new(r"<[^>]+>")
-        .expect("固定正規表示式")
-        .replace_all(&text, " ");
+    let text = RE_IMG_ALT.replace_all(&text, " [$1] ");
+    let text = RE_HTML_TAG.replace_all(&text, " ");
+    // 實體解碼：&amp; 必須最後才解，避免 "&amp;lt;" 被二次解碼成 "<"
     let text = text
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
-        .replace("&nbsp;", " ");
-    let text = Regex::new(r"[ \t\r\f\v]+")
-        .expect("固定正規表示式")
-        .replace_all(&text, " ");
-    Regex::new(r"\n{3,}")
-        .expect("固定正規表示式")
-        .replace_all(&text, "\n\n")
-        .into_owned()
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&");
+    let text = RE_INLINE_WS.replace_all(&text, " ");
+    RE_MULTIPLE_NEWLINES.replace_all(&text, "\n\n").into_owned()
 }
 
 /// 組裝送 LLM 的內文：text/plain + text/html（轉純文字）。
@@ -1137,12 +1373,22 @@ fn llm_judge(
 }
 
 /// 搬移前確認：未啟用或無待搬移郵件 → 直接核准全部 uid（與舊行為一致）；
-/// 否則向 UI 送出清單並阻塞等待決定；送出失敗（UI 已關閉）或無回覆 → 視為跳過（回傳空清單，不搬移）。
+/// 否則向 UI 送出清單並等待決定；送出失敗（UI 已關閉）、無回覆或逾時 → 視為跳過（回傳空清單，不搬移）。
 fn confirm_move(
     enabled: bool,
     pending: &[(u32, String, u32, String)],
     ask: &mpsc::Sender<Vec<PendingMoveMail>>,
     reply: &mpsc::Receiver<Vec<u32>>,
+) -> Vec<u32> {
+    confirm_move_with_timeout(enabled, pending, ask, reply, CONFIRM_TIMEOUT)
+}
+
+fn confirm_move_with_timeout(
+    enabled: bool,
+    pending: &[(u32, String, u32, String)],
+    ask: &mpsc::Sender<Vec<PendingMoveMail>>,
+    reply: &mpsc::Receiver<Vec<u32>>,
+    timeout: Duration,
 ) -> Vec<u32> {
     if !enabled || pending.is_empty() {
         return pending.iter().map(|(uid, _, _, _)| *uid).collect();
@@ -1156,36 +1402,62 @@ fn confirm_move(
             reason: reason.clone(),
         })
         .collect();
-    if ask.send(list).is_ok() {
-        reply.recv().unwrap_or_default()
-    } else {
-        Vec::new()
+    if ask.send(list).is_err() {
+        return Vec::new();
+    }
+    // 等待 UI 決定；逾時或通道斷線都視為「全部跳過」，避免 worker 永久卡死
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Vec::new();
+        }
+        match reply.recv_timeout(remaining.min(Duration::from_millis(200))) {
+            Ok(uids) => return uids,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Vec::new(),
+        }
     }
 }
 
 /// 掃描指定日期郵件：逐封送 LLM 判定；判定為釣魚/惡意廣告者先暫存，
 /// 該輪結束後依 `confirm_before_move` 向 UI 請求確認，核准之個別郵件才搬移至 phishing_mailbox。
 /// 回傳逐封 log 行（最後一行為總計）。LLM 未設定或判定失敗時不搬移。
+/// 掃描期間透過 `progress` 回報目前檢查進度供狀態列顯示。
 fn scan_mail(
     config: &Config,
     dates: &[NaiveDate],
     ask: &mpsc::Sender<Vec<PendingMoveMail>>,
     reply: &mpsc::Receiver<Vec<u32>>,
+    progress: &mpsc::Sender<ScanEvent>,
 ) -> Result<Vec<String>> {
     let mut session = connect(&config.imap)?;
-    session
+    let selected = session
         .select(&config.imap.source_mailbox)
         .with_context(|| format!("無法開啟來源信箱：{}", config.imap.source_mailbox))?;
+    let original_uidvalidity = selected.uid_validity;
     let llm = llm_config(config);
     let mut lines: Vec<String> = Vec::new();
     let mut scanned = 0;
+    let mut aborted_by_llm_error = false;
     // 疑似釣魚/惡意廣告郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
-    for date in dates {
-        let uids = session
+    'dates: for date in dates {
+        let mut uids: Vec<u32> = session
             .uid_search(format!("ON {}", date.format("%d-%b-%Y")))
-            .with_context(|| format!("搜尋 {date} 郵件失敗"))?;
-        for uid in uids {
+            .with_context(|| format!("搜尋 {date} 郵件失敗"))?
+            .into_iter()
+            .collect();
+        // 由小到大排序：處理順序穩定，進度計數也與 UID 對應
+        uids.sort_unstable();
+        progress
+            .send(ScanEvent::Progress(format!(
+                "搜尋 {date}：找到 {} 封待檢查",
+                uids.len()
+            )))
+            .ok();
+        let total = uids.len();
+        for (index, uid) in uids.into_iter().enumerate() {
             let messages = session.uid_fetch(uid.to_string(), "RFC822")?;
             let Some(bytes) = messages.iter().next().and_then(|message| message.body()) else {
                 continue;
@@ -1196,6 +1468,14 @@ fn scan_mail(
             // mailparse 對 multipart 的 get_body() 回傳空，改從 subparts 提取
             let (body, score_body) = extract_body_text(&mail);
             scanned += 1;
+            // 即時回報目前檢查的郵件（主旨），避免使用者誤以為程式卡住
+            progress
+                .send(ScanEvent::Progress(progress_text(
+                    index + 1,
+                    total,
+                    &subject,
+                )))
+                .ok();
             let targets = external_word_image_targets(&mail);
             // 現行啟發式評分僅供 log 參考，不再作為搬移依據
             let (score, _) =
@@ -1214,75 +1494,268 @@ fn scan_mail(
                     ));
                 }
                 Err(error) => {
-                    lines.push(format!("LLM 判斷失敗，略過〈{}〉：{error:#}", subject));
+                    // LLM 判定失敗多半是 API 設定錯誤或服務不可用：提前中止本輪，
+                    // 避免每封信都等滿逾時、整輪耗時數小時且全部略過
+                    lines.push(format!(
+                        "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
+                    ));
+                    aborted_by_llm_error = true;
+                    break 'dates;
                 }
             }
         }
     }
+    if aborted_by_llm_error && llm.is_some() {
+        session.logout().ok();
+        lines.push(format!(
+            "{}：已掃描 {scanned} 封後因 LLM 判定失敗中止，未搬移。",
+            dates_summary(dates)
+        ));
+        return Ok(lines);
+    }
     // 該輪結束、搬移前：依設定向 UI 請求確認；核准選取的 uid 才搬移
+    if !pending.is_empty() && config.gui.confirm_before_move {
+        progress
+            .send(ScanEvent::Progress("等待搬移確認…".into()))
+            .ok();
+    }
     let approved_uids = confirm_move(config.gui.confirm_before_move, &pending, ask, reply);
-    let approved_set: std::collections::HashSet<u32> = approved_uids.into_iter().collect();
+    let mut approved_set: std::collections::HashSet<u32> = approved_uids.into_iter().collect();
     let mut moved = 0;
+    let mut failed = 0;
+    let mut moved_uids: Vec<String> = Vec::new();
+    if !approved_set.is_empty() {
+        // 搬移前重新 SELECT 刷新狀態並比對 UIDVALIDITY，避免信箱重建後搬錯信
+        match session.select(&config.imap.source_mailbox) {
+            Ok(refreshed) if refreshed.uid_validity == original_uidvalidity => {}
+            Ok(_) => {
+                lines.push("來源信箱 UIDVALIDITY 已變更，為避免誤搬本輪取消搬移。".into());
+                approved_set.clear();
+            }
+            Err(error) => {
+                lines.push(format!("無法重新確認來源信箱狀態，本輪取消搬移：{error:#}"));
+                approved_set.clear();
+            }
+        }
+    }
+    if !approved_set.is_empty()
+        && let Err(error) = ensure_phishing_mailbox(&mut session, &config.imap.phishing_mailbox)
+    {
+        // 目標信箱不存在又建不出來：逐封標記失敗但保留全部日誌，不再中斷
+        lines.push(format!(
+            "目標信箱「{}」無法使用，本輪取消搬移：{error:#}",
+            config.imap.phishing_mailbox
+        ));
+        approved_set.clear();
+    }
     for (uid, subject, score, reason) in &pending {
-        if approved_set.contains(uid) {
-            move_message(&mut session, *uid, &config.imap.phishing_mailbox)?;
-            lines.push(format!(
-                "搬移〈{}〉（評分 {}；LLM：{}）",
-                subject, score, reason
-            ));
-            moved += 1;
-        } else {
+        if !approved_set.contains(uid) {
             lines.push(format!(
                 "跳過搬移〈{}〉（評分 {}；LLM：{}）",
                 subject, score, reason
             ));
+            continue;
+        }
+        match move_message(&mut session, *uid, &config.imap.phishing_mailbox) {
+            Ok(()) => {
+                lines.push(format!(
+                    "搬移〈{}〉（評分 {}；LLM：{}）",
+                    subject, score, reason
+                ));
+                moved += 1;
+                moved_uids.push(uid.to_string());
+            }
+            Err(error) => {
+                // 單封失敗只記錄並繼續，不再丟棄先前累積的所有日誌
+                lines.push(format!("搬移〈{}〉失敗：{error:#}", subject));
+                failed += 1;
+            }
         }
     }
-    if moved > 0 {
-        session.expunge().context("刪除來源信箱中已搬移郵件失敗")?;
+    if !moved_uids.is_empty() {
+        // 優先 UID EXPUNGE 只清除本輪已搬移的信件，避免連帶清掉使用者在他端手動刪除的信
+        let uid_set = moved_uids.join(",");
+        if let Err(error) = session.uid_expunge(&uid_set) {
+            lines.push(format!("UID EXPUNGE 失敗（改用 EXPUNGE）：{error:#}"));
+            if let Err(error) = session.expunge() {
+                lines.push(format!("刪除來源信箱中已搬移郵件失敗：{error:#}"));
+            }
+        }
     }
     session.logout().ok();
-    let scanned_dates = dates
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("、");
+    let scanned_dates = dates_summary(dates);
     if llm.is_none() {
         lines.push(format!(
             "LLM 未設定（config.toml 的 [llm] base_url 或 model 為空）。{scanned_dates}：已掃描 {scanned} 封，未搬移。"
         ));
     } else {
-        let skipped = pending.len().saturating_sub(moved);
-        if skipped > 0 {
-            lines.push(format!(
-                "{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封，保留 {skipped} 封疑似釣魚／惡意廣告郵件。"
-            ));
-        } else {
-            lines.push(format!(
-                "{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封疑似釣魚／惡意廣告郵件。"
-            ));
+        let skipped = pending.len().saturating_sub(moved + failed);
+        let mut summary = format!("{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封");
+        if failed > 0 {
+            summary.push_str(&format!("，搬移失敗 {failed} 封"));
         }
+        if skipped > 0 {
+            summary.push_str(&format!("，保留 {skipped} 封疑似釣魚／惡意廣告郵件"));
+        }
+        summary.push('。');
+        lines.push(summary);
     }
     Ok(lines)
+}
+
+fn dates_summary(dates: &[NaiveDate]) -> String {
+    dates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+/// 掃描進度文字；無主旨（或全空白）時以「(無主旨)」後備。
+fn progress_text(current: usize, total: usize, subject: &str) -> String {
+    let subject = subject.trim();
+    let subject = if subject.is_empty() {
+        "(無主旨)"
+    } else {
+        subject
+    };
+    format!("檢查第 {current}/{total} 封〈{subject}〉")
+}
+
+/// 確認目標信箱存在，不存在則嘗試建立。
+fn ensure_phishing_mailbox(session: &mut Session<imap::Connection>, name: &str) -> Result<()> {
+    let exists = session
+        .list(Some(""), Some(name))
+        .with_context(|| format!("無法查詢信箱是否存在：{name}"))?
+        .iter()
+        .any(|mailbox| mailbox.name() == name);
+    if !exists {
+        session
+            .create(name)
+            .with_context(|| format!("無法建立信箱：{name}"))?;
+    }
+    Ok(())
 }
 
 fn startup_scan_dates(today: NaiveDate) -> [NaiveDate; 2] {
     [today - chrono::Duration::days(1), today]
 }
 
+/// 建立 IMAP 連線：手動 TCP+TLS 以確保連線與讀寫皆有逾時，
+/// 避免伺服器停滯時 worker 永久卡死、排程掃描全面癱瘓。
 fn connect(config: &ImapConfig) -> Result<Session<imap::Connection>> {
-    let mode = match config.protocol.as_str() {
-        "imaps" => imap::ConnectionMode::Tls,
-        "starttls" => imap::ConnectionMode::StartTls,
+    let host = config.host.trim();
+    if host.is_empty() {
+        bail!("IMAP 伺服器位址為空");
+    }
+    let tcp = tcp_stream_with_timeout(host, config.port)?;
+    match config.protocol.as_str() {
+        "imaps" => {
+            let connector = native_tls::TlsConnector::new().context("無法建立 TLS 連接器")?;
+            let tls = connector.connect(host, tcp).context("IMAP TLS 交握失敗")?;
+            let mut client = imap::Client::<imap::Connection>::new(Box::new(tls));
+            client.read_greeting().context("讀取 IMAP 問候訊息失敗")?;
+            finish_login(client, config)
+        }
+        "starttls" => {
+            // imap crate 未公開「升級前送出任意指令」的 API，
+            // 故 STARTTLS 前置交談（問候＋STARTTLS 指令）在此手工完成。
+            let mut plain = tcp;
+            let greeting = read_imap_line(&mut plain)?;
+            if !greeting.starts_with("* ") {
+                bail!("非預期的 IMAP 問候訊息：{greeting}");
+            }
+            const TAG: &str = "AP1";
+            use std::io::Write as _;
+            write!(plain, "{TAG} STARTTLS\r\n").context("送出 STARTTLS 指令失敗")?;
+            plain.flush().context("送出 STARTTLS 指令失敗")?;
+            let done_line = loop {
+                let line = read_imap_line(&mut plain)?;
+                if line.starts_with(TAG) {
+                    break line;
+                }
+                // 忽略未標記回應（如 * CAPABILITY）
+            };
+            if !done_line
+                .split_whitespace()
+                .nth(1)
+                .is_some_and(|status| status.eq_ignore_ascii_case("OK"))
+            {
+                // 伺服器拒絕即中止，絕不退回明文登入，避免降級攻擊
+                bail!("STARTTLS 升級被伺服器拒絕：{}", done_line.trim());
+            }
+            let connector = native_tls::TlsConnector::new().context("無法建立 TLS 連接器")?;
+            let tls = connector
+                .connect(host, plain)
+                .context("IMAP TLS 交握失敗")?;
+            let mut client = imap::Client::<imap::Connection>::new(Box::new(tls));
+            // 問候訊息已在升級前讀取
+            client.greeting_read = true;
+            finish_login(client, config)
+        }
         other => bail!("不支援的 protocol：{other}"),
-    };
-    let client = imap::ClientBuilder::new(config.host.as_str(), config.port)
-        .mode(mode)
-        .connect()
-        .context("IMAP TLS 連線失敗")?;
+    }
+}
+
+/// 以 connect_timeout 逐一嘗試所有解析出的位址，並設定讀寫逾時。
+fn tcp_stream_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("無法解析 IMAP 伺服器位址：{host}"))?;
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, IMAP_CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(IMAP_IO_TIMEOUT))
+                    .context("設定讀取逾時失敗")?;
+                stream
+                    .set_write_timeout(Some(IMAP_IO_TIMEOUT))
+                    .context("設定寫入逾時失敗")?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    bail!(last_error.map_or_else(
+        || format!("IMAP TCP 連線失敗：{host}:{port}（沒有可嘗試的位址）"),
+        |error| format!("IMAP TCP 連線失敗：{host}:{port}（{error}）")
+    ))
+}
+
+/// 逐位元組讀取一行 IMAP 回應（不含行尾 CRLF）；
+/// 逐位元組是為了避免緩衝區超讚吃掉 TLS 交握後的第一批資料。
+fn read_imap_line(stream: &mut TcpStream) -> Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = stream.read(&mut byte).context("IMAP 連線讀取失敗")?;
+        if read == 0 {
+            bail!("IMAP 連線意外中斷");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+        if line.len() > 8192 {
+            bail!("IMAP 回應行過長");
+        }
+    }
+    let mut text = String::from_utf8_lossy(&line).into_owned();
+    if text.ends_with('\r') {
+        text.pop();
+    }
+    Ok(text)
+}
+
+fn finish_login(
+    client: imap::Client<imap::Connection>,
+    config: &ImapConfig,
+) -> Result<Session<imap::Connection>> {
     client
         .login(&config.username, &config.password)
-        .map_err(|error| error.0.into())
+        .map_err(|(error, _)| error)
+        .context("IMAP 登入失敗")
 }
 fn move_message(session: &mut Session<imap::Connection>, uid: u32, target: &str) -> Result<()> {
     session
@@ -1418,34 +1891,22 @@ fn phishing_score(
         score += count.min(3) as u32;
         reasons.push(format!("含 {count} 個可疑關鍵字"));
     }
-    let links = Regex::new(r"https?://")
-        .expect("固定正規表示式")
-        .find_iter(&text)
-        .count();
+    let links = RE_ANY_LINK.find_iter(&text).count();
     if links >= 2 {
         score += 2;
         reasons.push("含多個連結".into());
     }
-    if Regex::new(r"https?://[^\s]*@")
-        .expect("固定正規表示式")
-        .is_match(&text)
-    {
+    if RE_LINK_WITH_AT.is_match(&text) {
         score += 3;
         reasons.push("連結含 @，可能偽裝網域".into());
     }
     // QR code 內嵌圖（quishing）：整封無連結、叫用戶拿手機掃碼
-    if Regex::new(r#"img[^>]*alt=["'][^"']*qr"#)
-        .expect("固定正規表示式")
-        .is_match(&text)
-    {
+    if RE_QR_IMAGE.is_match(&text) {
         score += 4;
         reasons.push("含 QR code 圖片（quishing）".into());
     }
     // 品牌偽裝：From 顯示名稱含品牌（如 DHL），但寄件網域非該品牌官方網域
-    let email_domain = Regex::new(r"@([a-z0-9.-]+\.[a-z]{2,})")
-        .expect("固定正規表示式")
-        .captures(&from)
-        .map(|c| c[1].to_string());
+    let email_domain = RE_EMAIL_DOMAIN.captures(&from).map(|c| c[1].to_string());
     let display_name = from.split('<').next().unwrap_or(from.as_str()).trim();
     if let Some(domain) = email_domain {
         for (brand, official) in BRAND_OFFICIAL_DOMAINS {
@@ -1472,10 +1933,28 @@ fn phishing_score(
 }
 fn external_word_image_targets(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
     mail.parts()
+        .filter(|part| is_docx_part(part))
         .filter_map(|part| part.get_body_raw().ok())
         .flat_map(|bytes| external_word_image_targets_from_docx(&bytes))
         .collect()
 }
+
+/// 只對 Word（docx/docm）附件做 zip 解析，避免把所有附件都解 base64 並嘗試開 zip。
+fn is_docx_part(part: &mailparse::ParsedMail<'_>) -> bool {
+    let mime = part.ctype.mimetype.to_ascii_lowercase();
+    if mime.contains("wordprocessingml.document") {
+        return true;
+    }
+    part.get_content_disposition()
+        .params
+        .get("filename")
+        .map(|name| {
+            let lower = name.to_lowercase();
+            lower.ends_with(".docx") || lower.ends_with(".docm")
+        })
+        .unwrap_or(false)
+}
+
 fn external_word_image_targets_from_docx(bytes: &[u8]) -> Vec<String> {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return Vec::new();
@@ -1489,6 +1968,10 @@ fn external_word_image_targets_from_docx(bytes: &[u8]) -> Vec<String> {
             continue;
         };
         if !name.starts_with("word/") || !name.ends_with(".rels") {
+            continue;
+        }
+        // .rels 檔案極小；超過上限視為壓縮炸彈，直接略過
+        if entry.size() > MAX_DOCX_RELS_BYTES {
             continue;
         }
         let mut xml = String::new();
@@ -1668,6 +2151,37 @@ mod tests {
         assert!(llm_body.contains("請使用手機掃描"));
     }
 
+    // 實體解碼順序：&amp; 最後才解，避免 "&amp;lt;" 被二次解碼成 "<"
+    #[test]
+    fn html_entities_decode_ampersand_last() {
+        assert_eq!(html_to_text("&amp;lt;b&amp;gt;"), "&lt;b&gt;");
+        assert_eq!(html_to_text("&lt;b&gt;"), "<b>");
+        assert_eq!(html_to_text("a &amp;&amp; b"), "a && b");
+    }
+
+    // 只對 Word 附件做 zip 解析：依副檔名或 MIME 判別
+    #[test]
+    fn only_docx_attachments_are_selected_for_zip_parsing() {
+        let raw = concat!(
+            "Content-Type: multipart/mixed; boundary=b\r\n\r\n",
+            "--b\r\nContent-Disposition: attachment; filename=\"report.docx\"\r\n",
+            "Content-Type: application/octet-stream\r\n\r\nzzz\r\n",
+            "--b\r\nContent-Disposition: attachment; filename=\"notes.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\nhello\r\n",
+            "--b\r\nContent-Disposition: attachment\r\n",
+            "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n\r\nzzz\r\n",
+            "--b--\r\n"
+        );
+        let mail = parse_mail(raw.as_bytes()).expect("應可解析 multipart");
+        let attachments = &mail.subparts;
+        assert_eq!(attachments.len(), 3);
+        assert!(is_docx_part(&attachments[0]), ".docx 副檔名應命中");
+        assert!(!is_docx_part(&attachments[1]), ".txt 不應命中");
+        assert!(is_docx_part(&attachments[2]), "Word MIME 應命中");
+        // 非 zip 內容不應 panic 且回傳空
+        assert!(external_word_image_targets_from_docx(b"not a zip").is_empty());
+    }
+
     #[test]
     fn scores_qr_inline_image_as_quishing() {
         let (score, reasons) = phishing_score(
@@ -1778,6 +2292,29 @@ mod tests {
         assert!(approved.is_empty());
     }
 
+    #[test]
+    fn confirm_move_times_out_and_skips() {
+        let (ask, _ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
+        let (_reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
+        let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
+        // UI 遲遲不回覆 → 逾時視為全部跳過，worker 不會永久卡死
+        assert_eq!(
+            confirm_move_with_timeout(true, &pending, &ask, &reply_rx, Duration::from_millis(50)),
+            Vec::<u32>::new()
+        );
+    }
+
+    // 掃描進度文字：含計數與主旨；無主旨時以「(無主旨)」後備
+    #[test]
+    fn progress_text_formats_counter_and_subject() {
+        assert_eq!(
+            progress_text(3, 17, "您的帳戶即將被凍結"),
+            "檢查第 3/17 封〈您的帳戶即將被凍結〉"
+        );
+        assert_eq!(progress_text(1, 2, ""), "檢查第 1/2 封〈(無主旨)〉");
+        assert_eq!(progress_text(2, 5, "  "), "檢查第 2/5 封〈(無主旨)〉");
+    }
+
     // ===== IMAP UTF-7 解碼測試 =====
 
     #[test]
@@ -1822,6 +2359,7 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 19).unwrap();
         let (ask_tx, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
         let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
+        let (progress_tx, progress_rx) = mpsc::channel::<ScanEvent>();
 
         // 背景 thread：收到待搬移清單後印出，並回傳空清單（不搬移，僅測試判定）
         thread::spawn(move || {
@@ -1833,8 +2371,17 @@ mod tests {
                 reply_tx.send(Vec::new()).ok();
             }
         });
+        // 背景 thread：印出掃描進度
+        thread::spawn(move || {
+            while let Ok(event) = progress_rx.recv() {
+                if let ScanEvent::Progress(text) = event {
+                    println!("  [進度] {text}");
+                }
+            }
+        });
 
-        let logs = scan_mail(&config, &[date], &ask_tx, &reply_rx).expect("scan_mail 應成功執行");
+        let logs = scan_mail(&config, &[date], &ask_tx, &reply_rx, &progress_tx)
+            .expect("scan_mail 應成功執行");
         println!("\n=== 2026-08-19 掃描日誌結果 ===");
         for log in logs {
             println!("{log}");

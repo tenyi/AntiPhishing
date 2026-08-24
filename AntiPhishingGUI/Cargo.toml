@@ -19,6 +19,7 @@ ureq = { version = "3", features = ["json"] }
 toml = "1.1.4"
 tray-icon = "0.24.2"
 single-instance = "0.3"
+notify-rust = "4"
 zip = "9.0.0-pre.2"
 
 [build-dependencies]
