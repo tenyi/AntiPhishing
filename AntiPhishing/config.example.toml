@@ -16,3 +16,14 @@ trusted_sender_domains = ["company.example"]
 suspicious_keywords = ["verify", "urgent", "password", "login", "帳戶", "驗證", "緊急", "密碼"]
 # Word 附件以外部圖片追蹤開啟行為時加分；預設 5，會單獨達到預設門檻。
 external_word_image_score = 5
+
+# 地端 LLM 判定（OpenAI 相容 API，例如 Ollama / LM Studio / llama.cpp）。
+# base_url 或 model 留空即停用 LLM 判定，改用上方傳統評分規則（threshold）搬移。
+# 啟用後：LLM 判定為真者才搬移，評分僅供 log 參考；預設搬移前會互動確認（--yes 可跳過）。
+[llm]
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3.1"
+# 可選：單一請求逾時（秒），預設 120
+timeout_secs = 120
+# 可選：送給 LLM 的郵件內文最大字元數，預設 6000
+max_chars = 6000
