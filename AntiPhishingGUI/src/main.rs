@@ -1163,6 +1163,24 @@ impl eframe::App for App {
                     ui.end_row();
                 });
                 ui.separator();
+                ui.heading("LLM 判定（地端或雲端模型）");
+                egui::Grid::new("llm_grid").num_columns(2).show(ui, |ui| {
+                    field(ui, "伺服器網址", &mut self.config.llm.base_url);
+                    ui.end_row();
+                    field(ui, "模型名稱", &mut self.config.llm.model);
+                    ui.end_row();
+                    ui.label("API 金鑰");
+                    ui.add(egui::TextEdit::singleline(&mut self.config.llm.api_key).password(true));
+                    ui.end_row();
+                    ui.label("逾時（秒）");
+                    ui.add(egui::DragValue::new(&mut self.config.llm.timeout_secs).range(10..=600));
+                    ui.end_row();
+                    ui.label("內文最大字數");
+                    ui.add(egui::DragValue::new(&mut self.config.llm.max_chars).range(500..=50000));
+                    ui.end_row();
+                });
+                ui.small("留空伺服器網址或模型名稱即停用 LLM 判定；地端免認證模型（如 Ollama / LM Studio）API 金鑰可留空。");
+                ui.separator();
                 ui.heading("偵測規則");
                 ui.horizontal(|ui| {
                     ui.label("判定門檻");
@@ -1429,6 +1447,8 @@ struct LlmConfig {
     base_url: String,
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    api_key: String,
     #[serde(default = "default_llm_timeout_secs")]
     timeout_secs: u64,
     #[serde(default = "default_llm_max_chars")]
@@ -1447,6 +1467,7 @@ impl Default for LlmConfig {
         Self {
             base_url: String::new(),
             model: String::new(),
+            api_key: String::new(),
             timeout_secs: default_llm_timeout_secs(),
             max_chars: default_llm_max_chars(),
         }
@@ -1646,8 +1667,12 @@ fn llm_judge(
         .http_status_as_error(false)
         .build();
     let agent = ureq::Agent::new_with_config(agent_config);
-    let mut response = agent
-        .post(&url)
+    let mut request = agent.post(&url);
+    let api_key = config.api_key.trim();
+    if !api_key.is_empty() {
+        request = request.header("Authorization", &format!("Bearer {api_key}"));
+    }
+    let mut response = request
         .send_json(payload)
         .map_err(|error| anyhow::anyhow!("LLM 請求失敗：{error}"))?;
 
@@ -2979,5 +3004,32 @@ mod tests {
             _ => (outcome_new_validity, 100),
         };
         assert_eq!(updated_rebuild, (2000, 100));
+    }
+
+    #[test]
+    fn llm_config_defaults_api_key_to_empty_when_absent() {
+        let config: LlmConfig = toml::from_str(
+            r#"
+            base_url = "http://127.0.0.1:11434/v1"
+            model = "llama3.1"
+            "#,
+        )
+        .expect("缺 api_key 時應正常反序列化");
+        assert_eq!(config.api_key, "");
+        assert_eq!(config.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(config.model, "llama3.1");
+    }
+
+    #[test]
+    fn llm_config_parses_api_key_when_present() {
+        let config: LlmConfig = toml::from_str(
+            r#"
+            base_url = "https://api.openai.com/v1"
+            model = "gpt-4o-mini"
+            api_key = "sk-test123456"
+            "#,
+        )
+        .expect("有 api_key 時應正常解析");
+        assert_eq!(config.api_key, "sk-test123456");
     }
 }
