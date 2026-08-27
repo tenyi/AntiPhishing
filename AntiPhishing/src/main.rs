@@ -233,6 +233,9 @@ static RE_QR_IMAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"img[^>]*alt=["'][^"']*qr"#).expect("固定正規表示式"));
 static RE_EMAIL_DOMAIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@([a-z0-9.-]+\.[a-z]{2,})").expect("固定正規表示式"));
+static RE_THINKING_TAGS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<think(?:ing)?\b.*?</think(?:ing)?>").expect("固定正規表示式")
+});
 
 /// HTML 轉純文字：移除 style/script、base64 內嵌圖（保留 img 的 alt 文字，
 /// 例如「QR Code」），剝離其餘標籤並解譯常見實體字。
@@ -270,20 +273,27 @@ fn extract_body_text(mail: &mailparse::ParsedMail<'_>) -> (String, String) {
     (llm_body, score_body)
 }
 
-/// 解析 LLM 回傳的判定 JSON；容許 ```json 圍欄；解析失敗回 Err。
+/// 解析 LLM 回傳的判定 JSON；容許多段 <think>/<thinking> 思考標籤、```json 圍欄與前後文字；解析失敗回 Err。
 fn parse_llm_verdict(text: &str) -> Result<LlmVerdict> {
-    let mut text = text.trim();
+    // 1. 全域移除所有 <think>...</think> 或 <thinking>...</thinking> 標籤區塊（不分大小寫、支援多段）
+    let cleaned = RE_THINKING_TAGS.replace_all(text, " ");
+    let mut text = cleaned.trim();
+    // 2. 剝離 Markdown 程式碼圍欄（```json ... ``` 或 ``` ... ```）
     if let Some(stripped) = text.strip_prefix("```") {
-        // 剝離開頭圍欄（含選填的 json 標籤）
         let rest = stripped
             .strip_prefix("json")
             .unwrap_or(stripped)
             .trim_start();
         text = rest;
     }
-    // 剝離結尾圍欄
     if let Some(index) = text.rfind("```") {
         text = text[..index].trim();
+    }
+    // 3. 容錯：若仍含有非 JSON 前綴或後綴文字，擷取第一個 '{' 到最後一個 '}' 的 JSON 區塊
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
+        && start <= end
+    {
+        text = &text[start..=end];
     }
     serde_json::from_str(text).context("LLM 回應不是有效的判定 JSON")
 }
@@ -358,11 +368,16 @@ fn llm_judge(
         .body_mut()
         .read_json()
         .map_err(|error| anyhow::anyhow!("LLM 回應不是 JSON：{error}"))?;
-    let content = response["choices"]
+    let content = match response["choices"]
         .get(0)
         .and_then(|choice| choice["message"]["content"].as_str())
-        .context("LLM 回應缺少 choices[0].message.content")?;
-    parse_llm_verdict(content)
+    {
+        Some(s) => s,
+        None => {
+            bail!("LLM 回應缺少 choices[0].message.content，完整回應：{response}");
+        }
+    };
+    parse_llm_verdict(content).with_context(|| format!("原始回應內容為：{content:?}"))
 }
 
 fn main() -> Result<()> {
@@ -1134,6 +1149,64 @@ mod tests {
         let text = "```json\n{\"is_phishing\": false, \"reason\": \"正常\"}\n```";
         let verdict = parse_llm_verdict(text).expect("圍欄 JSON 應可解析");
         assert!(!verdict.is_phishing);
+    }
+
+    #[test]
+    fn parses_thinking_model_json_verdict() {
+        let response = r#"
+        <think>
+        Let me analyze this email carefully.
+        1. The sender domain is official.
+        2. No phishing indicators.
+        Conclusion: not phishing.
+        </think>
+
+        {"is_phishing": false, "reason": "內部正常公務通知"}
+        "#;
+        let verdict = parse_llm_verdict(response).expect("思考模型 <think> 標籤應可正確剝除並解析");
+        assert!(!verdict.is_phishing);
+        assert_eq!(verdict.reason, "內部正常公務通知");
+    }
+
+    #[test]
+    fn parses_conversational_wrapped_json_verdict() {
+        let response = r#"
+        根據分析，這是一封釣魚郵件：
+        ```json
+        {
+            "is_phishing": true,
+            "reason": "偽裝知名快遞索取個資"
+        }
+        ```
+        請盡速隔離。
+        "#;
+        let verdict =
+            parse_llm_verdict(response).expect("前後包裝文字與 markdown 圍欄應可正確擷取解析");
+        assert!(verdict.is_phishing);
+        assert_eq!(verdict.reason, "偽裝知名快遞索取個資");
+    }
+
+    #[test]
+    fn parses_multiple_thinking_tags_json_verdict() {
+        let response = r#"
+        <thinking>
+        初步觀察：這封信主旨是優惠活動。
+        </thinking>
+        進一步分析：
+        <think>
+        寄件者不是官方網域，含有可疑連結。
+        </think>
+        最終判定：
+        ```json
+        {
+            "is_phishing": true,
+            "reason": "多段思考後判定為詐騙"
+        }
+        ```
+        "#;
+        let verdict = parse_llm_verdict(response).expect("多段 think 與 thinking 標籤應被全數過濾");
+        assert!(verdict.is_phishing);
+        assert_eq!(verdict.reason, "多段思考後判定為詐騙");
     }
 
     #[test]
