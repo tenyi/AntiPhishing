@@ -55,4 +55,5 @@ AntiPhishingGUI/
 3. **設定與安全性**：
    - 帳密與敏感資訊僅存於 `config.toml`，切勿寫死在程式碼內或提交至版本控制。
    - 附件偵測不可連網下載外部資源或啟動外部 Office 程式。
-4. **驗證方式**：修改程式碼後，請確保 `cargo check` 與 `cargo test` 通過。
+4. **驗證方式**：修改程式碼後，請確保 `cargo check`、`cargo fmt --check` 與 `cargo test` 通過。
+5. **日誌與掃描進度**：執行紀錄統一走 `App::push_log`（寫入 `logs/YYYY-MM-DD.log`，UI 只留當日）；每輪掃描後以 `persist_scan_state` 更新 `scan_state.toml` 斷點，啟動時載入以跳過已檢查信件。改動相關邏輯時不得破壞此持久化迴路。

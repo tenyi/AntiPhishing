@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "anti-phishing-gui"
-version = "0.3.0"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -715,6 +715,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
 ]

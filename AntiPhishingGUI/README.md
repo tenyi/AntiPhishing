@@ -44,6 +44,7 @@ check_interval_minutes = 10
 minimize_to_tray = true
 hide_taskbar_when_minimized = true
 start_minimized_to_tray = false
+log_retention_days = 30       # 每日日誌保留天數；0 表示永不清理
 font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整路徑
 ```
 
@@ -53,6 +54,7 @@ font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整
 - `threshold` 是判定門檻。分數達到門檻的郵件會搬到 `phishing_mailbox`。
 - `external_word_image_score` 用於 DOCX 外部圖片追蹤偵測；預設 5 分。
 - `check_interval_minutes` 是排程掃描間隔，範圍為 1–1440 分鐘。
+- `log_retention_days` 是每日日誌檔的保留天數，超過即於啟動時刪除；預設 30，設為 0 表示永不清理。
 - GUI 啟動後會立即掃描前一日與今日郵件；啟動掃描完成後，排程每次只掃描今日郵件。
 - `minimize_to_tray` 開啟後，關閉視窗會留在 Windows 系統匣。
 - `hide_taskbar_when_minimized` 開啟後，縮小至系統匣時隱藏工作列項目。
@@ -61,6 +63,15 @@ font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整
 - `[llm]` 為地端 LLM 釣魚判定（OpenAI 相容 API，如 Ollama / LM Studio）；`base_url` 須以 `/v1` 結尾。`base_url` 或 `model` 留空即停用 LLM 判定，掃描不會搬移任何郵件；LLM 失敗時該封跳過並記於執行紀錄。
 
 程式不會開啟 Word 或連線下載附件內容；DOCX 僅檢查 ZIP 內的 Word relationship XML，找出外部 HTTP(S) 圖片連結。
+
+## 日誌與掃描進度檔
+
+程式會在**執行檔所在目錄**維護兩種檔案（皆已加入 `.gitignore`，不應提交）：
+
+- `logs\YYYY-MM-DD.log`：每日一個日誌檔，每行帶 `[YYYY-MM-DD HH:MM:SS]` 時間戳，記錄郵件掃描與判定結果（無新郵件之空掃不寫入日誌）。啟動時自動刪除超過保留天數的舊日誌，天數由 `[gui] log_retention_days` 設定（預設 30；設為 0 表示永不清理）。
+- `scan_state.toml`：掃描進度檔。記錄來源信箱的 UIDVALIDITY、已完整判定的最大 UID（斷點）、最後判定郵件的 UID／主旨／所屬日期與最後檢查時間。**啟動時讀取此檔續用斷點**，重啟後第一輪掃描即跳過已檢查過的信件，避免重複送 LLM 判定浪費資源。
+
+GUI「執行紀錄」區只顯示當日條目（重啟時回填今日日誌尾端約 200 行），完整歷史請看每日日誌檔。若進度檔損毀或刪除，程式會警告並重新檢查近兩日郵件（安全側行為）。
 
 ## 開發模式執行
 
