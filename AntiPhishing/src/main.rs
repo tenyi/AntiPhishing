@@ -100,6 +100,8 @@ struct LlmConfig {
     base_url: String,
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    api_key: String,
     #[serde(default = "default_llm_timeout_secs")]
     timeout_secs: u64,
     #[serde(default = "default_llm_max_chars")]
@@ -118,6 +120,7 @@ impl Default for LlmConfig {
         Self {
             base_url: String::new(),
             model: String::new(),
+            api_key: String::new(),
             timeout_secs: default_llm_timeout_secs(),
             max_chars: default_llm_max_chars(),
         }
@@ -317,8 +320,12 @@ fn llm_judge(
         .http_status_as_error(false)
         .build();
     let agent = ureq::Agent::new_with_config(agent_config);
-    let mut response = agent
-        .post(&url)
+    let mut request = agent.post(&url);
+    let api_key = config.api_key.trim();
+    if !api_key.is_empty() {
+        request = request.header("Authorization", &format!("Bearer {api_key}"));
+    }
+    let mut response = request
         .send_json(payload)
         .map_err(|error| anyhow::anyhow!("LLM 請求失敗：{error}"))?;
 
@@ -1182,5 +1189,32 @@ mod tests {
         dates.sort_unstable();
         dates.dedup();
         assert_eq!(dates, vec![d2, d3, d1]);
+    }
+
+    #[test]
+    fn llm_config_defaults_api_key_to_empty_when_absent() {
+        let config: LlmConfig = toml::from_str(
+            r#"
+            base_url = "http://127.0.0.1:11434/v1"
+            model = "llama3.1"
+            "#,
+        )
+        .expect("缺 api_key 時應正常反序列化");
+        assert_eq!(config.api_key, "");
+        assert_eq!(config.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(config.model, "llama3.1");
+    }
+
+    #[test]
+    fn llm_config_parses_api_key_when_present() {
+        let config: LlmConfig = toml::from_str(
+            r#"
+            base_url = "https://api.openai.com/v1"
+            model = "gpt-4o-mini"
+            api_key = "sk-test123456"
+            "#,
+        )
+        .expect("有 api_key 時應正常解析");
+        assert_eq!(config.api_key, "sk-test123456");
     }
 }

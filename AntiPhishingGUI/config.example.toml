@@ -31,6 +31,8 @@ font_family = "Noto Sans TC"
 [llm]
 base_url = "http://127.0.0.1:11434/v1"
 model = "llama3.1"
+# 可選：API 金鑰（若使用地端免認證模型如 Ollama 可留空；若使用需認證模型請填入）
+api_key = ""
 # 可選：單一請求逾時（秒），預設 120
 timeout_secs = 120
 # 可選：送給 LLM 的郵件內文最大字元數，預設 6000

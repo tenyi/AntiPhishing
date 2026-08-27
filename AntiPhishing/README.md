@@ -29,8 +29,9 @@ cargo run -- --date 2026-08-05 -y         # 跳過互動確認，直接搬移全
 
 ```toml
 [llm]
-base_url = "http://127.0.0.1:11434/v1"   # Ollama / LM Studio / llama.cpp 等
+base_url = "http://127.0.0.1:11434/v1"   # Ollama / LM Studio / llama.cpp 或雲端 API
 model = "llama3.1"
+api_key = ""                             # 可選：API 金鑰（地端免認證模型可留空）
 timeout_secs = 120                       # 可選：單一請求逾時（秒）
 max_chars = 6000                         # 可選：送給 LLM 的內文最大字元數
 ```
