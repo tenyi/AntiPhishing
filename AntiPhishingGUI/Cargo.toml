@@ -1,11 +1,11 @@
 [package]
 name = "anti-phishing-gui"
-version = "0.3.0"
+version = "0.5.2"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-chrono = { version = "0.4.45", features = ["clock"] }
+chrono = { version = "0.4.45", features = ["clock", "serde"] }
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 imap = "3.0.0-alpha.15"
 mailparse = "0.16.1"

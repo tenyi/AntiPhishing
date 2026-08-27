@@ -380,9 +380,14 @@ fn main() -> Result<()> {
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
 
+    // 確保日期由舊到新排序且不重複，保證 UID 嚴格遞增處理
+    let mut dates = args.date.clone();
+    dates.sort_unstable();
+    dates.dedup();
+
     // 進度顯示在 stderr，stdout 保留給判定結果，方便管線處理
     let progress_width = Cell::new(0usize);
-    'dates: for date in &args.date {
+    'dates: for date in &dates {
         let mut uids: Vec<u32> = session
             .uid_search(format!("ON {}", date.format("%d-%b-%Y")))
             .with_context(|| format!("搜尋 {date} 郵件失敗"))?
@@ -396,14 +401,28 @@ fn main() -> Result<()> {
         );
         let total = uids.len();
         for (index, uid) in uids.into_iter().enumerate() {
-            let messages = session.uid_fetch(uid.to_string(), "RFC822")?;
+            let messages = match session.uid_fetch(uid.to_string(), "RFC822") {
+                Ok(messages) => messages,
+                Err(error) => {
+                    lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
+                    continue;
+                }
+            };
             let Some(message) = messages.iter().next() else {
+                lines.push(format!("郵件 UID {uid} 內容為空，略過。"));
                 continue;
             };
             let Some(bytes) = message.body() else {
+                lines.push(format!("郵件 UID {uid} 內文為空，略過。"));
                 continue;
             };
-            let mail = parse_mail(bytes).context("無法解析郵件內容")?;
+            let mail = match parse_mail(bytes) {
+                Ok(mail) => mail,
+                Err(error) => {
+                    lines.push(format!("無法解析郵件 UID {uid} 內容（略過）：{error:#}"));
+                    continue;
+                }
+            };
             let from = mail.headers.get_first_value("From").unwrap_or_default();
             let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
             // mailparse 對 multipart 的 get_body() 回傳空，改從 subparts 提取
@@ -453,7 +472,7 @@ fn main() -> Result<()> {
         }
         println!(
             "{}：已掃描 {scanned} 封後因 LLM 判定失敗中止，未搬移。",
-            dates_summary(&args.date)
+            dates_summary(&dates)
         );
         return Ok(());
     }
@@ -1152,5 +1171,16 @@ mod tests {
         let text = progress_text(1, 2, &long);
         assert!(text.chars().count() < 60);
         assert!(text.starts_with("檢查第 1/2 封〈"));
+    }
+
+    #[test]
+    fn dates_sorting_and_dedup_orders_oldest_first() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let d3 = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let mut dates = vec![d1, d2, d3, d2];
+        dates.sort_unstable();
+        dates.dedup();
+        assert_eq!(dates, vec![d2, d3, d1]);
     }
 }

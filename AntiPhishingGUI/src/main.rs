@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -36,6 +36,10 @@ const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(600);
 /// 單一 .rels 檔案的解壓上限（Word 關聯檔極小，僅防壓縮炸彈）
 const MAX_DOCX_RELS_BYTES: u64 = 8 * 1024 * 1024;
+/// 每日日誌檔保留天數的預設值；可由 `[gui] log_retention_days` 覆寫
+const LOG_RETENTION_DAYS: i64 = 30;
+/// 啟動時回填到 UI 執行紀錄的今日日誌行數上限
+const BACKFILL_LOG_LINES: usize = 200;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
@@ -85,6 +89,9 @@ struct GuiConfig {
     start_minimized_to_tray: bool,
     #[serde(default = "default_font_family")]
     font_family: String,
+    /// 每日日誌保留天數，超過即於啟動時刪除；0 表示永不清理（預設 30）
+    #[serde(default = "default_log_retention_days")]
+    log_retention_days: u32,
 }
 
 fn default_interval_minutes() -> u64 {
@@ -92,6 +99,9 @@ fn default_interval_minutes() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_log_retention_days() -> u32 {
+    LOG_RETENTION_DAYS as u32
 }
 fn default_external_word_image_score() -> u32 {
     5
@@ -135,6 +145,7 @@ impl Default for Config {
                 hide_taskbar_when_minimized: true,
                 start_minimized_to_tray: false,
                 font_family: default_font_family(),
+                log_retention_days: default_log_retention_days(),
             },
             llm: LlmConfig::default(),
         }
@@ -156,6 +167,135 @@ fn config_path() -> PathBuf {
         .ok()
         .and_then(|path| path.parent().map(|dir| dir.join(CONFIG_FILE_NAME)))
         .unwrap_or_else(|| PathBuf::from(CONFIG_FILE_NAME))
+}
+
+// ===== 掃描進度檔（scan_state.toml）：跨重啟記住檢查斷點，避免重複檢查信件 =====
+
+/// 掃描進度狀態檔內容，存於執行檔所在目錄 `scan_state.toml`。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct LastScanState {
+    /// 來源信箱 UIDVALIDITY（信箱世代）；不符時 `filter_new_uids` 自動放棄此斷點
+    uidvalidity: u32,
+    /// 斷點：本世代已完整判定的最大 UID（LLM 判定失敗者不列入，下輪重試）
+    max_checked_uid: u32,
+    /// 最後完成判定郵件的 UID（參考資訊）
+    last_mail_uid: u32,
+    /// 最後完成判定郵件的主旨
+    last_mail_subject: String,
+    /// 該封所屬的搜尋日期
+    last_mail_date: NaiveDate,
+    /// 本狀態寫入時間（＝最後完成檢查時間，含無新郵件的空掃）
+    checked_at: DateTime<Local>,
+}
+
+/// 進度檔完整路徑：與執行檔同目錄。
+fn scan_state_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("scan_state.toml")))
+        .unwrap_or_else(|| PathBuf::from("scan_state.toml"))
+}
+
+/// 讀取掃描進度檔；檔案不存在＝Ok(None)，解析失敗＝Err（呼叫端轉為警告並全量重掃）。
+fn load_scan_state() -> Result<Option<LastScanState>> {
+    let text = match fs::read_to_string(scan_state_path()) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    toml::from_str(&text)
+        .map(Some)
+        .context("scan_state.toml 解析失敗")
+}
+
+/// 寫入掃描進度檔（整檔覆寫；內容極小，直接同步寫出）。
+fn save_scan_state(state: &LastScanState) -> Result<()> {
+    fs::write(scan_state_path(), toml::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+// ===== 每日日誌檔（logs/YYYY-MM-DD.log） =====
+
+/// 執行紀錄單筆條目：附所屬日期供 UI 只保留最後一天。
+struct LogEntry {
+    date: NaiveDate,
+    line: String,
+}
+
+/// 日誌目錄：執行檔所在目錄下的 logs/（.gitignore 已涵蓋 *.log 與 logs/）。
+fn log_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("logs")))
+        .unwrap_or_else(|| PathBuf::from("logs"))
+}
+
+/// 每日日誌檔名：`YYYY-MM-DD.log`。
+fn log_file_name(date: NaiveDate) -> String {
+    format!("{date}.log")
+}
+
+/// 將訊息逐行附加寫入指定日的日誌檔，每行加 `[YYYY-MM-DD HH:MM:SS]` 前綴。
+/// 追加模式：同一日多次寫入不覆蓋先前內容。
+fn append_log_lines(dir: &Path, date: NaiveDate, messages: &[String]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(log_file_name(date)))?;
+    let stamp = Local::now().format("[%Y-%m-%d %H:%M:%S]");
+    for message in messages {
+        writeln!(file, "{stamp} {message}")?;
+    }
+    Ok(())
+}
+
+/// 讀取指定日日誌檔的尾端行數（供啟動時回填 UI）；檔案不存在視為空。
+fn load_day_log(dir: &Path, date: NaiveDate, max_lines: usize) -> Result<Vec<String>> {
+    let text = match fs::read_to_string(dir.join(log_file_name(date))) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.contains("無新郵件"))
+        .collect();
+    let start = lines.len().saturating_sub(max_lines);
+    Ok(lines[start..].iter().map(|line| line.to_string()).collect())
+}
+
+/// 刪除超過保留天數的舊日誌檔；僅處理「檔名可解析為日期」的 .log，其餘一律跳過。回傳刪除數。
+fn cleanup_old_logs(dir: &Path, today: NaiveDate, retention_days: i64) -> usize {
+    let cutoff = today - chrono::Duration::days(retention_days);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".log") else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(stem, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < cutoff && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 移除非當日的條目，讓 UI 執行紀錄只保留最後一天（純函式便於測試）。
+fn prune_logs(entries: &mut Vec<LogEntry>, today: NaiveDate) {
+    entries.retain(|entry| entry.date == today);
+}
+
+/// 將設定的保留天數轉為清理參數：0 表示永不清理（回傳 None）。
+fn cleanup_retention_days(retention_days: u32) -> Option<i64> {
+    (retention_days > 0).then(|| i64::from(retention_days))
 }
 
 /// 已有另一個執行個體時顯示的提示視窗，數秒後自動關閉。
@@ -292,6 +432,8 @@ struct ScanOutcome {
     uidvalidity: u32,
     /// 本輪實際檢查過的最大 UID（含判定略過者）；未檢查任何郵件時為 None
     max_checked_uid: Option<u32>,
+    /// 本輪最後完成判定的郵件（所屬搜尋日期、UID、主旨）；空掃或未判定任何信為 None
+    last_checked: Option<(NaiveDate, u32, String)>,
     /// 全部日期皆無新郵件（皆已於前輪檢查過）；不寫入執行紀錄，僅更新最後檢查時間
     no_new_mail: bool,
 }
@@ -301,7 +443,10 @@ struct App {
     status: String,
     /// 掃描進行中的即時進度（目前檢查哪封信）；空字串表示無掃描進行
     scan_progress: String,
-    logs: Vec<String>,
+    /// 執行紀錄（僅保留當日條目；完整歷史見每日日誌檔）
+    logs: Vec<LogEntry>,
+    /// 日誌檔寫入失敗時只提示一次的旗標
+    log_error_reported: bool,
     date_text: String,
     next_check: Instant,
     receiver: Option<Receiver<ScanEvent>>,
@@ -321,8 +466,10 @@ struct App {
     mailbox_receiver: Option<Receiver<Result<Vec<String>>>>,
     /// 上次檢查到的最後一封郵件（UIDVALIDITY、最大 UID）；排程掃描藉此跳過無新郵件的一輪
     last_seen: Option<(u32, u32)>,
-    /// 上次完成掃描的時間（含無新郵件的空掃），顯示於狀態列下方
+    /// 上次完成掃描的時間（含無新郵件的空掃），顯示於狀態列下方；跨重啟由進度檔回復
     last_check: Option<DateTime<Local>>,
+    /// 最後完成判定的郵件（UID、主旨、所屬搜尋日期），顯示於狀態列下方
+    last_mail: Option<(u32, String, NaiveDate)>,
 }
 
 struct Tray {
@@ -341,12 +488,46 @@ impl App {
             cc.egui_ctx
                 .send_viewport_cmd(ViewportCommand::Visible(true));
         }
+        // 跨重啟回復掃描斷點：失敗僅警告，安全側行為＝全量重掃近兩日
+        let (scan_state, state_warning) = match load_scan_state() {
+            Ok(Some(state)) => (Some(state), String::new()),
+            Ok(None) => (None, String::new()),
+            Err(error) => (
+                None,
+                format!(" 掃描進度檔載入失敗，將重新檢查近兩日郵件：{error:#}"),
+            ),
+        };
+        // 清理過期日誌並回填今日日誌尾端到執行紀錄顯示（保留天數可設定，0＝永不清理）
+        let today = Local::now().date_naive();
+        let removed = cleanup_retention_days(config.gui.log_retention_days)
+            .map(|days| cleanup_old_logs(&log_dir(), today, days))
+            .unwrap_or(0);
+        let (backfill, log_warning) = match load_day_log(&log_dir(), today, BACKFILL_LOG_LINES) {
+            Ok(lines) => (lines, String::new()),
+            Err(error) => (Vec::new(), format!(" 今日日誌讀取失敗：{error:#}")),
+        };
+        let mut status = format!("{status} {font_status}");
+        if !state_warning.is_empty() || !log_warning.is_empty() {
+            status.push_str(&state_warning);
+            status.push_str(&log_warning);
+        }
+        if removed > 0 {
+            status.push_str(&format!(" 已清理 {removed} 個過期日誌檔。"));
+        }
+        let logs = backfill
+            .into_iter()
+            .map(|line| LogEntry { date: today, line })
+            .collect();
+        let last_seen = scan_state
+            .as_ref()
+            .map(|state| (state.uidvalidity, state.max_checked_uid));
         Self {
             next_check: Instant::now() + interval(&config),
             config,
-            status: format!("{status} {font_status}"),
+            status,
             scan_progress: String::new(),
-            logs: Vec::new(),
+            logs,
+            log_error_reported: false,
             date_text: Local::now().date_naive().to_string(),
             receiver: None,
             ask_receiver: None,
@@ -358,8 +539,15 @@ impl App {
             hide_window_on_startup,
             mailboxes: Vec::new(),
             mailbox_receiver: None,
-            last_seen: None,
-            last_check: None,
+            last_seen,
+            last_check: scan_state.as_ref().map(|state| state.checked_at),
+            last_mail: scan_state.map(|state| {
+                (
+                    state.last_mail_uid,
+                    state.last_mail_subject,
+                    state.last_mail_date,
+                )
+            }),
         }
     }
 
@@ -393,6 +581,46 @@ impl App {
         }
     }
 
+    /// 統一日誌入口：附加寫入當日日誌檔並加入 UI 執行紀錄（僅保留當日條目）。
+    fn push_log(&mut self, message: String) {
+        let now = Local::now();
+        let date = now.date_naive();
+        let line = format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S"), message);
+        if let Err(error) = append_log_lines(&log_dir(), date, std::slice::from_ref(&message)) {
+            // 磁碟異常不得影響掃描與 UI：僅在狀態列提示一次
+            if !self.log_error_reported {
+                self.log_error_reported = true;
+                self.status = format!("日誌檔寫入失敗（不再重複提示）：{error:#}");
+            }
+        }
+        prune_logs(&mut self.logs, date);
+        self.logs.push(LogEntry { date, line });
+    }
+
+    /// 掃描結束後將最新進度寫回掃描進度檔（斷點＋最後一封郵件資訊）；失敗僅提示不中斷。
+    fn persist_scan_state(&mut self) {
+        let (Some(last_seen), Some(last_check)) = (self.last_seen, self.last_check) else {
+            return;
+        };
+        let Some((uid, subject, mail_date)) = &self.last_mail else {
+            return;
+        };
+        let state = LastScanState {
+            uidvalidity: last_seen.0,
+            max_checked_uid: last_seen.1,
+            last_mail_uid: *uid,
+            last_mail_subject: subject.clone(),
+            last_mail_date: *mail_date,
+            checked_at: last_check,
+        };
+        if let Err(error) = save_scan_state(&state)
+            && !self.log_error_reported
+        {
+            self.log_error_reported = true;
+            self.status = format!("掃描進度檔寫入失敗（不再重複提示）：{error:#}");
+        }
+    }
+
     fn start_scan(&mut self, scheduled: bool) {
         let date = match NaiveDate::parse_from_str(&self.date_text, "%Y-%m-%d") {
             Ok(value) => value,
@@ -401,10 +629,17 @@ impl App {
                 return;
             }
         };
-        self.start_scan_dates(vec![date], scheduled);
+        // 手動指定日期掃描時不帶 last_seen（執行全量檢查不套用 UID 過濾），排程掃描才帶 last_seen
+        let last_seen = if scheduled { self.last_seen } else { None };
+        self.start_scan_dates(vec![date], last_seen, scheduled);
     }
 
-    fn start_scan_dates(&mut self, dates: Vec<NaiveDate>, scheduled: bool) {
+    fn start_scan_dates(
+        &mut self,
+        dates: Vec<NaiveDate>,
+        last_seen: Option<(u32, u32)>,
+        scheduled: bool,
+    ) {
         if self.receiver.is_some() {
             self.status = "已有掃描進行中，請稍候。".into();
             return;
@@ -422,7 +657,6 @@ impl App {
             return;
         }
         let config = self.config.clone();
-        let last_seen = self.last_seen;
         let (sender, receiver) = mpsc::channel::<ScanEvent>();
         self.receiver = Some(receiver);
         // 搬移確認通道：worker 於掃描結束前送出待搬移清單並阻塞等待決定
@@ -436,7 +670,7 @@ impl App {
         } else if scheduled {
             "排程掃描中…".into()
         } else {
-            "手動掃描中…".into()
+            "手動全量掃描中…".into()
         };
         thread::spawn(move || {
             // catch_unwind：worker panic 時仍回傳結果，避免 UI 端 receiver 永久卡住
@@ -448,6 +682,7 @@ impl App {
                     lines: vec![format!("掃描失敗：{error:#}")],
                     uidvalidity: 0,
                     max_checked_uid: None,
+                    last_checked: None,
                     no_new_mail: false,
                 },
                 Err(panic) => {
@@ -460,6 +695,7 @@ impl App {
                         lines: vec![format!("掃描執行緒異常中止：{detail}")],
                         uidvalidity: 0,
                         max_checked_uid: None,
+                        last_checked: None,
                         no_new_mail: false,
                     }
                 }
@@ -496,10 +732,7 @@ impl App {
         if worker_lost || done.is_some() {
             if worker_lost {
                 self.status = "掃描執行緒異常結束，未回傳任何結果。".into();
-                self.logs.push(format!(
-                    "[{}] 掃描執行緒異常結束，未回傳任何結果。",
-                    Local::now().format("%H:%M:%S")
-                ));
+                self.push_log("掃描執行緒異常結束，未回傳任何結果。".into());
                 send_notification(
                     "AntiPhishing 掃描失敗",
                     "掃描執行緒異常結束，未回傳任何結果。",
@@ -507,16 +740,29 @@ impl App {
             } else if let Some(outcome) = done {
                 self.last_check = Some(Local::now());
                 if outcome.no_new_mail {
-                    // 無新郵件的排程空掃：只更新最後檢查時間，不洗版執行紀錄
+                    // 無新郵件的排程空掃：只更新最後檢查時間，不寫入執行紀錄、日誌檔與進度檔
                     self.status =
                         format!("最後檢查 {}：無新郵件。", Local::now().format("%H:%M:%S"));
                 } else {
-                    self.logs.extend(outcome.lines.iter().cloned());
-                    self.status = outcome.lines.last().cloned().unwrap_or_default();
-                    // 記住本輪檢查進度，下輪排程掃描只檢查其後的新信
-                    if let Some(max_uid) = outcome.max_checked_uid {
-                        self.last_seen = Some((outcome.uidvalidity, max_uid));
+                    for line in &outcome.lines {
+                        self.push_log(line.clone());
                     }
+                    self.status = outcome.lines.last().cloned().unwrap_or_default();
+                    // 記住本輪檢查進度：若在相同信箱世代下，取原有進度與本輪最大進度之較大者，
+                    // 避免手動掃描過去歷史日期時將全域進度降級
+                    if let Some(max_uid) = outcome.max_checked_uid {
+                        self.last_seen = Some(match self.last_seen {
+                            Some((validity, seen_max)) if validity == outcome.uidvalidity => {
+                                (validity, seen_max.max(max_uid))
+                            }
+                            _ => (outcome.uidvalidity, max_uid),
+                        });
+                    }
+                    if let Some((mail_date, uid, subject)) = &outcome.last_checked {
+                        self.last_mail = Some((*uid, subject.clone(), *mail_date));
+                    }
+                    // 本輪有新檢查進度時才寫回進度檔，重啟後即可從斷點續掃
+                    self.persist_scan_state();
                 }
                 // 失敗時以系統匣通知提醒（視窗可能縮在系統匣看不到）
                 if let Some(first_failure) = outcome
@@ -605,10 +851,12 @@ impl App {
             self.startup_scan_pending = false;
             let today = Local::now().date_naive();
             self.date_text = today.to_string();
-            self.start_scan_dates(startup_scan_dates(today).to_vec(), false);
+            self.start_scan_dates(startup_scan_dates(today).to_vec(), self.last_seen, false);
         } else if self.receiver.is_none() && Instant::now() >= self.next_check {
-            self.date_text = Local::now().date_naive().to_string();
-            self.start_scan(true);
+            let today = Local::now().date_naive();
+            self.date_text = today.to_string();
+            // 排程定時掃描自動涵蓋前一日與今日（應對 UTC 時區落差），並傳入 last_seen 斷點續掃
+            self.start_scan_dates(startup_scan_dates(today).to_vec(), self.last_seen, true);
         }
         if let Some(tray) = &self.tray {
             let show_id = tray.show.id().clone();
@@ -624,8 +872,13 @@ impl App {
                     }
                 }
                 if event.id == scan_id {
-                    self.date_text = Local::now().date_naive().to_string();
-                    self.start_scan(false);
+                    let today = Local::now().date_naive();
+                    self.date_text = today.to_string();
+                    self.start_scan_dates(
+                        startup_scan_dates(today).to_vec(),
+                        self.last_seen,
+                        false,
+                    );
                 }
                 if event.id == quit_id {
                     self.allow_exit = true;
@@ -847,6 +1100,10 @@ impl eframe::App for App {
                         last_check.format("%Y-%m-%d %H:%M:%S")
                     ));
                 }
+                // 跨重啟由進度檔回復的最後判定郵件資訊
+                if let Some((uid, subject, mail_date)) = &self.last_mail {
+                    ui.small(format!("上次檢查至 UID {uid}〈{subject}〉（{mail_date}）"));
+                }
                 // 掃描進行中顯示即時進度（目前檢查哪封信）；完成後自動消失
                 if !self.scan_progress.is_empty() {
                     ui.horizontal(|ui| {
@@ -967,8 +1224,8 @@ impl eframe::App for App {
                 if self.logs.is_empty() {
                     ui.small("尚無執行紀錄");
                 } else {
-                    for log in self.logs.iter().rev().take(20) {
-                        ui.label(log);
+                    for entry in self.logs.iter().rev().take(20) {
+                        ui.label(&entry.line);
                     }
                 }
             });
@@ -1502,10 +1759,17 @@ fn scan_mail(
     let mut scanned = 0;
     // 本輪實際檢查過（完成判定）的最大 UID；LLM 判定失敗的信不列入，下輪會重試
     let mut max_checked_uid: Option<u32> = None;
+    // 本輪最後完成判定的郵件（搜尋日期、UID、主旨），供進度檔記錄
+    let mut last_checked: Option<(NaiveDate, u32, String)> = None;
     let mut aborted_by_llm_error = false;
     // 疑似釣魚/惡意廣告郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
-    'dates: for date in dates {
+    // 確保日期由舊到新排序且不重複，保證 UID 嚴格遞增處理
+    let mut sorted_dates = dates.to_vec();
+    sorted_dates.sort_unstable();
+    sorted_dates.dedup();
+
+    'dates: for date in &sorted_dates {
         let mut uids: Vec<u32> = session
             .uid_search(format!("ON {}", date.format("%d-%b-%Y")))
             .with_context(|| format!("搜尋 {date} 郵件失敗"))?
@@ -1525,11 +1789,24 @@ fn scan_mail(
         }
         let total = uids.len();
         for (index, uid) in uids.into_iter().enumerate() {
-            let messages = session.uid_fetch(uid.to_string(), "RFC822")?;
+            let messages = match session.uid_fetch(uid.to_string(), "RFC822") {
+                Ok(messages) => messages,
+                Err(error) => {
+                    lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
+                    continue;
+                }
+            };
             let Some(bytes) = messages.iter().next().and_then(|message| message.body()) else {
+                lines.push(format!("郵件 UID {uid} 內容為空或已被刪除，略過。"));
                 continue;
             };
-            let mail = parse_mail(bytes).context("無法解析郵件內容")?;
+            let mail = match parse_mail(bytes) {
+                Ok(mail) => mail,
+                Err(error) => {
+                    lines.push(format!("無法解析郵件 UID {uid} 內容（略過）：{error:#}"));
+                    continue;
+                }
+            };
             let from = mail.headers.get_first_value("From").unwrap_or_default();
             let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
             // mailparse 對 multipart 的 get_body() 回傳空，改從 subparts 提取
@@ -1554,6 +1831,7 @@ fn scan_mail(
                             // 本封已完成判定（不論結果），記住檢查進度
                             max_checked_uid =
                                 Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                            last_checked = Some((*date, uid, subject.clone()));
                             if verdict.is_phishing {
                                 pending.push((uid, subject.clone(), score, verdict.reason));
                             } else {
@@ -1577,6 +1855,7 @@ fn scan_mail(
                 None => {
                     // LLM 未設定：僅計數不判定；仍記住進度，完整警告只在首輪顯示
                     max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                    last_checked = Some((*date, uid, subject.clone()));
                 }
             }
         }
@@ -1588,6 +1867,7 @@ fn scan_mail(
             lines: Vec::new(),
             uidvalidity: original_uidvalidity,
             max_checked_uid: None,
+            last_checked: None,
             no_new_mail: true,
         });
     }
@@ -1595,12 +1875,13 @@ fn scan_mail(
         session.logout().ok();
         lines.push(format!(
             "{}：已掃描 {scanned} 封後因 LLM 判定失敗中止，未搬移。",
-            dates_summary(dates)
+            dates_summary(&sorted_dates)
         ));
         return Ok(ScanOutcome {
             lines,
             uidvalidity: original_uidvalidity,
             max_checked_uid,
+            last_checked,
             no_new_mail: false,
         });
     }
@@ -1695,6 +1976,7 @@ fn scan_mail(
         lines,
         uidvalidity: original_uidvalidity,
         max_checked_uid,
+        last_checked,
         no_new_mail: false,
     })
 }
@@ -2127,6 +2409,7 @@ fn external_image_targets_from_relationships(xml: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn detects_external_word_image_relationship() {
@@ -2343,6 +2626,20 @@ mod tests {
     }
 
     #[test]
+    fn gui_log_retention_days_defaults_to_30_when_absent() {
+        // 既有 config.toml 缺此欄位時，預設保留 30 天
+        let gui: GuiConfig = toml::from_str("").expect("所有欄位皆有 serde 預設值");
+        assert_eq!(gui.log_retention_days, 30);
+    }
+
+    #[test]
+    fn cleanup_retention_days_zero_means_never_cleanup() {
+        assert_eq!(cleanup_retention_days(0), None);
+        assert_eq!(cleanup_retention_days(30), Some(30));
+        assert_eq!(cleanup_retention_days(7), Some(7));
+    }
+
+    #[test]
     fn confirm_move_auto_approves_when_disabled_or_empty() {
         let (ask, _ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
         let (_reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
@@ -2515,5 +2812,172 @@ mod tests {
         assert_eq!(filter_new_uids(vec![3, 7], Some((42, 9)), 43), [3, 7]);
         // 從未掃描過：保留全部
         assert_eq!(filter_new_uids(vec![3, 7], None, 42), [3, 7]);
+    }
+
+    // ===== 掃描進度檔與每日日誌 =====
+
+    /// 建立唯一的暫存目錄供檔案型測試使用。
+    fn temp_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系統時間應晚於 UNIX_EPOCH")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("apgui-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).expect("應能建立暫存目錄");
+        dir
+    }
+
+    #[test]
+    fn scan_state_round_trips_through_toml() {
+        let state = LastScanState {
+            uidvalidity: 42,
+            max_checked_uid: 999,
+            last_mail_uid: 999,
+            last_mail_subject: "DHL：包裹待領取「引號」".into(),
+            last_mail_date: NaiveDate::from_ymd_opt(2026, 8, 25).unwrap(),
+            checked_at: Local
+                .with_ymd_and_hms(2026, 8, 25, 10, 30, 0)
+                .single()
+                .expect("應可建構時間"),
+        };
+        let text = toml::to_string_pretty(&state).expect("應可序列化");
+        let parsed: LastScanState = toml::from_str(&text).expect("應可反序列化");
+        assert_eq!(parsed, state);
+    }
+
+    #[test]
+    fn malformed_scan_state_text_is_rejected() {
+        assert!(toml::from_str::<LastScanState>("不是 TOML 內容").is_err());
+        // 缺欄位亦不可靜默接受，避免半殘斷點造成漏掃或誤跳
+        assert!(toml::from_str::<LastScanState>("uidvalidity = 42").is_err());
+    }
+
+    #[test]
+    fn log_file_name_formats_daily_path() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        assert_eq!(log_file_name(date), "2026-08-05.log");
+    }
+
+    #[test]
+    fn append_log_lines_creates_and_appends_with_timestamp() {
+        let dir = temp_test_dir("append");
+        let date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        append_log_lines(&dir, date, &["第一行".into()]).expect("首次寫入應成功");
+        append_log_lines(&dir, date, &["第二行".into()]).expect("第二次寫入應為附加");
+        let text = fs::read_to_string(dir.join(log_file_name(date))).expect("應有日誌檔");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "同一日兩次寫入不得覆蓋");
+        assert!(lines[0].ends_with("第一行"));
+        assert!(
+            lines[0].contains("[2026-") && lines[0].starts_with('['),
+            "應有時間戳前綴：{}",
+            lines[0]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_day_log_caps_tail_and_scopes_to_requested_date() {
+        let dir = temp_test_dir("loadday");
+        let day = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        fs::write(
+            dir.join(log_file_name(day)),
+            "a\n[2026-08-25 13:40:46] 檢查完成：無新郵件。\nb\nc\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(log_file_name(NaiveDate::from_ymd_opt(2026, 8, 24).unwrap())),
+            "昨日內容\n",
+        )
+        .unwrap();
+        // 只讀指定日、只取尾端上限行數、過濾無新郵件空掃紀錄；缺檔視為空
+        assert_eq!(load_day_log(&dir, day, 2).unwrap(), ["b", "c"]);
+        assert_eq!(load_day_log(&dir, day, 10).unwrap(), ["a", "b", "c"]);
+        let missing = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        assert!(load_day_log(&dir, missing, 5).unwrap().is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_logs_keeps_only_today_entries() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let mut entries = vec![
+            LogEntry {
+                date: yesterday,
+                line: "舊".into(),
+            },
+            LogEntry {
+                date: today,
+                line: "新".into(),
+            },
+        ];
+        prune_logs(&mut entries, today);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].line, "新");
+    }
+
+    #[test]
+    fn cleanup_old_logs_removes_only_expired_dated_files() {
+        let dir = temp_test_dir("cleanup");
+        let today = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let expired = dir.join(log_file_name(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()));
+        let kept_recent = dir.join(log_file_name(NaiveDate::from_ymd_opt(2026, 8, 24).unwrap()));
+        let kept_unparsed = dir.join("notes.log");
+        for path in [&expired, &kept_recent, &kept_unparsed] {
+            fs::write(path, "x").unwrap();
+        }
+        let removed = cleanup_old_logs(&dir, today, LOG_RETENTION_DAYS);
+        assert_eq!(removed, 1);
+        assert!(!expired.exists(), "超過保留天數的日誌應被刪除");
+        assert!(kept_recent.exists(), "保留期內的日誌不應被刪");
+        assert!(kept_unparsed.exists(), "非日期檔名一律跳過");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dates_sorting_and_dedup_orders_oldest_first() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let d3 = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let mut dates = vec![d1, d2, d3, d2];
+        dates.sort_unstable();
+        dates.dedup();
+        assert_eq!(dates, vec![d2, d3, d1]);
+    }
+
+    #[test]
+    fn last_seen_merging_keeps_maximum_uid_within_same_validity() {
+        let current_last_seen = Some((1000u32, 500u32));
+        // 手動掃描過去日期（最大 UID 為 300），不應降級目前進度 500
+        let outcome_uidvalidity = 1000u32;
+        let outcome_max_uid = 300u32;
+        let updated = match current_last_seen {
+            Some((validity, seen_max)) if validity == outcome_uidvalidity => {
+                (validity, seen_max.max(outcome_max_uid))
+            }
+            _ => (outcome_uidvalidity, outcome_max_uid),
+        };
+        assert_eq!(updated, (1000, 500));
+
+        // 手動/排程掃描到新信（最大 UID 為 600），應升級為 600
+        let outcome_max_uid_new = 600u32;
+        let updated_new = match current_last_seen {
+            Some((validity, seen_max)) if validity == outcome_uidvalidity => {
+                (validity, seen_max.max(outcome_max_uid_new))
+            }
+            _ => (outcome_uidvalidity, outcome_max_uid_new),
+        };
+        assert_eq!(updated_new, (1000, 600));
+
+        // 信箱重建（UIDVALIDITY 變為 2000），應直接採用新 validity
+        let outcome_new_validity = 2000u32;
+        let updated_rebuild = match current_last_seen {
+            Some((validity, seen_max)) if validity == outcome_new_validity => {
+                (validity, seen_max.max(100))
+            }
+            _ => (outcome_new_validity, 100),
+        };
+        assert_eq!(updated_rebuild, (2000, 100));
     }
 }
