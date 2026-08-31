@@ -631,7 +631,8 @@ impl App {
         };
         // 手動指定日期掃描時不帶 last_seen（執行全量檢查不套用 UID 過濾），排程掃描才帶 last_seen
         let last_seen = if scheduled { self.last_seen } else { None };
-        self.start_scan_dates(vec![date], last_seen, scheduled);
+        // 自動納入前一日以消除伺服器 UTC 時差落差（例如臺灣 UTC+8 凌晨信件會落在伺服器前一日）
+        self.start_scan_dates(startup_scan_dates(date).to_vec(), last_seen, scheduled);
     }
 
     fn start_scan_dates(
@@ -665,9 +666,7 @@ impl App {
         self.ask_receiver = Some(ask_receiver);
         self.reply_sender = Some(reply_sender);
         self.scan_progress.clear();
-        self.status = if dates.len() > 1 {
-            "啟動掃描前一日與今日郵件中…".into()
-        } else if scheduled {
+        self.status = if scheduled {
             "排程掃描中…".into()
         } else {
             "手動全量掃描中…".into()

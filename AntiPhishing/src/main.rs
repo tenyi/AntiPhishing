@@ -402,10 +402,8 @@ fn main() -> Result<()> {
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
 
-    // 確保日期由舊到新排序且不重複，保證 UID 嚴格遞增處理
-    let mut dates = args.date.clone();
-    dates.sort_unstable();
-    dates.dedup();
+    // 自動納入前一日以消除伺服器 UTC 時差落差（例如臺灣 UTC+8 凌晨信件會落在伺服器前一日）
+    let dates = expand_scan_dates(&args.date);
 
     // 進度顯示在 stderr，stdout 保留給判定結果，方便管線處理
     let progress_width = Cell::new(0usize);
@@ -797,6 +795,17 @@ fn confirm_move_interactive(pending: &[(u32, String, u32, String)]) -> Vec<u32> 
         }
         _ => Vec::new(),
     }
+}
+
+/// 擴充掃描日期：每個指定日期自動包含前一日（安全視窗），以消除 IMAP 伺服器 UTC 時差落差，並按日期由舊到新排序且去重。
+fn expand_scan_dates(dates: &[NaiveDate]) -> Vec<NaiveDate> {
+    let mut expanded: Vec<NaiveDate> = dates
+        .iter()
+        .flat_map(|&d| [d - chrono::Duration::days(1), d])
+        .collect();
+    expanded.sort_unstable();
+    expanded.dedup();
+    expanded
 }
 
 fn dates_summary(dates: &[NaiveDate]) -> String {
@@ -1290,6 +1299,18 @@ mod tests {
         dates.sort_unstable();
         dates.dedup();
         assert_eq!(dates, vec![d2, d3, d1]);
+    }
+
+    #[test]
+    fn expand_scan_dates_expands_previous_day_and_dedups() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+        let d0 = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+        let expanded = expand_scan_dates(&[d1]);
+        assert_eq!(expanded, vec![d0, d1]);
+
+        let d_prev = NaiveDate::from_ymd_opt(2026, 8, 29).unwrap();
+        let expanded_multi = expand_scan_dates(&[d0, d1]);
+        assert_eq!(expanded_multi, vec![d_prev, d0, d1]);
     }
 
     #[test]
