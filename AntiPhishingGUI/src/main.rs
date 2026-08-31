@@ -1092,7 +1092,18 @@ impl eframe::App for App {
             .max_height(settings_max)
             .show(ui, |ui| {
                 ui.heading("AntiPhishing 郵件防護");
-                ui.label(&self.status);
+                if self.receiver.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(&self.status)
+                                .color(egui::Color32::from_rgb(255, 140, 0))
+                                .strong(),
+                        );
+                    });
+                } else {
+                    ui.label(&self.status);
+                }
                 // 上次完成掃描的時間（含無新郵件的空掃）；空掃不寫執行紀錄，只更新此處
                 if let Some(last_check) = self.last_check {
                     ui.small(format!(
@@ -1108,7 +1119,12 @@ impl eframe::App for App {
                 if !self.scan_progress.is_empty() {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(egui::RichText::new(&self.scan_progress).small().strong());
+                        ui.label(
+                            egui::RichText::new(&self.scan_progress)
+                                .color(egui::Color32::from_rgb(0, 160, 230))
+                                .small()
+                                .strong(),
+                        );
                     });
                 }
                 ui.separator();
@@ -1223,8 +1239,19 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.start_scan(false);
-                    } else if scan_busy {
-                        ui.small("掃描進行中…");
+                    }
+                    if scan_busy {
+                        ui.spinner();
+                        let progress_display = if self.scan_progress.is_empty() {
+                            "掃描進行中…"
+                        } else {
+                            &self.scan_progress
+                        };
+                        ui.label(
+                            egui::RichText::new(progress_display)
+                                .color(egui::Color32::from_rgb(255, 140, 0))
+                                .strong(),
+                        );
                     }
                     ui.label("日期");
                     ui.text_edit_singleline(&mut self.date_text);
@@ -1232,7 +1259,22 @@ impl eframe::App for App {
             });
         // 下方 1/3：執行紀錄（恆顯示，最新優先）
         ui.separator();
-        ui.heading("執行紀錄");
+        ui.horizontal(|ui| {
+            ui.heading("執行紀錄");
+            if self.receiver.is_some() {
+                ui.spinner();
+                let progress_display = if self.scan_progress.is_empty() {
+                    "正在掃描中…"
+                } else {
+                    &self.scan_progress
+                };
+                ui.label(
+                    egui::RichText::new(progress_display)
+                        .color(egui::Color32::from_rgb(255, 140, 0))
+                        .strong(),
+                );
+            }
+        });
         egui::ScrollArea::vertical()
             .id_salt("logs_scroll_area")
             .auto_shrink([false, false])
@@ -2281,11 +2323,15 @@ pub fn decode_imap_utf7(s: &str) -> String {
     result.push_str(rest);
     result
 }
-/// 常見快遞品牌及其官方網域（小寫）：用於偵測 From 顯示名稱偽裝。
-const BRAND_OFFICIAL_DOMAINS: [(&str, &str); 3] = [
-    ("dhl", "dhl.com"),
-    ("fedex", "fedex.com"),
-    ("ups", "ups.com"),
+/// 常見快遞與電商品牌及其官方網域（小寫）：用於偵測 From 顯示名稱偽裝。
+const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 7] = [
+    ("dhl", &["dhl.com"]),
+    ("fedex", &["fedex.com"]),
+    ("ups", &["ups.com"]),
+    ("momo", &["momoshop.com.tw", "momo.com.tw"]),
+    ("pchome", &["pchome.com.tw", "pcstore.com.tw"]),
+    ("shopee", &["shopee.tw", "shopee.com"]),
+    ("蝦皮", &["shopee.tw", "shopee.com"]),
 ];
 fn phishing_score(
     from: &str,
@@ -2329,14 +2375,19 @@ fn phishing_score(
         score += 4;
         reasons.push("含 QR code 圖片（quishing）".into());
     }
-    // 品牌偽裝：From 顯示名稱含品牌（如 DHL），但寄件網域非該品牌官方網域
+    // 品牌偽裝：From 顯示名稱含品牌（如 DHL、momo、蝦皮），但寄件網域非該品牌官方網域
     let email_domain = RE_EMAIL_DOMAIN.captures(&from).map(|c| c[1].to_string());
     let display_name = from.split('<').next().unwrap_or(from.as_str()).trim();
     if let Some(domain) = email_domain {
-        for (brand, official) in BRAND_OFFICIAL_DOMAINS {
-            if display_name.contains(brand) && !domain.ends_with(official) {
+        for (brand, officials) in BRAND_OFFICIAL_DOMAINS {
+            if display_name.contains(brand)
+                && !officials.iter().any(|official| domain.ends_with(official))
+            {
                 score += 3;
-                reasons.push(format!("品牌偽裝：顯示名稱含 {brand} 但網域非 {official}"));
+                reasons.push(format!(
+                    "品牌偽裝：顯示名稱含 {brand} 但網域非 {}",
+                    officials.join("/")
+                ));
                 break;
             }
         }
@@ -2689,6 +2740,16 @@ mod tests {
         );
         assert!(score >= 3);
         assert!(reasons.iter().any(|r| r.contains("品牌偽裝")));
+
+        let (score_momo, reasons_momo) = phishing_score(
+            "MOMO會員權益 <service02@service02.6htao.com>",
+            "發票中獎",
+            "",
+            &[],
+            &test_detection_config(),
+        );
+        assert!(score_momo >= 3);
+        assert!(reasons_momo.iter().any(|r| r.contains("品牌偽裝")));
     }
 
     #[test]
@@ -2701,6 +2762,15 @@ mod tests {
             &test_detection_config(),
         );
         assert!(!reasons.iter().any(|r| r.contains("品牌偽裝")));
+
+        let (_, reasons_momo) = phishing_score(
+            "momo購物網 <service@momoshop.com.tw>",
+            "發票開立",
+            "",
+            &[],
+            &test_detection_config(),
+        );
+        assert!(!reasons_momo.iter().any(|r| r.contains("品牌偽裝")));
     }
 
     // ===== 搬移確認 =====
@@ -3099,5 +3169,31 @@ mod tests {
         )
         .expect("有 api_key 時應正常解析");
         assert_eq!(config.api_key, "sk-test123456");
+    }
+
+    #[test]
+    fn parses_momospam_eml_and_verifies_detection() {
+        let eml_bytes = fs::read("momoSpam.eml").expect("應可讀取 momoSpam.eml");
+        let mail = mailparse::parse_mail(&eml_bytes).expect("應可解析郵件");
+        let from = mail.headers.get_first_value("From").unwrap_or_default();
+        let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
+        let (body, score_body) = extract_body_text(&mail);
+        let targets = external_word_image_targets(&mail);
+        let detection_cfg = test_detection_config();
+        let (score, reasons) =
+            phishing_score(&from, &subject, &score_body, &targets, &detection_cfg);
+        let prompt = llm_user_prompt(&from, &subject, &body, 4000, &targets);
+
+        println!("=== momoSpam.eml 解析結果 ===");
+        println!("From: {from}");
+        println!("Subject: {subject}");
+        println!("Score: {score}");
+        println!("Reasons: {reasons:?}");
+        println!("Prompt:\n{prompt}");
+
+        assert!(from.contains("6htao.com"));
+        assert!(subject.contains("momo購物網"));
+        assert!(score >= 5);
+        assert!(reasons.iter().any(|r| r.contains("品牌偽裝")));
     }
 }
