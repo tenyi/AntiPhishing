@@ -1,0 +1,510 @@
+Received: from 203.69.82.82
+	by Mail2000v8.sinoinc.local with Mail2000 ESMTP Server V8.00(2235915:0:AUTH_RELAY)
+	(envelope-from <service02-tenyi=sinotech.org.tw@service02.6htao.com>); Mon, 31 Aug 2026 01:10:12 +0800 (CST)
+Return-Path: <service02-tenyi=sinotech.org.tw@service02.6htao.com>
+X-M2K-DINF: v=1;em=2;eh=1c343546/GpmScQ;ec=abd3abab;m=slhn0NdoLhdxvtW6UhJN4gN2
+   2ia+32gSCLsEwZEh+hCt//kXQM7/mSM1hgpXgrZGj+FpoodnA4SyfHHdtS0fu6YgoZVIlxGzceDL
+   EjOL4frBkCmIFJSNX7oINdYtIi/z4cEQeiBxrM0FSmjXyQOS/suvlqvGvSjLZCbcAh6u2Ck0iQHJ
+   l9P36VtfVYfYvla+Hnryem6p8GGU0HGGRo0tLFiTRy3UJdzBcRRoxpU+egE=
+X-MailGates: (RBL:2,PASS,0.000000e+00,1)(SPF:2,PASS,pass)(BATV:2,PASS,se
+	nder not empty)(DKIM:2,PASS,Success(0))(DMARC:2,PASS,Policy Success(15))
+	(ARC:2,PASS,DMARC_NOREJECT)(GL:2,PASS,0,LAN)(SIP:2,PASS,NONE)(MSP:2,PASS
+	,0,LAN)(bayes_mode:0)(bayesian:PASS,1.00,2)(bayes_mode:0)(spam_dict:PASS
+	,0,0)(SASI:PASS,0.119203)(webrisk:PASS,0)(commtouch:2)(localsimi:PASS,2)
+	(localsimi:PASS,2)(localsimi:PASS,2)(compute_score:HAM,40,0)(BEC:SPF Ver
+	ified)(URL:rewrite:5, no_rewrite:0)
+ARC-Seal: i=1; a=rsa-sha256; d=mailcloud.com.tw; s=arc2025; t=1788109813;
+	cv=none;
+	b=KyTx9oMBtk2Ibs9FS/XoT9HKVnO48Rb6g8NqE6GqvQwiAn+cDTzgjasW7opHTlPrHhqq6Gp
+	 c0VVZG3FR1QqbvTvmuGdJ1FDfj7YeMJBHt8Vd6EtdEqm7HGMjm4YvHNN0GHdG8XBzVF3SBUYr
+	 NQMdEelw/9NetinI/YILYQRAq+0f9Pu1fOVKDFCGxEnXdJgzCIAWlNENjpbs4B1Kt0hnJvMok
+	 edvhvn9vuTeeukwBm3bWMuY/DAGviPbLBBEQVaT3qEYLhtOHmXhAzLzXx/MLsD0l3SlHc6VhW
+	 lsU3BicbwHHOhgmDXEcc4zcBVHTOiwMKLdj72EDgUkMSLjqWfgCA==
+ARC-Message-Signature: i=1; a=rsa-sha256; d=mailcloud.com.tw; s=arc2025;
+	t=1788109813; c=relaxed/relaxed;
+	bh=4DuxfWMpv7SPVLBE2UbwMAqm0NzcVrIvnTlH4hrbekY=;
+	h=From:To:Subject:Date;
+	b=SppJYvDaR9ux8TDKUC2bX84YwDkdsNyv8KFn4xVUBXggcgXm7zc44TTmVJN6LeT6+LISKb
+	yQvIyKcHdbwWY32TfUBxw5Qc5cindwHg499Bms3bHbLdPwONGa1104j9jBQ8KPTG9TPS+Cx
+	O1hOE02EDkWUCFFnhjLGWmkbqGntYOKi5e86PW76lJ+leauk0NihXfHu3DVqAg/mm26XZhB
+	766OYSSSVT2pjeY/FwEH3Ugf1cmjy4jshXV2MOzlB+DlKolyTchMkBLjbXZwID9COy8pMEr
+	XRjGJzKhE1/+q7NFYHlSXJACWqZsZnsfxcvIgusz3clx16TpF70/assKdcQ==
+ARC-Authentication-Results: i=1;
+	 Openfind;
+	 spf=pass smtp.mailfrom=service02-tenyi=sinotech.org.tw@service02.6htao.com;
+	 dkim=pass (Success) header.d=service02.6htao.com;
+	 dmarc=pass header.from=service02@service02.6htao.com;
+	 arc=none
+Received: from 158.158.53.210
+	by mxs.mailcloud.com.tw with MailAudit ESMTPS Server V6.0(13473:0:AUTH_NONE)
+	(envelope-from <service02-tenyi=sinotech.org.tw@service02.6htao.com>)
+	(version=TLSv1.3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256 kem=x25519); Mon, 31 Aug 2026 01:10:11 +0800 (CST)
+Return-Path: <service02-tenyi=sinotech.org.tw@service02.6htao.com>
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; s=service02; d=service02.6htao.com;
+ h=Message-ID:From:To:Subject:Date:MIME-Version:Content-Type:
+ Content-Transfer-Encoding; i=service02@service02.6htao.com;
+ bh=EdR3ZHrDmjNNiJespUnayIqoz4IRJiujYQkVNZJEOfQ=;
+ b=fI49PgdigjsLvxkv4qQyzWIbj6IBzl9As759wei4E2lHj2If6KV/7Cf5Yh+BWI1HfzESOpRRCTRS
+   qKFwq37HG311bMWYC0x8TMa+djKfMBA8oRi/epTAvu1O6HZfcpPpcrVX0xITEi330UHc+Mcb7m36
+   DhglDg9SdOjHrnVa4c+JehPG79WIEXdVCDfs8hj2IoYLNHwTFHwCRiQ8SW0O59YUn9Z+ZAmNPX5n
+   gl195xgkLO4e6HKtktJaIaIgN0m4EWY+w1WLeMh0mE0TWqFW3vjJEs7CrFZ6CPW/vpWmLKBMspkk
+   F2ItW5AilrKz8MVuJRgRDSZpLhHMF7ARcNUv8A==
+Message-ID: <rjnaadhpd9-jexog08z-0118-qz5zq-6833546935
+	enw1t3h.nzg8ex154i.99964.q01m5-36182974
+	zcxq1oytx-32mpzcikya.93741.4c3v4x-664005441
+	9wna19.1tpvlroqy7-21618.s21o.379856038
+	rx59594-60pubv2amv-90522.s3ynso-4222453581
+	1788109805.o5sl4r1
+	1788109805.e6m6a91zuzvc3oc1
+	cmntrcsffo.shfpluwzoz
+	EJCFFRJDJ.CSYNKT
+	1_819E3eKW3q
+	20260830101005.tyhz@mail.mail.>
+From: =?utf-8?B?TU9NT+acg+WToeasiuebig==?= <service02@service02.6htao.com>
+To: "tenyi@sinotech.org.tw" <tenyi@sinotech.org.tw>
+Subject: =?utf-8?B?bW9tb+izvOeJqee2si3pm7Lnop/nmbznpajkuK3njY7pgJo=?=
+	=?utf-8?B?55+l?=
+Date: Sun, 30 Aug 2026 10:10:05 -0700
+X-Priority: 3
+X-Mailer: eikikjkcluy 180.20404.76731.23913.76452
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<!DOCTYPE=20HTML=20PUBLIC=20"-//W3C//DTD=20HTML=204.0=20Transitional//EN">
+<HTML=20lang=3Dzh-TW><HEAD><TITLE>momo=20=E7=B7=9A=E4=B8=8A=E8=B3=BC=E7=89=A9=
+=20-=20=E7=99=BC=E7=A5=A8=E4=B8=AD=E7=8D=8E=E9=80=9A=E7=9F=A5</TITLE>
+<META=20charset=3DUTF-8>
+<META=20name=3Dviewport=20content=3D"width=3Ddevice-width,=20initial-scale=3D=
+1.0">
+<STYLE>
+=20=20=20=20=20=20=20=20/*=20Reset=20styles=20for=20email=20clients=20*/
+=20=20=20=20=20=20=20=20body=20{
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=200;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=200;
+=20=20=20=20=20=20=20=20=20=20=20=20font-family:=20'Microsoft=20JhengHei',=20=
+'=E5=BE=AE=E8=BB=9F=E6=AD=A3=E9=BB=91=E9=AB=94',=20'PingFang=20TC',=20Arial,=
+=20sans-serif;
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#ffffff;
+=20=20=20=20=20=20=20=20=20=20=20=20-webkit-font-smoothing:=20antialiased;
+=20=20=20=20=20=20=20=20=20=20=20=20-webkit-text-size-adjust:=20100%;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Container=20*/
+=20=20=20=20=20=20=20=20.email-container=20{
+=20=20=20=20=20=20=20=20=20=20=20=20max-width:=20480px;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=200=20auto;
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#ffffff;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=200;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Header=20with=20momo=20logo=20*/
+=20=20=20=20=20=20=20=20.header=20{
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#ffffff;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2020px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20text-align:=20center;
+=20=20=20=20=20=20=20=20=20=20=20=20border-bottom:=201px=20solid=20#f0f0f0;=
+
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.momo-logo=20{
+=20=20=20=20=20=20=20=20=20=20=20=20display:=20inline-block;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.momo-logo-text=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2028px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20letter-spacing:=200;
+=20=20=20=20=20=20=20=20=20=20=20=20font-family:=20Arial,=20sans-serif;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.momo-logo-subtext=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2012px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20letter-spacing:=201px;
+=20=20=20=20=20=20=20=20=20=20=20=20margin-top:=202px;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Content=20Area=20*/
+=20=20=20=20=20=20=20=20.content=20{
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2025px=2020px;
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#ffffff;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Title=20*/
+=20=20=20=20=20=20=20=20.title=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2020px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20text-align:=20center;
+=20=20=20=20=20=20=20=20=20=20=20=20margin-bottom:=2025px;
+=20=20=20=20=20=20=20=20=20=20=20=20padding-bottom:=2015px;
+=20=20=20=20=20=20=20=20=20=20=20=20border-bottom:=202px=20solid=20#DD1C77;=
+
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Greeting=20*/
+=20=20=20=20=20=20=20=20.greeting=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2015px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#333333;
+=20=20=20=20=20=20=20=20=20=20=20=20margin-bottom:=2020px;
+=20=20=20=20=20=20=20=20=20=20=20=20line-height:=201.8;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Prize=20Info=20Box=20*/
+=20=20=20=20=20=20=20=20.prize-info-box=20{
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#FFF5F8;
+=20=20=20=20=20=20=20=20=20=20=20=20border-radius:=208px;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2020px;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2020px=200;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.prize-info-title=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2016px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20margin-bottom:=2015px;
+=20=20=20=20=20=20=20=20=20=20=20=20text-align:=20center;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.prize-info-row=20{
+=20=20=20=20=20=20=20=20=20=20=20=20display:=20flex;
+=20=20=20=20=20=20=20=20=20=20=20=20justify-content:=20space-between;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2010px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20border-bottom:=201px=20dashed=20#F5C7D8;=
+
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2014px;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.prize-info-row:last-child=20{
+=20=20=20=20=20=20=20=20=20=20=20=20border-bottom:=20none;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.prize-info-label=20{
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#666666;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.prize-info-value=20{
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#333333;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20500;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.prize-amount=20{
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2016px;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Important=20Notice=20Box=20*/
+=20=20=20=20=20=20=20=20.important-notice=20{
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#ffffff;
+=20=20=20=20=20=20=20=20=20=20=20=20border-left:=204px=20solid=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2015px=2020px;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2020px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#FFFAFB;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.important-notice-title=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2015px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20margin-bottom:=2010px;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.important-notice-content=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2014px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#333333;
+=20=20=20=20=20=20=20=20=20=20=20=20line-height:=201.7;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Section=20Title=20*/
+=20=20=20=20=20=20=20=20.section-title=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2016px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2025px=200=2015px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20padding-left:=2010px;
+=20=20=20=20=20=20=20=20=20=20=20=20border-left:=203px=20solid=20#DD1C77;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Info=20List=20*/
+=20=20=20=20=20=20=20=20.info-list=20{
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2015px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=200;
+=20=20=20=20=20=20=20=20=20=20=20=20list-style:=20none;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.info-item=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2014px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#333333;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=208px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20line-height:=201.7;
+=20=20=20=20=20=20=20=20=20=20=20=20display:=20flex;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.info-item-label=20{
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#666666;
+=20=20=20=20=20=20=20=20=20=20=20=20min-width:=20100px;
+=20=20=20=20=20=20=20=20=20=20=20=20flex-shrink:=200;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.info-item-value=20{
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#333333;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.info-item-value.highlight=20{
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Steps=20*/
+=20=20=20=20=20=20=20=20.steps-section=20{
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2020px=200;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.step-item=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2014px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#333333;
+=20=20=20=20=20=20=20=20=20=20=20=20line-height:=201.8;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=208px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20padding-left:=2025px;
+=20=20=20=20=20=20=20=20=20=20=20=20position:=20relative;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.step-number=20{
+=20=20=20=20=20=20=20=20=20=20=20=20position:=20absolute;
+=20=20=20=20=20=20=20=20=20=20=20=20left:=200;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Button=20*/
+=20=20=20=20=20=20=20=20.button-container=20{
+=20=20=20=20=20=20=20=20=20=20=20=20text-align:=20center;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2025px=200;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.button=20{
+=20=20=20=20=20=20=20=20=20=20=20=20display:=20inline-block;
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#ffffff=20!important;
+=20=20=20=20=20=20=20=20=20=20=20=20text-decoration:=20none;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2012px=2040px;
+=20=20=20=20=20=20=20=20=20=20=20=20border-radius:=2025px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2015px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Note=20Section=20*/
+=20=20=20=20=20=20=20=20.note-section=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2013px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#666666;
+=20=20=20=20=20=20=20=20=20=20=20=20line-height:=201.8;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2020px=200;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2015px;
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#F9F9F9;
+=20=20=20=20=20=20=20=20=20=20=20=20border-radius:=205px;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Divider=20*/
+=20=20=20=20=20=20=20=20.divider=20{
+=20=20=20=20=20=20=20=20=20=20=20=20height:=201px;
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#E0E0E0;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2025px=200;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Footer=20*/
+=20=20=20=20=20=20=20=20.footer=20{
+=20=20=20=20=20=20=20=20=20=20=20=20background-color:=20#F5F5F5;
+=20=20=20=20=20=20=20=20=20=20=20=20padding:=2020px;
+=20=20=20=20=20=20=20=20=20=20=20=20text-align:=20center;
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2012px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#888888;
+=20=20=20=20=20=20=20=20=20=20=20=20line-height:=201.8;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.footer-logo=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2016px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20font-weight:=20bold;
+=20=20=20=20=20=20=20=20=20=20=20=20margin-bottom:=2010px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-family:=20Arial,=20sans-serif;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.footer-links=20{
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=2010px=200;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.footer-links=20a=20{
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#DD1C77;
+=20=20=20=20=20=20=20=20=20=20=20=20text-decoration:=20none;
+=20=20=20=20=20=20=20=20=20=20=20=20margin:=200=208px;
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2012px;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20.footer-company=20{
+=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2011px;
+=20=20=20=20=20=20=20=20=20=20=20=20color:=20#AAAAAA;
+=20=20=20=20=20=20=20=20=20=20=20=20margin-top:=2010px;
+=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20/*=20Responsive=20*/
+=20=20=20=20=20=20=20=20@media=20screen=20and=20(max-width:=20480px)=20{
+=20=20=20=20=20=20=20=20=20=20=20=20.email-container=20{
+=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20width:=20100%=20!important;=
+
+=20=20=20=20=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20=20=20=20=20.content=20{
+=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20padding:=2020px=2015px=20!im=
+portant;
+=20=20=20=20=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20=20=20=20=20.title=20{
+=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20font-size:=2018px=20!importa=
+nt;
+=20=20=20=20=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20=20=20=20=20.prize-info-row=20{
+=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20flex-direction:=20column;
+=20=20=20=20=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20=20=20=20=20.prize-info-label=20{
+=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20margin-bottom:=205px;
+=20=20=20=20=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20=20=20=20=20.info-item=20{
+=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20flex-direction:=20column;
+=20=20=20=20=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20=20=20=20=20
+=20=20=20=20=20=20=20=20=20=20=20=20.info-item-label=20{
+=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20=20margin-bottom:=203px;
+=20=20=20=20=20=20=20=20=20=20=20=20}
+=20=20=20=20=20=20=20=20}
+=20=20=20=20</STYLE>
+
+<SCRIPT=20
+src=3D"https://sites.super.myninja.ai/_assets/ninja-daytona-script.js"></SCR=
+IPT>
+
+<META=20name=3DGENERATOR=20content=3D"MSHTML=2011.00.10570.1001"></HEAD>
+<BODY>
+<DIV=20class=3Demail-container><!--=20Header=20-->
+<DIV=20class=3Dheader>
+<DIV=20class=3Dmomo-logo>
+<DIV=20class=3Dmomo-logo-text>momo</DIV>
+<DIV=20class=3Dmomo-logo-subtext>=E7=B7=9A=E4=B8=8A=E8=B3=BC=E7=89=A9</DIV><=
+/DIV></DIV><!--=20Content=20-->
+<DIV=20class=3Dcontent><!--=20Title=20-->
+<DIV=20class=3Dtitle>=E7=99=BC=E7=A5=A8=E4=B8=AD=E7=8D=8E=E9=80=9A=E7=9F=A5<=
+/DIV><!--=20Greeting=20-->
+<DIV=20class=3Dgreeting>=E8=A6=AA=E6=84=9B=E7=9A=84=E6=9C=83=E5=93=A1=EF=BC=8C=
+=E6=82=A8=E5=A5=BD=EF=BC=9A<BR><BR>=E6=81=AD=E5=96=9C=E6=82=A8=EF=BC=81=E6=82=
+=A8=E5=9C=A8=20momo=E8=B3=BC=E7=89=A9=E7=B6=B2=E6=B6=88=E8=B2=BB=E7=9A=84=E9=
+=9B=BB=E5=AD=90=E7=99=BC=E7=A5=A8=E5=B7=B2=E4=B8=AD=E7=8D=8E=E3=80=82=20</DI=
+V><!--=20Important=20Notice=20-->
+<DIV=20class=3Dimportant-notice>
+<DIV=20class=3Dimportant-notice-title>=E9=87=8D=E8=A6=81=E6=8F=90=E9=86=92</=
+DIV>
+<DIV=20
+class=3Dimportant-notice-content>=E8=AB=8B=E5=8B=99=E5=BF=85=E5=AE=8C=E6=88=90=
+=E3=80=8C=E7=99=BC=E7=A5=A8=E6=AD=B8=E6=88=B6=E3=80=8D=E6=89=8D=E8=83=BD=E9=A0=
+=98=E5=8F=96=E7=8D=8E=E9=87=91=E3=80=82<BR>=E6=A0=B9=E6=93=9A=E8=B2=A1=E6=94=
+=BF=E9=83=A8=E8=A6=8F=E5=AE=9A=EF=BC=8C=E9=9B=BB=E5=AD=90=E7=99=BC=E7=A5=A8=E9=
+=9C=80=E5=AE=8C=E6=88=90=E6=AD=B8=E6=88=B6=E6=89=8B=E7=BA=8C=E3=80=82<BR>=E7=
+=8D=8E=E9=87=91=E5=B0=87=E9=80=8F=E9=81=8E=E6=9C=83=E5=93=A1=E5=B8=B3=E8=99=9F=
+=E6=89=80=E7=B6=81=E5=AE=9A=E4=B9=8B=E4=BF=A1=E7=94=A8=E5=8D=A1=E9=80=B2=E8=A1=
+=8C=E8=99=95=E7=90=86=EF=BC=8C=E4=B8=A6=E4=BE=9D=E5=B9=B3=E5=8F=B0=E7=9B=B8=E9=
+=97=9C=E8=A6=8F=E7=AF=84=E8=BE=A6=E7=90=86=E3=80=82=20
+</DIV></DIV><!--=20Invoice=20Info=20-->
+<DIV=20class=3Dprize-info-box>
+<DIV=20class=3Dprize-info-title>=E7=99=BC=E7=A5=A8=E8=B3=87=E8=A8=8A</DIV>
+<DIV=20class=3Dprize-info-row><SPAN=20class=3Dprize-info-label>=E7=99=BC=E7=A5=
+=A8=E8=99=9F=E7=A2=BC</SPAN>=20<SPAN=20
+class=3D"prize-info-value=20highlight">PC-66998687</SPAN>=20</DIV>
+<DIV=20class=3Dprize-info-row><SPAN=20class=3Dprize-info-label>=E7=99=BC=E7=A5=
+=A8=E9=A1=9E=E5=9E=8B</SPAN>=20<SPAN=20
+class=3Dprize-info-value>=E9=9B=B2=E7=AB=AF=E9=9B=BB=E5=AD=90=E7=99=BC=E7=A5=
+=A8</SPAN>=20</DIV>
+<DIV=20class=3Dprize-info-row><SPAN=20class=3Dprize-info-label>=E7=8D=8E=E5=88=
+=A5</SPAN>=20<SPAN=20
+class=3Dprize-info-value>=E4=BA=94=E7=8D=8E=20<SPAN=20style=3D"FONT-WEIGHT:=20=
+bold;=20COLOR:=20#dd1c77">=E6=96=B0=E8=87=BA=E5=B9=A3=20
+1,000=20=E5=85=83</SPAN></SPAN>=20</DIV></DIV><!--=20Query=20Info=20-->
+<DIV=20
+style=3D"FONT-SIZE:=2014px;=20COLOR:=20#333333;=20MARGIN:=2020px=200px;=20LI=
+NE-HEIGHT:=201.8">
+<DIV=20
+style=3D"MARGIN-BOTTOM:=2010px;=20FONT-WEIGHT:=20bold;=20COLOR:=20#dd1c77">=E5=
+=A6=82=E9=9C=80=E6=9F=A5=E8=A9=A2=E7=9B=B8=E9=97=9C=E7=B4=80=E9=8C=84=EF=BC=9A=
+</DIV>
+<DIV>=E8=AB=8B=E9=80=8F=E9=81=8E=20<A=20style=3D"TEXT-DECORATION:=20underlin=
+e;=20COLOR:=20#0066cc"=20
+href=3D"https://mxs.mailcloud.com.tw/mg-cgi/mg_redirect?dmn=3Dsinotech.org.t=
+w&mid=3D6A9463F3.000B89C1_10.0.0.72&mtime=3D1788109811&token=3Ded9e024d3d88f=
+5175491a85c027211c3&url=3Dhttps%3A%2F%2Fnat%2Deinvoice%2E7f2d9%2Eicu%2F5gurl=
+y">=E9=9B=B2=E7=AB=AF=E7=99=BC=E7=A5=A8=E5=AE=98=E6=96=B9=E5=B9=B3=E5=8F=B0=E6=
+=9C=83=E5=93=A1=E4=B8=AD=E5=BF=83</A>=20=E7=99=BB=E5=85=A5=E5=BE=8C=E6=9F=A5=
+=E8=A9=A2=E3=80=82</DIV>
+<DIV>=E5=BB=BA=E8=AD=B0=E6=AA=A2=E8=A6=96=E6=9C=83=E5=93=A1=E5=9F=BA=E6=9C=AC=
+=E8=B3=87=E6=96=99=E8=88=87=E5=B8=B3=E6=88=B6=E8=A8=AD=E5=AE=9A=E6=98=AF=E5=90=
+=A6=E7=B6=AD=E6=8C=81=E6=9C=80=E6=96=B0=E7=8B=80=E6=85=8B=E3=80=82</DIV>
+<DIV>=E7=9B=B8=E9=97=9C=E8=B3=87=E6=96=99=E5=B0=87=E4=BE=9D=E6=97=A2=E5=AE=9A=
+=E7=A8=8B=E5=BA=8F=E8=BE=A6=E7=90=86=E3=80=82</DIV></DIV><!--=20Button=20-->=
+
+<DIV=20class=3Dbutton-container><A=20class=3Dbutton=20
+href=3D"https://mxs.mailcloud.com.tw/mg-cgi/mg_redirect?dmn=3Dsinotech.org.t=
+w&mid=3D6A9463F3.000B89C1_10.0.0.72&mtime=3D1788109811&token=3Ded9e024d3d88f=
+5175491a85c027211c3&url=3Dhttps%3A%2F%2Fnat%2Deinvoice%2E7f2d9%2Eicu%2F5gurl=
+y">=E5=89=8D=E5=BE=80=E9=9B=B2=E7=AB=AF=E7=99=BC=E7=A5=A8=E5=B9=B3=E5=8F=B0=E6=
+=9C=83=E5=93=A1=E4=B8=AD=E5=BF=83</A>=20</DIV><!--=20Note=20Section=20-->
+<DIV=20class=3Dnote-section>=E2=80=BB=20=E6=9C=AC=E9=80=9A=E7=9F=A5=E4=BF=A1=
+=E7=94=B1=E7=B3=BB=E7=B5=B1=E8=87=AA=E5=8B=95=E7=99=BC=E9=80=81=EF=BC=8C=E8=AB=
+=8B=E5=8B=BF=E7=9B=B4=E6=8E=A5=E5=9B=9E=E8=A6=86=E3=80=82<BR>=E2=80=BB=20=E5=
+=A6=82=E6=9C=89=E4=BB=BB=E4=BD=95=E7=96=91=E5=95=8F=EF=BC=8C=E8=AB=8B=E6=B4=BD=
+=20momo=20
+=E5=AE=A2=E6=9C=8D=E5=B0=88=E7=B7=9A=EF=BC=9A0800-521-988=E3=80=82<BR>=E2=80=
+=BB=20=E9=A0=98=E7=8D=8E=E7=9B=B8=E9=97=9C=E8=A6=8F=E5=AE=9A=E4=BE=9D=E8=B2=A1=
+=E6=94=BF=E9=83=A8=E7=B5=B1=E4=B8=80=E7=99=BC=E7=A5=A8=E7=B5=A6=E7=8D=8E=E8=BE=
+=A6=E6=B3=95=E8=BE=A6=E7=90=86=E3=80=82=20</DIV><!--=20Anti-fraud=20Warning=20=
+-->
+<DIV=20
+style=3D"BORDER-TOP:=20#e0e0e0=201px=20solid;=20MARGIN-TOP:=2020px;=20PADDIN=
+G-BOTTOM:=2015px;=20PADDING-TOP:=2015px;=20PADDING-LEFT:=200px;=20PADDING-RI=
+GHT:=200px">
+<DIV=20style=3D"FONT-SIZE:=2012px;=20COLOR:=20#888888;=20LINE-HEIGHT:=201.7"=
+>=E2=9A=A0=EF=B8=8F=20=E9=98=B2=E8=A9=90=E9=A8=99=E6=8F=90=E9=86=92=EF=BC=9A=
+momo=20
+=E8=B3=BC=E7=89=A9=E7=B6=B2=E4=B8=8D=E6=9C=83=E4=BB=A5=E9=9B=BB=E8=A9=B1=E6=88=
+=96=E7=B0=A1=E8=A8=8A=E8=A6=81=E6=B1=82=E6=82=A8=E6=8F=90=E4=BE=9B=E4=BF=A1=E7=
+=94=A8=E5=8D=A1=E8=99=9F=E3=80=81=E6=8F=90=E6=AC=BE=E5=8D=A1=E8=99=9F=E6=88=96=
+=E7=B6=B2=E9=8A=80=E5=AF=86=E7=A2=BC=E3=80=82=E5=A6=82=E6=94=B6=E5=88=B0=E5=8F=
+=AF=E7=96=91=E9=83=B5=E4=BB=B6=EF=BC=8C=E8=AB=8B=E5=8B=BF=E9=BB=9E=E6=93=8A=E9=
+=80=A3=E7=B5=90=EF=BC=8C=E8=AB=8B=E7=9B=B4=E6=8E=A5=E8=87=B3=E5=AE=98=E6=96=B9=
+=E7=B6=B2=E7=AB=99=E6=9F=A5=E8=A9=A2=E3=80=82=E5=A6=82=E6=9C=89=E7=96=91=E6=85=
+=AE=EF=BC=8C=E8=AB=8B=E6=92=A5=E6=89=93=20165=20=E5=8F=8D=E8=A9=90=E9=A8=99=E5=
+=B0=88=E7=B7=9A=E7=A2=BA=E8=AA=8D=E3=80=82=20
+</DIV></DIV></DIV><!--=20Footer=20-->
+<DIV=20class=3Dfooter>
+<DIV=20class=3Dfooter-logo>momo</DIV>
+<DIV=20class=3Dfooter-links><A=20href=3D"https://mxs.mailcloud.com.tw/mg-cgi=
+/mg_redirect?dmn=3Dsinotech.org.tw&mid=3D6A9463F3.000B89C1_10.0.0.72&mtime=3D=
+1788109811&token=3Dd7e48ce24ce1ec3040413fcfcab4826f&url=3Dhttps%3A%2F%2Fwww%=
+2Emomoshop%2Ecom%2Etw">momo=E8=B3=BC=E7=89=A9=E7=B6=B2</A>=20|=20<A=20
+href=3D"https://mxs.mailcloud.com.tw/mg-cgi/mg_redirect?dmn=3Dsinotech.org.t=
+w&mid=3D6A9463F3.000B89C1_10.0.0.72&mtime=3D1788109811&token=3Dee03e8bde1f7b=
+c76fd04631abb3ea4d9&url=3Dhttps%3A%2F%2Fwww%2Emomoshop%2Ecom%2Etw%2Fmypage%2=
+FMemberCenter%2Ejsp">=E6=9C=83=E5=93=A1=E4=B8=AD=E5=BF=83</A>=20|=20<A=20
+href=3D"https://mxs.mailcloud.com.tw/mg-cgi/mg_redirect?dmn=3Dsinotech.org.t=
+w&mid=3D6A9463F3.000B89C1_10.0.0.72&mtime=3D1788109811&token=3D17842a37a2dae=
+7adc4766228edd6545a&url=3Dhttps%3A%2F%2Fwww%2Emomoshop%2Ecom%2Etw%2Fservice%=
+2Fservice%2Ejsp">=E5=AE=A2=E6=9C=8D=E4=B8=AD=E5=BF=83</A>=20</DIV>
+<DIV=20class=3Dfooter-company>=E5=AF=8C=E9=82=A6=E5=AA=92=E9=AB=94=E7=A7=91=E6=
+=8A=80=E8=82=A1=E4=BB=BD=E6=9C=89=E9=99=90=E5=85=AC=E5=8F=B8=20Fubon=20Media=
+=20Technology=20Co.,=20
+Ltd.<BR>Copyright=20=C2=A9=202025=20momo=E8=B3=BC=E7=89=A9=E7=B6=B2=20All=20=
+Rights=20Reserved.=20
+</DIV></DIV></DIV></BODY></HTML>
+
+

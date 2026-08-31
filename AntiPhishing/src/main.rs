@@ -807,11 +807,15 @@ fn dates_summary(dates: &[NaiveDate]) -> String {
         .join("、")
 }
 
-/// 常見快遞品牌及其官方網域（小寫）：用於偵測 From 顯示名稱偽裝。
-const BRAND_OFFICIAL_DOMAINS: [(&str, &str); 3] = [
-    ("dhl", "dhl.com"),
-    ("fedex", "fedex.com"),
-    ("ups", "ups.com"),
+/// 常見快遞與電商品牌及其官方網域（小寫）：用於偵測 From 顯示名稱偽裝。
+const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 7] = [
+    ("dhl", &["dhl.com"]),
+    ("fedex", &["fedex.com"]),
+    ("ups", &["ups.com"]),
+    ("momo", &["momoshop.com.tw", "momo.com.tw"]),
+    ("pchome", &["pchome.com.tw", "pcstore.com.tw"]),
+    ("shopee", &["shopee.tw", "shopee.com"]),
+    ("蝦皮", &["shopee.tw", "shopee.com"]),
 ];
 
 fn phishing_score(
@@ -856,14 +860,19 @@ fn phishing_score(
         score += 4;
         reasons.push("含 QR code 圖片（quishing）".into());
     }
-    // 品牌偽裝：From 顯示名稱含品牌（如 DHL），但寄件網域非該品牌官方網域
+    // 品牌偽裝：From 顯示名稱含品牌（如 DHL、momo、蝦皮），但寄件網域非該品牌官方網域
     let email_domain = RE_EMAIL_DOMAIN.captures(&from).map(|c| c[1].to_string());
     let display_name = from.split('<').next().unwrap_or(from.as_str()).trim();
     if let Some(domain) = email_domain {
-        for (brand, official) in BRAND_OFFICIAL_DOMAINS {
-            if display_name.contains(brand) && !domain.ends_with(official) {
+        for (brand, officials) in BRAND_OFFICIAL_DOMAINS {
+            if display_name.contains(brand)
+                && !officials.iter().any(|official| domain.ends_with(official))
+            {
                 score += 3;
-                reasons.push(format!("品牌偽裝：顯示名稱含 {brand} 但網域非 {official}"));
+                reasons.push(format!(
+                    "品牌偽裝：顯示名稱含 {brand} 但網域非 {}",
+                    officials.join("/")
+                ));
                 break;
             }
         }
@@ -1049,6 +1058,16 @@ mod tests {
         );
         assert!(score >= 3);
         assert!(reasons.iter().any(|r| r.contains("品牌偽裝")));
+
+        let (score_momo, reasons_momo) = phishing_score(
+            "MOMO會員權益 <service02@service02.6htao.com>",
+            "發票中獎",
+            "",
+            &[],
+            &bare_config(),
+        );
+        assert!(score_momo >= 3);
+        assert!(reasons_momo.iter().any(|r| r.contains("品牌偽裝")));
     }
 
     #[test]
@@ -1061,6 +1080,15 @@ mod tests {
             &bare_config(),
         );
         assert!(!reasons.iter().any(|r| r.contains("品牌偽裝")));
+
+        let (_, reasons_momo) = phishing_score(
+            "momo購物網 <service@momoshop.com.tw>",
+            "發票開立",
+            "",
+            &[],
+            &bare_config(),
+        );
+        assert!(!reasons_momo.iter().any(|r| r.contains("品牌偽裝")));
     }
 
     // 回歸：multipart/alternative 的內文在 subparts 裡，get_body() 回傳空。
