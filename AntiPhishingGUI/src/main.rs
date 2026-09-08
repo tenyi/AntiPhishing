@@ -6,7 +6,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+    sync::mpsc::{Receiver, Sender, TryRecvError},
     sync::{Arc, LazyLock, mpsc},
     thread,
     time::{Duration, Instant},
@@ -32,8 +32,8 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// IMAP 讀寫逾時（避免伺服器停滯時 worker 永久卡死）
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
-/// 搬移確認對話框的最長等待時間；逾時視為全部跳過（不搬移）
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(600);
+/// 連假或跨日追溯補掃的最高天數上限（避免無限回溯）
+const MAX_CATCHUP_DAYS: i64 = 60;
 /// 單一 .rels 檔案的解壓上限（Word 關聯檔極小，僅防壓縮炸彈）
 const MAX_DOCX_RELS_BYTES: u64 = 8 * 1024 * 1024;
 /// 每日日誌檔保留天數的預設值；可由 `[gui] log_retention_days` 覆寫
@@ -470,6 +470,8 @@ struct App {
     last_check: Option<DateTime<Local>>,
     /// 最後完成判定的郵件（UID、主旨、所屬搜尋日期），顯示於狀態列下方
     last_mail: Option<(u32, String, NaiveDate)>,
+    /// 偵測到疑似郵件彈出確認時的多幀焦點強制重試計數
+    focus_restore_ticks: u8,
 }
 
 struct Tray {
@@ -548,7 +550,16 @@ impl App {
                     state.last_mail_date,
                 )
             }),
+            focus_restore_ticks: 0,
         }
+    }
+
+    /// 取得上次完成掃描的最後郵件日期（若無最後郵件則使用最後檢查時間所屬日期）
+    fn last_scanned_date(&self) -> Option<NaiveDate> {
+        self.last_mail
+            .as_ref()
+            .map(|(_, _, date)| *date)
+            .or_else(|| self.last_check.as_ref().map(|dt| dt.date_naive()))
     }
 
     fn fetch_mailboxes(&mut self) {
@@ -708,6 +719,13 @@ impl App {
             self.hide_window_on_startup = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
+        if self.focus_restore_ticks > 0 {
+            self.focus_restore_ticks -= 1;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+            ctx.request_repaint();
+        }
         // 掃描事件排水：Progress 更新進度行；Done＝整輪結束。
         // Disconnected＝worker 結束但未送結果（理論上已被 catch_unwind 攔住）
         let mut done: Option<ScanOutcome> = None;
@@ -777,7 +795,14 @@ impl App {
             self.reply_sender = None;
             self.pending_move = None;
             self.scan_progress.clear();
-            self.next_check = Instant::now() + interval(&self.config);
+            // 若上次掃描日期早於今日（如連假或多日未確認），立即觸發補掃直到最新；否則排入正常間隔
+            let today = Local::now().date_naive();
+            let needs_catchup = self.last_scanned_date().map_or(false, |d| d < today);
+            self.next_check = if needs_catchup {
+                Instant::now()
+            } else {
+                Instant::now() + interval(&self.config)
+            };
         }
         // worker 請求確認搬移：先暫存，視窗顯示時由 Dialog 呈現（eframe 不允許在 logic 繪製 UI）
         if let Some(ask) = &self.ask_receiver {
@@ -805,7 +830,10 @@ impl App {
                             })
                             .collect();
                         self.pending_move = Some(PendingMoveDialog { candidates, reply });
-                        // 偵測到疑似釣魚／惡意廣告郵件需確認時：解除系統匣縮小/隱藏狀態，顯示視窗並置中螢幕
+                        // 偵測到疑似釣魚／惡意廣告郵件需確認時：解除系統匣縮小/隱藏狀態，設定置頂、取得焦點並置中螢幕
+                        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
+                            egui::WindowLevel::AlwaysOnTop,
+                        ));
                         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                         ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -815,6 +843,8 @@ impl App {
                         if let Some(cmd) = ViewportCommand::center_on_screen(ctx) {
                             ctx.send_viewport_cmd(cmd);
                         }
+                        self.focus_restore_ticks = 3;
+                        ctx.request_repaint();
                     }
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -846,16 +876,21 @@ impl App {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if self.receiver.is_none() && self.startup_scan_pending {
+        if self.receiver.is_none() && self.pending_move.is_none() && self.startup_scan_pending {
             self.startup_scan_pending = false;
             let today = Local::now().date_naive();
             self.date_text = today.to_string();
-            self.start_scan_dates(startup_scan_dates(today).to_vec(), self.last_seen, false);
-        } else if self.receiver.is_none() && Instant::now() >= self.next_check {
+            let dates = scan_dates_since_last(today, self.last_scanned_date());
+            self.start_scan_dates(dates, self.last_seen, false);
+        } else if self.receiver.is_none()
+            && self.pending_move.is_none()
+            && Instant::now() >= self.next_check
+        {
             let today = Local::now().date_naive();
             self.date_text = today.to_string();
-            // 排程定時掃描自動涵蓋前一日與今日（應對 UTC 時區落差），並傳入 last_seen 斷點續掃
-            self.start_scan_dates(startup_scan_dates(today).to_vec(), self.last_seen, true);
+            // 排程定時掃描自上次掃描日期一路涵蓋至今日（防跨日與連假遺漏），並傳入 last_seen 斷點續掃
+            let dates = scan_dates_since_last(today, self.last_scanned_date());
+            self.start_scan_dates(dates, self.last_seen, true);
         }
         if let Some(tray) = &self.tray {
             let show_id = tray.show.id().clone();
@@ -870,14 +905,11 @@ impl App {
                         ctx.send_viewport_cmd(cmd);
                     }
                 }
-                if event.id == scan_id {
+                if event.id == scan_id && self.receiver.is_none() && self.pending_move.is_none() {
                     let today = Local::now().date_naive();
                     self.date_text = today.to_string();
-                    self.start_scan_dates(
-                        startup_scan_dates(today).to_vec(),
-                        self.last_seen,
-                        false,
-                    );
+                    let dates = scan_dates_since_last(today, self.last_scanned_date());
+                    self.start_scan_dates(dates, self.last_seen, false);
                 }
                 if event.id == quit_id {
                     self.allow_exit = true;
@@ -1289,10 +1321,15 @@ impl eframe::App for App {
                 }
             });
         // 搬移確認對話框：使用者決定後清空，未決定則保留等下次繪製
-        if let Some(mut dialog) = self.pending_move.take()
-            && !Self::show_move_confirmation(ui.ctx(), &mut dialog)
-        {
-            self.pending_move = Some(dialog);
+        if let Some(mut dialog) = self.pending_move.take() {
+            if !Self::show_move_confirmation(ui.ctx(), &mut dialog) {
+                self.pending_move = Some(dialog);
+            } else {
+                // 使用者已做出決定：還原視窗置頂層級，並立即將下次檢查時間設為現在，無縫啟動補掃
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+                self.next_check = Instant::now();
+            }
         }
     }
 }
@@ -1764,22 +1801,12 @@ fn llm_judge(
 }
 
 /// 搬移前確認：未啟用或無待搬移郵件 → 直接核准全部 uid（與舊行為一致）；
-/// 否則向 UI 送出清單並等待決定；送出失敗（UI 已關閉）、無回覆或逾時 → 視為跳過（回傳空清單，不搬移）。
+/// 否則向 UI 送出清單並等待使用者決定（無期限等待）；送出失敗或通道中斷（UI 關閉/退出）→ 視為跳過（回傳空清單，不搬移）。
 fn confirm_move(
     enabled: bool,
     pending: &[(u32, String, u32, String)],
     ask: &mpsc::Sender<Vec<PendingMoveMail>>,
     reply: &mpsc::Receiver<Vec<u32>>,
-) -> Vec<u32> {
-    confirm_move_with_timeout(enabled, pending, ask, reply, CONFIRM_TIMEOUT)
-}
-
-fn confirm_move_with_timeout(
-    enabled: bool,
-    pending: &[(u32, String, u32, String)],
-    ask: &mpsc::Sender<Vec<PendingMoveMail>>,
-    reply: &mpsc::Receiver<Vec<u32>>,
-    timeout: Duration,
 ) -> Vec<u32> {
     if !enabled || pending.is_empty() {
         return pending.iter().map(|(uid, _, _, _)| *uid).collect();
@@ -1796,19 +1823,8 @@ fn confirm_move_with_timeout(
     if ask.send(list).is_err() {
         return Vec::new();
     }
-    // 等待 UI 決定；逾時或通道斷線都視為「全部跳過」，避免 worker 永久卡死
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Vec::new();
-        }
-        match reply.recv_timeout(remaining.min(Duration::from_millis(200))) {
-            Ok(uids) => return uids,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Vec::new(),
-        }
-    }
+    // 無期限等待使用者決定；僅在通道斷線（UI 已關閉或結束）時回傳空清單避免 worker 卡死
+    reply.recv().unwrap_or_default()
 }
 
 /// 掃描指定日期郵件：逐封送 LLM 判定；判定為釣魚/惡意廣告者先暫存，
@@ -2104,6 +2120,23 @@ fn ensure_phishing_mailbox(session: &mut Session<imap::Connection>, name: &str) 
 
 fn startup_scan_dates(today: NaiveDate) -> [NaiveDate; 2] {
     [today - chrono::Duration::days(1), today]
+}
+
+/// 計算掃描日期清單：自上次掃描的郵件所屬日期（或預設前一日）一路涵蓋至今日，
+/// 避免隔日或連續假期未掃描/未確認時產生遺漏。最高回溯上限為 `MAX_CATCHUP_DAYS` 天。
+fn scan_dates_since_last(today: NaiveDate, last_date: Option<NaiveDate>) -> Vec<NaiveDate> {
+    let earliest = today - chrono::Duration::days(MAX_CATCHUP_DAYS);
+    let start_date = match last_date {
+        Some(d) => d.min(today - chrono::Duration::days(1)).max(earliest),
+        None => today - chrono::Duration::days(1),
+    };
+    let mut dates = Vec::new();
+    let mut cur = start_date;
+    while cur <= today {
+        dates.push(cur);
+        cur += chrono::Duration::days(1);
+    }
+    dates
 }
 
 /// 建立 IMAP 連線：手動 TCP+TLS 以確保連線與讀寫皆有逾時，
@@ -2518,6 +2551,48 @@ mod tests {
     }
 
     #[test]
+    fn scan_dates_since_last_covers_same_day_and_gap() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 5).expect("固定測試日期");
+        // 同一日檢查：涵蓋前一日與今日（與舊行為一致）
+        assert_eq!(
+            scan_dates_since_last(today, Some(today)),
+            vec![
+                NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 5).unwrap(),
+            ]
+        );
+        // 連假 4 天前（8 月 1 日）：自 8 月 1 日連續涵蓋到 8 月 5 日
+        let last = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        assert_eq!(
+            scan_dates_since_last(today, Some(last)),
+            vec![
+                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 5).unwrap(),
+            ]
+        );
+        // 無上次紀錄：回退至近兩日
+        assert_eq!(
+            scan_dates_since_last(today, None),
+            vec![
+                NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 5).unwrap(),
+            ]
+        );
+        // 超過 60 天以上未開機：限制最多回溯 MAX_CATCHUP_DAYS 天
+        let ancient = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let dates = scan_dates_since_last(today, Some(ancient));
+        assert_eq!(dates.len(), (MAX_CATCHUP_DAYS + 1) as usize);
+        assert_eq!(
+            dates.first(),
+            Some(&(today - chrono::Duration::days(MAX_CATCHUP_DAYS)))
+        );
+        assert_eq!(dates.last(), Some(&today));
+    }
+
+    #[test]
     fn parses_plain_json_verdict() {
         let verdict = parse_llm_verdict(r#"{"is_phishing": true, "reason": "偽裝銀行"}"#)
             .expect("純 JSON 應可解析");
@@ -2859,13 +2934,14 @@ mod tests {
     }
 
     #[test]
-    fn confirm_move_times_out_and_skips() {
+    fn confirm_move_skips_when_reply_dropped() {
         let (ask, _ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
-        let (_reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
+        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
         let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
-        // UI 遲遲不回覆 → 逾時視為全部跳過，worker 不會永久卡死
+        // 模擬 UI 關閉/崩潰使得 reply sender drop → 回傳空清單，worker 不會卡死
+        drop(reply_tx);
         assert_eq!(
-            confirm_move_with_timeout(true, &pending, &ask, &reply_rx, Duration::from_millis(50)),
+            confirm_move(true, &pending, &ask, &reply_rx),
             Vec::<u32>::new()
         );
     }
