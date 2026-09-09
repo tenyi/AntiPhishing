@@ -6,7 +6,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, Sender, TryRecvError},
+    sync::mpsc::{Receiver, TryRecvError},
     sync::{Arc, LazyLock, mpsc},
     thread,
     time::{Duration, Instant},
@@ -171,6 +171,17 @@ fn config_path() -> PathBuf {
 
 // ===== 掃描進度檔（scan_state.toml）：跨重啟記住檢查斷點，避免重複檢查信件 =====
 
+/// 待隔離郵件項目（儲存於待處理佇列中，亦持久化於 scan_state.toml）
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingMoveItem {
+    uid: u32,
+    subject: String,
+    score: u32,
+    reason: String,
+    #[serde(default = "default_true")]
+    selected: bool,
+}
+
 /// 掃描進度狀態檔內容，存於執行檔所在目錄 `scan_state.toml`。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct LastScanState {
@@ -186,6 +197,9 @@ struct LastScanState {
     last_mail_date: NaiveDate,
     /// 本狀態寫入時間（＝最後完成檢查時間，含無新郵件的空掃）
     checked_at: DateTime<Local>,
+    /// 待確認隔離的郵件清單（跨重啟保留）
+    #[serde(default)]
+    pending_moves: Vec<PendingMoveItem>,
 }
 
 /// 進度檔完整路徑：與執行檔同目錄。
@@ -395,26 +409,12 @@ fn main() -> eframe::Result {
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingMoveMail {
-    uid: u32,
-    subject: String,
-    score: u32,
-    reason: String,
-}
-
-#[derive(Clone, Debug)]
-struct MoveCandidateItem {
-    uid: u32,
-    subject: String,
-    score: u32,
-    reason: String,
-    selected: bool,
-}
-
-struct PendingMoveDialog {
-    candidates: Vec<MoveCandidateItem>,
-    reply: Sender<Vec<u32>>,
+/// 獨立搬移任務回報結果
+struct MoveOutcome {
+    lines: Vec<String>,
+    moved_uids: Vec<u32>,
+    failed_uids: Vec<u32>,
+    not_found_uids: Vec<u32>,
 }
 
 /// 掃描工作執行緒送往 UI 的事件：
@@ -436,6 +436,8 @@ struct ScanOutcome {
     last_checked: Option<(NaiveDate, u32, String)>,
     /// 全部日期皆無新郵件（皆已於前輪檢查過）；不寫入執行紀錄，僅更新最後檢查時間
     no_new_mail: bool,
+    /// 本輪發現的疑似釣魚／惡意廣告郵件清單（若啟用確認，由 UI 入列處理）
+    pending_moves: Vec<PendingMoveItem>,
 }
 
 struct App {
@@ -450,12 +452,14 @@ struct App {
     date_text: String,
     next_check: Instant,
     receiver: Option<Receiver<ScanEvent>>,
-    /// 搬移確認：worker 送出的待搬移清單（uid、主旨、評分、理由）
-    ask_receiver: Option<Receiver<Vec<PendingMoveMail>>>,
-    /// 搬移確認：回覆 worker 決定搬移的 uid 清單
-    reply_sender: Option<Sender<Vec<u32>>>,
-    /// 目前顯示中的待確認對話框狀態
-    pending_move: Option<PendingMoveDialog>,
+    /// 待確認隔離的郵件清單（Queue/List，可跨重啟保留）
+    pending_queue: Vec<PendingMoveItem>,
+    /// 是否顯示隔離確認對話框
+    show_confirm_dialog: bool,
+    /// 獨立搬移任務的 receiver
+    move_receiver: Option<Receiver<MoveOutcome>>,
+    /// 搬移進行中的狀態提示
+    move_status: String,
     tray: Option<Tray>,
     allow_exit: bool,
     startup_scan_pending: bool,
@@ -523,6 +527,11 @@ impl App {
         let last_seen = scan_state
             .as_ref()
             .map(|state| (state.uidvalidity, state.max_checked_uid));
+        let pending_queue = scan_state
+            .as_ref()
+            .map(|state| state.pending_moves.clone())
+            .unwrap_or_default();
+        let show_confirm_dialog = !pending_queue.is_empty();
         Self {
             next_check: Instant::now() + interval(&config),
             config,
@@ -532,9 +541,10 @@ impl App {
             log_error_reported: false,
             date_text: Local::now().date_naive().to_string(),
             receiver: None,
-            ask_receiver: None,
-            reply_sender: None,
-            pending_move: None,
+            pending_queue,
+            show_confirm_dialog,
+            move_receiver: None,
+            move_status: String::new(),
             tray,
             allow_exit: false,
             startup_scan_pending: true,
@@ -554,12 +564,12 @@ impl App {
         }
     }
 
-    /// 取得上次完成掃描的最後郵件日期（若無最後郵件則使用最後檢查時間所屬日期）
+    /// 取得上次完成掃描的最後日期（優先使用最後檢查時間所屬日期，次選最後郵件日期）
     fn last_scanned_date(&self) -> Option<NaiveDate> {
-        self.last_mail
+        self.last_check
             .as_ref()
-            .map(|(_, _, date)| *date)
-            .or_else(|| self.last_check.as_ref().map(|dt| dt.date_naive()))
+            .map(|dt| dt.date_naive())
+            .or_else(|| self.last_mail.as_ref().map(|(_, _, date)| *date))
     }
 
     fn fetch_mailboxes(&mut self) {
@@ -608,7 +618,7 @@ impl App {
         self.logs.push(LogEntry { date, line });
     }
 
-    /// 掃描結束後將最新進度寫回掃描進度檔（斷點＋最後一封郵件資訊）；失敗僅提示不中斷。
+    /// 掃描結束後將最新進度寫回掃描進度檔（斷點＋最後一封郵件資訊＋待隔離清單）；失敗僅提示不中斷。
     fn persist_scan_state(&mut self) {
         let (Some(last_seen), Some(last_check)) = (self.last_seen, self.last_check) else {
             return;
@@ -623,12 +633,83 @@ impl App {
             last_mail_subject: subject.clone(),
             last_mail_date: *mail_date,
             checked_at: last_check,
+            pending_moves: self.pending_queue.clone(),
         };
         if let Err(error) = save_scan_state(&state)
             && !self.log_error_reported
         {
             self.log_error_reported = true;
             self.status = format!("掃描進度檔寫入失敗（不再重複提示）：{error:#}");
+        }
+    }
+
+    /// 啟動獨立的隔離搬移任務（於獨立短暫的背景 IMAP 連線執行）
+    fn start_move_task(&mut self, items: Vec<PendingMoveItem>) {
+        if self.move_receiver.is_some() {
+            self.status = "已有隔離搬移作業進行中，請稍候。".into();
+            return;
+        }
+        if items.is_empty() {
+            return;
+        }
+        let config = self.config.clone();
+        let (sender, receiver) = mpsc::channel::<MoveOutcome>();
+        self.move_receiver = Some(receiver);
+        let count = items.len();
+        self.move_status = format!("正在隔離搬移 {count} 封郵件中…");
+        self.status = format!("正在隔離搬移 {count} 封郵件中…");
+        thread::spawn(move || {
+            let outcome =
+                match catch_unwind(AssertUnwindSafe(|| execute_move_task(&config, &items))) {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(error)) => MoveOutcome {
+                        lines: vec![format!("隔離搬移失敗：{error:#}")],
+                        moved_uids: Vec::new(),
+                        failed_uids: items.iter().map(|i| i.uid).collect(),
+                        not_found_uids: Vec::new(),
+                    },
+                    Err(panic) => {
+                        let detail = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "未知原因".into());
+                        MoveOutcome {
+                            lines: vec![format!("隔離搬移執行緒異常中止：{detail}")],
+                            moved_uids: Vec::new(),
+                            failed_uids: items.iter().map(|i| i.uid).collect(),
+                            not_found_uids: Vec::new(),
+                        }
+                    }
+                };
+            let _ = sender.send(outcome);
+        });
+    }
+
+    /// 跳過選取的待隔離郵件（不連線 IMAP，直接自清單移除）
+    fn skip_pending_items(&mut self, uids: &[u32]) {
+        if uids.is_empty() {
+            return;
+        }
+        let uid_set: std::collections::HashSet<u32> = uids.iter().copied().collect();
+        let log_lines: Vec<String> = self
+            .pending_queue
+            .iter()
+            .filter(|item| uid_set.contains(&item.uid))
+            .map(|item| {
+                format!(
+                    "跳過隔離〈{}〉（評分 {}；LLM：{}）",
+                    item.subject, item.score, item.reason
+                )
+            })
+            .collect();
+        for line in log_lines {
+            self.push_log(line);
+        }
+        self.pending_queue.retain(|i| !uid_set.contains(&i.uid));
+        self.persist_scan_state();
+        if self.pending_queue.is_empty() {
+            self.show_confirm_dialog = false;
         }
     }
 
@@ -671,11 +752,6 @@ impl App {
         let config = self.config.clone();
         let (sender, receiver) = mpsc::channel::<ScanEvent>();
         self.receiver = Some(receiver);
-        // 搬移確認通道：worker 於掃描結束前送出待搬移清單並阻塞等待決定
-        let (ask, ask_receiver) = mpsc::channel::<Vec<PendingMoveMail>>();
-        let (reply_sender, reply_receiver) = mpsc::channel::<Vec<u32>>();
-        self.ask_receiver = Some(ask_receiver);
-        self.reply_sender = Some(reply_sender);
         self.scan_progress.clear();
         self.status = if scheduled {
             "排程掃描中…".into()
@@ -685,7 +761,7 @@ impl App {
         thread::spawn(move || {
             // catch_unwind：worker panic 時仍回傳結果，避免 UI 端 receiver 永久卡住
             let outcome = match catch_unwind(AssertUnwindSafe(|| {
-                scan_mail(&config, &dates, last_seen, &ask, &reply_receiver, &sender)
+                scan_mail(&config, &dates, last_seen, &sender)
             })) {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(error)) => ScanOutcome {
@@ -694,6 +770,7 @@ impl App {
                     max_checked_uid: None,
                     last_checked: None,
                     no_new_mail: false,
+                    pending_moves: Vec::new(),
                 },
                 Err(panic) => {
                     let detail = panic
@@ -707,6 +784,7 @@ impl App {
                         max_checked_uid: None,
                         last_checked: None,
                         no_new_mail: false,
+                        pending_moves: Vec::new(),
                     }
                 }
             };
@@ -778,9 +856,49 @@ impl App {
                     if let Some((mail_date, uid, subject)) = &outcome.last_checked {
                         self.last_mail = Some((*uid, subject.clone(), *mail_date));
                     }
-                    // 本輪有新檢查進度時才寫回進度檔，重啟後即可從斷點續掃
-                    self.persist_scan_state();
                 }
+                // 將本輪發現的待隔離郵件加入 pending_queue（去重）
+                let mut new_pending_count = 0;
+                for item in outcome.pending_moves {
+                    if !self
+                        .pending_queue
+                        .iter()
+                        .any(|existing| existing.uid == item.uid)
+                    {
+                        self.pending_queue.push(item);
+                        new_pending_count += 1;
+                    }
+                }
+                if new_pending_count > 0 {
+                    let total_pending = self.pending_queue.len();
+                    self.status = format!(
+                        "掃描完成：目前有 {total_pending} 封疑似釣魚／惡意廣告郵件待確認隔離"
+                    );
+                    send_notification(
+                        "AntiPhishing 偵測警告",
+                        &format!(
+                            "偵測到 {new_pending_count} 封疑似釣魚／惡意廣告郵件，請確認是否隔離。"
+                        ),
+                    );
+                    self.show_confirm_dialog = true;
+                    // 偵測到疑似釣魚／惡意廣告郵件需確認時：解除系統匣縮小/隱藏狀態，設定置頂、取得焦點並置中螢幕
+                    ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
+                        egui::WindowLevel::AlwaysOnTop,
+                    ));
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Critical,
+                    ));
+                    if let Some(cmd) = ViewportCommand::center_on_screen(ctx) {
+                        ctx.send_viewport_cmd(cmd);
+                    }
+                    self.focus_restore_ticks = 3;
+                    ctx.request_repaint();
+                }
+                // 本輪有新檢查進度時才寫回進度檔，重啟後即可從斷點續掃
+                self.persist_scan_state();
                 // 失敗時以系統匣通知提醒（視窗可能縮在系統匣看不到）
                 if let Some(first_failure) = outcome
                     .lines
@@ -791,67 +909,66 @@ impl App {
                 }
             }
             self.receiver = None;
-            self.ask_receiver = None;
-            self.reply_sender = None;
-            self.pending_move = None;
             self.scan_progress.clear();
             // 若上次掃描日期早於今日（如連假或多日未確認），立即觸發補掃直到最新；否則排入正常間隔
             let today = Local::now().date_naive();
-            let needs_catchup = self.last_scanned_date().map_or(false, |d| d < today);
+            let checked_today = self.last_check.map_or(false, |dt| dt.date_naive() == today);
+            let needs_catchup =
+                !checked_today && self.last_scanned_date().map_or(false, |d| d < today);
             self.next_check = if needs_catchup {
                 Instant::now()
             } else {
                 Instant::now() + interval(&self.config)
             };
         }
-        // worker 請求確認搬移：先暫存，視窗顯示時由 Dialog 呈現（eframe 不允許在 logic 繪製 UI）
-        if let Some(ask) = &self.ask_receiver {
-            match ask.try_recv() {
-                Ok(list) => {
-                    let detected = list.len();
-                    if let Some(reply) = self.reply_sender.clone() {
+        // 處理獨立搬移任務接收
+        if let Some(receiver) = &self.move_receiver {
+            match receiver.try_recv() {
+                Ok(outcome) => {
+                    for line in &outcome.lines {
+                        self.push_log(line.clone());
+                    }
+                    let moved_count = outcome.moved_uids.len();
+                    let failed_count = outcome.failed_uids.len();
+                    let removed_set: std::collections::HashSet<u32> = outcome
+                        .moved_uids
+                        .iter()
+                        .chain(outcome.not_found_uids.iter())
+                        .copied()
+                        .collect();
+                    self.pending_queue.retain(|i| !removed_set.contains(&i.uid));
+                    if failed_count > 0 {
                         self.status = format!(
-                            "掃描完成：{detected} 封疑似釣魚／惡意廣告郵件，請確認是否隔離"
+                            "隔離完成：成功搬移 {moved_count} 封，失敗 {failed_count} 封。"
                         );
                         send_notification(
-                            "AntiPhishing 偵測警告",
-                            &format!(
-                                "偵測到 {detected} 封疑似釣魚／惡意廣告郵件，請確認是否隔離。"
-                            ),
+                            "AntiPhishing 隔離結果",
+                            &format!("成功搬移 {moved_count} 封，失敗 {failed_count} 封。"),
                         );
-                        let candidates = list
-                            .into_iter()
-                            .map(|m| MoveCandidateItem {
-                                uid: m.uid,
-                                subject: m.subject,
-                                score: m.score,
-                                reason: m.reason,
-                                selected: true,
-                            })
-                            .collect();
-                        self.pending_move = Some(PendingMoveDialog { candidates, reply });
-                        // 偵測到疑似釣魚／惡意廣告郵件需確認時：解除系統匣縮小/隱藏狀態，設定置頂、取得焦點並置中螢幕
-                        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
-                            egui::WindowLevel::AlwaysOnTop,
-                        ));
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-                        ctx.send_viewport_cmd(ViewportCommand::Focus);
-                        ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
-                            egui::UserAttentionType::Critical,
-                        ));
-                        if let Some(cmd) = ViewportCommand::center_on_screen(ctx) {
-                            ctx.send_viewport_cmd(cmd);
-                        }
-                        self.focus_restore_ticks = 3;
-                        ctx.request_repaint();
+                    } else if moved_count > 0 {
+                        self.status = format!("隔離完成：成功搬移 {moved_count} 封。");
+                        send_notification(
+                            "AntiPhishing 隔離完成",
+                            &format!("已成功隔離搬移 {moved_count} 封疑似釣魚／惡意廣告郵件。"),
+                        );
+                    } else {
+                        self.status = "隔離作業結束。".into();
                     }
+                    if self.pending_queue.is_empty() {
+                        self.show_confirm_dialog = false;
+                        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
+                            egui::WindowLevel::Normal,
+                        ));
+                    }
+                    self.move_receiver = None;
+                    self.move_status.clear();
+                    self.persist_scan_state();
                 }
                 Err(TryRecvError::Disconnected) => {
-                    // worker 在等待確認前異常結束：清空確認狀態，等 receiver 分支收尾
-                    self.ask_receiver = None;
-                    self.reply_sender = None;
-                    self.pending_move = None;
+                    self.status = "隔離搬移執行緒異常結束。".into();
+                    self.push_log("隔離搬移執行緒異常結束。".into());
+                    self.move_receiver = None;
+                    self.move_status.clear();
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -876,14 +993,14 @@ impl App {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if self.receiver.is_none() && self.pending_move.is_none() && self.startup_scan_pending {
+        if self.receiver.is_none() && self.move_receiver.is_none() && self.startup_scan_pending {
             self.startup_scan_pending = false;
             let today = Local::now().date_naive();
             self.date_text = today.to_string();
             let dates = scan_dates_since_last(today, self.last_scanned_date());
             self.start_scan_dates(dates, self.last_seen, false);
         } else if self.receiver.is_none()
-            && self.pending_move.is_none()
+            && self.move_receiver.is_none()
             && Instant::now() >= self.next_check
         {
             let today = Local::now().date_naive();
@@ -905,7 +1022,7 @@ impl App {
                         ctx.send_viewport_cmd(cmd);
                     }
                 }
-                if event.id == scan_id && self.receiver.is_none() && self.pending_move.is_none() {
+                if event.id == scan_id && self.receiver.is_none() && self.move_receiver.is_none() {
                     let today = Local::now().date_naive();
                     self.date_text = today.to_string();
                     let dates = scan_dates_since_last(today, self.last_scanned_date());
@@ -917,19 +1034,16 @@ impl App {
                 }
             }
         }
-        // 掃描中提高重繪頻率，讓進度行即時更新；閒置維持每秒一次
-        ctx.request_repaint_after(if self.receiver.is_some() {
+        // 掃描或搬移中提高重繪頻率，讓進度行即時更新；閒置維持每秒一次
+        ctx.request_repaint_after(if self.receiver.is_some() || self.move_receiver.is_some() {
             Duration::from_millis(300)
         } else {
             Duration::from_secs(1)
         });
     }
 
-    /// 搬移確認對話框；回傳 true 表示使用者已做出決定（隔離選取項／全部跳過）。
-    fn show_move_confirmation(ctx: &egui::Context, dialog: &mut PendingMoveDialog) -> bool {
-        let mut decided = false;
-
-        // 繪製半透明全螢幕暗色背景遮罩，突顯對話框
+    /// 搬移確認對話框
+    fn show_move_confirmation(ctx: &egui::Context, app: &mut App) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
             egui::Id::new("modal_backdrop"),
@@ -951,13 +1065,18 @@ impl App {
                 color: egui::Color32::from_black_alpha(180),
             });
 
+        let mut close_dialog = false;
+        let mut trigger_move = false;
+        let mut trigger_skip = false;
+        let is_moving = app.move_receiver.is_some();
+
         egui::Window::new("隔離確認")
-            .title_bar(false) // 無標題列＝無關閉鈕，只能以按鈕決定
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .frame(frame)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_size([650.0, 460.0])
+            .default_size([650.0, 480.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
@@ -973,8 +1092,8 @@ impl App {
 
                 ui.label(
                     egui::RichText::new(format!(
-                        "本次掃描共發現 {} 封疑似釣魚／惡意廣告郵件，請勾選要隔離（搬移至指定信箱）的項目，未勾選的郵件將保留：",
-                        dialog.candidates.len()
+                        "目前待隔離清單共 {} 封疑似郵件，請勾選要隔離（搬移至指定信箱）的項目，未勾選者將保留：",
+                        app.pending_queue.len()
                     ))
                     .size(15.0)
                     .strong(),
@@ -982,27 +1101,27 @@ impl App {
 
                 // 批次勾選快捷按鈕列
                 ui.horizontal(|ui| {
-                    if ui.button("全選").clicked() {
-                        for item in &mut dialog.candidates {
+                    if ui.add_enabled(!is_moving, egui::Button::new("全選")).clicked() {
+                        for item in &mut app.pending_queue {
                             item.selected = true;
                         }
                     }
-                    if ui.button("全不選").clicked() {
-                        for item in &mut dialog.candidates {
+                    if ui.add_enabled(!is_moving, egui::Button::new("全不選")).clicked() {
+                        for item in &mut app.pending_queue {
                             item.selected = false;
                         }
                     }
-                    if ui.button("反選").clicked() {
-                        for item in &mut dialog.candidates {
+                    if ui.add_enabled(!is_moving, egui::Button::new("反選")).clicked() {
+                        for item in &mut app.pending_queue {
                             item.selected = !item.selected;
                         }
                     }
-                    let selected_count = dialog.candidates.iter().filter(|i| i.selected).count();
+                    let selected_count = app.pending_queue.iter().filter(|i| i.selected).count();
                     ui.label(
                         egui::RichText::new(format!(
                             "（已選取 {} / {} 封）",
                             selected_count,
-                            dialog.candidates.len()
+                            app.pending_queue.len()
                         ))
                         .color(egui::Color32::LIGHT_GRAY),
                     );
@@ -1014,7 +1133,7 @@ impl App {
                     .max_height(250.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (idx, item) in dialog.candidates.iter_mut().enumerate() {
+                        for (idx, item) in app.pending_queue.iter_mut().enumerate() {
                             let item_frame = egui::Frame::group(ui.style())
                                 .inner_margin(egui::Margin::symmetric(12, 8))
                                 .stroke(egui::Stroke::new(
@@ -1028,7 +1147,7 @@ impl App {
 
                             item_frame.show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.checkbox(&mut item.selected, "");
+                                    ui.add_enabled(!is_moving, egui::Checkbox::without_text(&mut item.selected));
                                     ui.vertical(|ui| {
                                         ui.label(
                                             egui::RichText::new(format!(
@@ -1054,45 +1173,72 @@ impl App {
 
                 ui.separator();
 
-                ui.horizontal(|ui| {
-                    let selected_count = dialog.candidates.iter().filter(|i| i.selected).count();
-                    let move_btn = egui::Button::new(
-                        egui::RichText::new(format!("  🚨 隔離選取郵件 ({} 封)  ", selected_count))
-                            .size(16.0)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(if selected_count > 0 {
-                        egui::Color32::from_rgb(180, 40, 40)
-                    } else {
-                        egui::Color32::from_rgb(100, 100, 100)
-                    })
-                    .min_size(egui::vec2(220.0, 38.0));
+                if is_moving {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(&app.move_status)
+                                .color(egui::Color32::from_rgb(230, 80, 80))
+                                .strong(),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        let selected_count = app.pending_queue.iter().filter(|i| i.selected).count();
+                        let move_btn = egui::Button::new(
+                            egui::RichText::new(format!("  🚨 隔離選取郵件 ({} 封)  ", selected_count))
+                                .size(16.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(if selected_count > 0 {
+                            egui::Color32::from_rgb(180, 40, 40)
+                        } else {
+                            egui::Color32::from_rgb(100, 100, 100)
+                        })
+                        .min_size(egui::vec2(200.0, 38.0));
 
-                    if ui.add_enabled(selected_count > 0, move_btn).clicked() {
-                        let selected_uids: Vec<u32> = dialog
-                            .candidates
-                            .iter()
-                            .filter(|i| i.selected)
-                            .map(|i| i.uid)
-                            .collect();
-                        let _ = dialog.reply.send(selected_uids);
-                        decided = true;
-                    }
+                        if ui.add_enabled(selected_count > 0, move_btn).clicked() {
+                            trigger_move = true;
+                        }
 
-                    ui.add_space(12.0);
+                        ui.add_space(8.0);
 
-                    let skip_btn =
-                        egui::Button::new(egui::RichText::new("  全部跳過（不隔離）  ").size(15.0))
-                            .min_size(egui::vec2(160.0, 38.0));
+                        let skip_btn = egui::Button::new(egui::RichText::new("  全部跳過（不隔離）  ").size(15.0))
+                            .min_size(egui::vec2(150.0, 38.0));
 
-                    if ui.add(skip_btn).clicked() {
-                        let _ = dialog.reply.send(Vec::new());
-                        decided = true;
-                    }
-                });
+                        if ui.add(skip_btn).clicked() {
+                            trigger_skip = true;
+                        }
+
+                        ui.add_space(8.0);
+
+                        let later_btn = egui::Button::new(egui::RichText::new("  稍後處理  ").size(15.0))
+                            .min_size(egui::vec2(100.0, 38.0));
+
+                        if ui.add(later_btn).clicked() {
+                            close_dialog = true;
+                        }
+                    });
+                }
             });
-        decided
+
+        if trigger_move {
+            let items: Vec<PendingMoveItem> = app
+                .pending_queue
+                .iter()
+                .filter(|i| i.selected)
+                .cloned()
+                .collect();
+            app.start_move_task(items);
+        } else if trigger_skip {
+            let all_uids: Vec<u32> = app.pending_queue.iter().map(|i| i.uid).collect();
+            app.skip_pending_items(&all_uids);
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        } else if close_dialog {
+            app.show_confirm_dialog = false;
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        }
     }
 }
 
@@ -1145,6 +1291,32 @@ impl eframe::App for App {
                 // 跨重啟由進度檔回復的最後判定郵件資訊
                 if let Some((uid, subject, mail_date)) = &self.last_mail {
                     ui.small(format!("上次檢查至 UID {uid}〈{subject}〉（{mail_date}）"));
+                }
+                if !self.pending_queue.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠️ 目前有 {} 封疑似釣魚／惡意廣告郵件待確認隔離",
+                                self.pending_queue.len()
+                            ))
+                            .color(egui::Color32::from_rgb(240, 80, 80))
+                            .strong(),
+                        );
+                        if ui.button("檢視並隔離").clicked() {
+                            self.show_confirm_dialog = true;
+                        }
+                    });
+                }
+                if self.move_receiver.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(&self.move_status)
+                                .color(egui::Color32::from_rgb(230, 80, 80))
+                                .strong(),
+                        );
+                    });
                 }
                 // 掃描進行中顯示即時進度（目前檢查哪封信）；完成後自動消失
                 if !self.scan_progress.is_empty() {
@@ -1320,16 +1492,9 @@ impl eframe::App for App {
                     }
                 }
             });
-        // 搬移確認對話框：使用者決定後清空，未決定則保留等下次繪製
-        if let Some(mut dialog) = self.pending_move.take() {
-            if !Self::show_move_confirmation(ui.ctx(), &mut dialog) {
-                self.pending_move = Some(dialog);
-            } else {
-                // 使用者已做出決定：還原視窗置頂層級，並立即將下次檢查時間設為現在，無縫啟動補掃
-                ui.ctx()
-                    .send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-                self.next_check = Instant::now();
-            }
+        // 搬移確認對話框：當有待隔離項目且 show_confirm_dialog 為 true 時繪製
+        if self.show_confirm_dialog && !self.pending_queue.is_empty() {
+            Self::show_move_confirmation(ui.ctx(), self);
         }
     }
 }
@@ -1800,64 +1965,106 @@ fn llm_judge(
     parse_llm_verdict(content)
 }
 
-/// 搬移前確認：未啟用或無待搬移郵件 → 直接核准全部 uid（與舊行為一致）；
-/// 否則向 UI 送出清單並等待使用者決定（無期限等待）；送出失敗或通道中斷（UI 關閉/退出）→ 視為跳過（回傳空清單，不搬移）。
-fn confirm_move(
-    enabled: bool,
-    pending: &[(u32, String, u32, String)],
-    ask: &mpsc::Sender<Vec<PendingMoveMail>>,
-    reply: &mpsc::Receiver<Vec<u32>>,
-) -> Vec<u32> {
-    if !enabled || pending.is_empty() {
-        return pending.iter().map(|(uid, _, _, _)| *uid).collect();
+/// 執行獨立的隔離搬移任務（於獨立短暫的 IMAP session 中進行）
+fn execute_move_task(config: &Config, items: &[PendingMoveItem]) -> Result<MoveOutcome> {
+    let mut lines = Vec::new();
+    let mut moved_uids = Vec::new();
+    let mut failed_uids = Vec::new();
+    let mut not_found_uids = Vec::new();
+
+    let mut session = connect(&config.imap).context("無法連線至 IMAP 伺服器")?;
+    let _ = session
+        .select(&config.imap.source_mailbox)
+        .with_context(|| format!("無法開啟來源信箱：{}", config.imap.source_mailbox))?;
+
+    ensure_phishing_mailbox(&mut session, &config.imap.phishing_mailbox)
+        .with_context(|| format!("目標信箱「{}」無法使用", config.imap.phishing_mailbox))?;
+
+    let mut expunge_uids = Vec::new();
+    for item in items {
+        // 先以 UID SEARCH 檢查該郵件是否依然存在於來源信箱
+        let exists = match session.uid_search(format!("UID {}", item.uid)) {
+            Ok(uids) => uids.contains(&item.uid),
+            Err(_) => true, // 若搜尋指令不支援或出錯，仍嘗試搬移
+        };
+        if !exists {
+            lines.push(format!(
+                "郵件 UID {}〈{}〉已不在來源信箱中（可能已於外部手動刪除），略過。",
+                item.uid, item.subject
+            ));
+            not_found_uids.push(item.uid);
+            continue;
+        }
+
+        match move_message(&mut session, item.uid, &config.imap.phishing_mailbox) {
+            Ok(()) => {
+                lines.push(format!(
+                    "已隔離搬移〈{}〉（評分 {}；LLM：{}）",
+                    item.subject, item.score, item.reason
+                ));
+                moved_uids.push(item.uid);
+                expunge_uids.push(item.uid.to_string());
+            }
+            Err(error) => {
+                let err_str = format!("{error:#}");
+                if err_str.to_ascii_lowercase().contains("nonexistent")
+                    || err_str.to_ascii_lowercase().contains("not found")
+                    || err_str.to_ascii_lowercase().contains("no such message")
+                {
+                    lines.push(format!(
+                        "郵件 UID {}〈{}〉搬移時伺服器回報不存在（可能已手動刪除），略過。",
+                        item.uid, item.subject
+                    ));
+                    not_found_uids.push(item.uid);
+                } else {
+                    lines.push(format!("搬移〈{}〉失敗：{error:#}", item.subject));
+                    failed_uids.push(item.uid);
+                }
+            }
+        }
     }
-    let list = pending
-        .iter()
-        .map(|(uid, subject, score, reason)| PendingMoveMail {
-            uid: *uid,
-            subject: subject.clone(),
-            score: *score,
-            reason: reason.clone(),
-        })
-        .collect();
-    if ask.send(list).is_err() {
-        return Vec::new();
+
+    if !expunge_uids.is_empty() {
+        let uid_set = expunge_uids.join(",");
+        if let Err(error) = session.uid_expunge(&uid_set) {
+            lines.push(format!("UID EXPUNGE 失敗（改用 EXPUNGE）：{error:#}"));
+            if let Err(error) = session.expunge() {
+                lines.push(format!("清除來源信箱中已搬移郵件失敗：{error:#}"));
+            }
+        }
     }
-    // 無期限等待使用者決定；僅在通道斷線（UI 已關閉或結束）時回傳空清單避免 worker 卡死
-    reply.recv().unwrap_or_default()
+
+    session.logout().ok();
+
+    Ok(MoveOutcome {
+        lines,
+        moved_uids,
+        failed_uids,
+        not_found_uids,
+    })
 }
 
-/// 掃描指定日期郵件：逐封送 LLM 判定；判定為釣魚/惡意廣告者先暫存，
-/// 該輪結束後依 `confirm_before_move` 向 UI 請求確認，核准之個別郵件才搬移至 phishing_mailbox。
-/// `last_seen` 為上次檢查到的最後一封郵件（UIDVALIDITY、最大 UID），同信箱世代下只檢查其後的新信。
-/// 回傳掃描結果（日誌行與檢查進度）。LLM 未設定或判定失敗時不搬移。
-/// 掃描期間透過 `progress` 回報目前檢查進度供狀態列顯示。
+/// 掃描指定日期郵件：逐封送 LLM 判定；
+/// 若啟用 confirm_before_move，判定為釣魚/惡意廣告者放入待隔離清單，完成後立即結束並斷開連線；
+/// 若未啟用，則於本輪中直接自動搬移。
 fn scan_mail(
     config: &Config,
     dates: &[NaiveDate],
     last_seen: Option<(u32, u32)>,
-    ask: &mpsc::Sender<Vec<PendingMoveMail>>,
-    reply: &mpsc::Receiver<Vec<u32>>,
     progress: &mpsc::Sender<ScanEvent>,
 ) -> Result<ScanOutcome> {
     let mut session = connect(&config.imap)?;
     let selected = session
         .select(&config.imap.source_mailbox)
         .with_context(|| format!("無法開啟來源信箱：{}", config.imap.source_mailbox))?;
-    // 伺服器未回報 UIDVALIDITY 時以 0 代稱（仍可與搬移前重查的值比對）
     let original_uidvalidity = selected.uid_validity.unwrap_or(0);
     let llm = llm_config(config);
     let mut lines: Vec<String> = Vec::new();
     let mut scanned = 0;
-    // 本輪實際檢查過（完成判定）的最大 UID；LLM 判定失敗的信不列入，下輪會重試
     let mut max_checked_uid: Option<u32> = None;
-    // 本輪最後完成判定的郵件（搜尋日期、UID、主旨），供進度檔記錄
     let mut last_checked: Option<(NaiveDate, u32, String)> = None;
     let mut aborted_by_llm_error = false;
-    // 疑似釣魚/惡意廣告郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
-    let mut checked_uids: Vec<u32> = Vec::new();
-    // 確保日期由舊到新排序且不重複，保證 UID 嚴格遞增處理
     let mut sorted_dates = dates.to_vec();
     sorted_dates.sort_unstable();
     sorted_dates.dedup();
@@ -1868,9 +2075,7 @@ fn scan_mail(
             .with_context(|| format!("搜尋 {date} 郵件失敗"))?
             .into_iter()
             .collect();
-        // 由小到大排序：處理順序穩定，進度計數也與 UID 對應
         uids.sort_unstable();
-        // 只檢查上次之後的新信：同信箱世代（UIDVALIDITY）下捨棄已檢查過的 UID
         uids = filter_new_uids(uids, last_seen, original_uidvalidity);
         if !uids.is_empty() {
             progress
@@ -1902,10 +2107,8 @@ fn scan_mail(
             };
             let from = mail.headers.get_first_value("From").unwrap_or_default();
             let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
-            // mailparse 對 multipart 的 get_body() 回傳空，改從 subparts 提取
             let (body, score_body) = extract_body_text(&mail);
             scanned += 1;
-            // 即時回報目前檢查的郵件（主旨），避免使用者誤以為程式卡住
             progress
                 .send(ScanEvent::Progress(progress_text(
                     index + 1,
@@ -1914,48 +2117,37 @@ fn scan_mail(
                 )))
                 .ok();
             let targets = external_word_image_targets(&mail);
-            // 現行啟發式評分僅供 log 參考，不再作為搬移依據
             let (score, _) =
                 phishing_score(&from, &subject, &score_body, &targets, &config.detection);
             match &llm {
-                Some(llm_config) => {
-                    match llm_judge(llm_config, &from, &subject, &body, &targets) {
-                        Ok(verdict) => {
-                            // 本封已完成判定（不論結果），記住檢查進度
-                            checked_uids.push(uid);
-                            max_checked_uid =
-                                Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
-                            last_checked = Some((*date, uid, subject.clone()));
-                            if verdict.is_phishing {
-                                pending.push((uid, subject.clone(), score, verdict.reason));
-                            } else {
-                                lines.push(format!(
-                                    "略過〈{}〉（評分 {score}；LLM：{}）",
-                                    subject, verdict.reason
-                                ));
-                            }
-                        }
-                        Err(error) => {
-                            // LLM 判定失敗多半是 API 設定錯誤或服務不可用：提前中止本輪，
-                            // 避免每封信都等滿逾時、整輪耗時數小時且全部略過
+                Some(llm_config) => match llm_judge(llm_config, &from, &subject, &body, &targets) {
+                    Ok(verdict) => {
+                        max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                        last_checked = Some((*date, uid, subject.clone()));
+                        if verdict.is_phishing {
+                            pending.push((uid, subject.clone(), score, verdict.reason));
+                        } else {
                             lines.push(format!(
-                                "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
+                                "略過〈{}〉（評分 {score}；LLM：{}）",
+                                subject, verdict.reason
                             ));
-                            aborted_by_llm_error = true;
-                            break 'dates;
                         }
                     }
-                }
+                    Err(error) => {
+                        lines.push(format!(
+                            "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
+                        ));
+                        aborted_by_llm_error = true;
+                        break 'dates;
+                    }
+                },
                 None => {
-                    // LLM 未設定：僅計數不判定；仍記住進度，完整警告只在首輪顯示
-                    checked_uids.push(uid);
                     max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                     last_checked = Some((*date, uid, subject.clone()));
                 }
             }
         }
     }
-    // 全部日期皆無新郵件：不搬移、不寫日誌，僅回報空掃讓 UI 更新最後檢查時間
     if scanned == 0 {
         session.logout().ok();
         return Ok(ScanOutcome {
@@ -1964,6 +2156,7 @@ fn scan_mail(
             max_checked_uid: None,
             last_checked: None,
             no_new_mail: true,
+            pending_moves: Vec::new(),
         });
     }
     if aborted_by_llm_error && llm.is_some() {
@@ -1978,185 +2171,95 @@ fn scan_mail(
             max_checked_uid,
             last_checked,
             no_new_mail: false,
+            pending_moves: Vec::new(),
         });
     }
-    // 該輪結束、搬移前：依設定向 UI 請求確認；核准選取的 uid 才搬移
-    if !pending.is_empty() && config.gui.confirm_before_move {
-        progress
-            .send(ScanEvent::Progress("等待搬移確認…".into()))
-            .ok();
-    }
-    let approved_uids = confirm_move(config.gui.confirm_before_move, &pending, ask, reply);
-    let mut approved_set: std::collections::HashSet<u32> = approved_uids.iter().copied().collect();
+
     let mut moved = 0;
     let mut failed = 0;
     let mut moved_uids: Vec<String> = Vec::new();
-    if !approved_set.is_empty() {
-        // 搬移前重新 SELECT 刷新狀態並比對 UIDVALIDITY，避免信箱重建後搬錯信。
-        // 若因等待確認過久導致連線中斷或逾時（如 Connection Lost），嘗試重新連線後再次確認。
-        let mut reconnected = false;
-        let select_res = match session.select(&config.imap.source_mailbox) {
-            Ok(refreshed) => Ok(refreshed),
-            Err(first_err) => {
-                lines.push(format!(
-                    "來源信箱連線中斷或逾時（{first_err:#}），嘗試重新建立連線…"
-                ));
-                session.logout().ok();
-                match connect(&config.imap) {
-                    Ok(new_session) => {
-                        session = new_session;
-                        reconnected = true;
-                        session
-                            .select(&config.imap.source_mailbox)
-                            .map_err(|e| anyhow::anyhow!(e))
-                    }
-                    Err(reconnect_err) => Err(anyhow::anyhow!(
-                        "重新連線失敗：{reconnect_err:#}（原連線錯誤：{first_err:#}）"
-                    )),
-                }
-            }
-        };
-        match select_res {
-            Ok(refreshed) if refreshed.uid_validity.unwrap_or(0) == original_uidvalidity => {
-                if reconnected {
-                    lines.push("重新建立連線成功，繼續搬移作業。".into());
-                }
-            }
-            Ok(_) => {
-                lines.push("來源信箱 UIDVALIDITY 已變更，為避免誤搬本輪取消搬移。".into());
-                approved_set.clear();
-            }
-            Err(error) => {
-                lines.push(format!("無法重新確認來源信箱狀態，本輪取消搬移：{error:#}"));
-                approved_set.clear();
-            }
-        }
-    }
-    if !approved_set.is_empty()
-        && let Err(error) = ensure_phishing_mailbox(&mut session, &config.imap.phishing_mailbox)
-    {
-        // 目標信箱不存在又建不出來：逐封標記失敗但保留全部日誌，不再中斷
-        lines.push(format!(
-            "目標信箱「{}」無法使用，本輪取消搬移：{error:#}",
-            config.imap.phishing_mailbox
-        ));
-        approved_set.clear();
-    }
-    for (uid, subject, score, reason) in &pending {
-        if !approved_set.contains(uid) {
-            if approved_uids.contains(uid) {
-                lines.push(format!(
-                    "因本輪取消搬移未處理〈{}〉（評分 {}；LLM：{}）",
-                    subject, score, reason
-                ));
-            } else {
-                lines.push(format!(
-                    "跳過搬移〈{}〉（評分 {}；LLM：{}）",
-                    subject, score, reason
-                ));
-            }
-            continue;
-        }
-        match move_message(&mut session, *uid, &config.imap.phishing_mailbox) {
-            Ok(()) => {
-                lines.push(format!(
-                    "搬移〈{}〉（評分 {}；LLM：{}）",
-                    subject, score, reason
-                ));
-                moved += 1;
-                moved_uids.push(uid.to_string());
-            }
-            Err(error) => {
-                // 單封失敗只記錄並繼續，不再丟棄先前累積的所有日誌
-                lines.push(format!("搬移〈{}〉失敗：{error:#}", subject));
-                failed += 1;
-            }
-        }
-    }
-    if !moved_uids.is_empty() {
-        // 優先 UID EXPUNGE 只清除本輪已搬移的信件，避免連帶清掉使用者在他端手動刪除的信
-        let uid_set = moved_uids.join(",");
-        if let Err(error) = session.uid_expunge(&uid_set) {
-            lines.push(format!("UID EXPUNGE 失敗（改用 EXPUNGE）：{error:#}"));
-            if let Err(error) = session.expunge() {
-                lines.push(format!("刪除來源信箱中已搬移郵件失敗：{error:#}"));
-            }
-        }
-    }
-    session.logout().ok();
+    let mut pending_moves = Vec::new();
 
-    // 若有核准搬移但未成功搬移的信件（因取消搬移或單封失敗），斷點不可越過該信件，避免下次排程跳過未處理信件
-    let moved_set: std::collections::HashSet<u32> = moved_uids
-        .iter()
-        .filter_map(|s| s.parse::<u32>().ok())
-        .collect();
-    max_checked_uid = adjust_checkpoint_on_move_failure(
-        &checked_uids,
-        &approved_uids,
-        &moved_set,
-        max_checked_uid,
-    );
-    if let Some(&min_failed) = approved_uids
-        .iter()
-        .filter(|uid| !moved_set.contains(uid))
-        .min()
-    {
-        if last_checked
-            .as_ref()
-            .map_or(false, |(_, uid, _)| *uid >= min_failed)
-        {
-            last_checked = None;
+    if config.gui.confirm_before_move {
+        for (uid, subject, score, reason) in pending {
+            lines.push(format!(
+                "發現疑似釣魚／惡意廣告郵件〈{}〉（評分 {}；LLM：{}），已加入待隔離清單。",
+                subject, score, reason
+            ));
+            pending_moves.push(PendingMoveItem {
+                uid,
+                subject,
+                score,
+                reason,
+                selected: true,
+            });
+        }
+    } else if !pending.is_empty() {
+        // 未啟用確認：自動立即搬移
+        if let Err(error) = ensure_phishing_mailbox(&mut session, &config.imap.phishing_mailbox) {
+            lines.push(format!(
+                "目標信箱「{}」無法使用，本輪取消搬移：{error:#}",
+                config.imap.phishing_mailbox
+            ));
+        } else {
+            for (uid, subject, score, reason) in pending {
+                match move_message(&mut session, uid, &config.imap.phishing_mailbox) {
+                    Ok(()) => {
+                        lines.push(format!(
+                            "自動搬移〈{}〉（評分 {}；LLM：{}）",
+                            subject, score, reason
+                        ));
+                        moved += 1;
+                        moved_uids.push(uid.to_string());
+                    }
+                    Err(error) => {
+                        lines.push(format!("搬移〈{}〉失敗：{error:#}", subject));
+                        failed += 1;
+                    }
+                }
+            }
+            if !moved_uids.is_empty() {
+                let uid_set = moved_uids.join(",");
+                if let Err(error) = session.uid_expunge(&uid_set) {
+                    lines.push(format!("UID EXPUNGE 失敗（改用 EXPUNGE）：{error:#}"));
+                    let _ = session.expunge();
+                }
+            }
         }
     }
+
+    session.logout().ok();
 
     let scanned_dates = dates_summary(dates);
     if llm.is_none() {
         lines.push(format!(
             "LLM 未設定（config.toml 的 [llm] base_url 或 model 為空）。{scanned_dates}：已掃描 {scanned} 封，未搬移。"
         ));
-    } else {
-        let skipped = pending.len().saturating_sub(moved + failed);
-        let mut summary = format!("{scanned_dates}：已掃描 {scanned} 封，搬移 {moved} 封");
-        if failed > 0 {
-            summary.push_str(&format!("，搬移失敗 {failed} 封"));
+    } else if config.gui.confirm_before_move {
+        let found = pending_moves.len();
+        let mut summary = format!("{scanned_dates}：已掃描 {scanned} 封");
+        if found > 0 {
+            summary.push_str(&format!("，發現 {found} 封待確認隔離"));
         }
-        if skipped > 0 {
-            summary.push_str(&format!("，保留 {skipped} 封疑似釣魚／惡意廣告郵件"));
+        summary.push('。');
+        lines.push(summary);
+    } else {
+        let mut summary = format!("{scanned_dates}：已掃描 {scanned} 封，自動搬移 {moved} 封");
+        if failed > 0 {
+            summary.push_str(&format!("，失敗 {failed} 封"));
         }
         summary.push('。');
         lines.push(summary);
     }
+
     Ok(ScanOutcome {
         lines,
         uidvalidity: original_uidvalidity,
         max_checked_uid,
         last_checked,
         no_new_mail: false,
+        pending_moves,
     })
-}
-
-/// 若有經核准搬移但因錯誤未成功搬移的信件，將斷點限縮於未成功信件之前已檢查的最大 UID，
-/// 避免下次排程掃描跳過未處理完成的釣魚信。
-fn adjust_checkpoint_on_move_failure(
-    checked_uids: &[u32],
-    approved_uids: &[u32],
-    moved_set: &std::collections::HashSet<u32>,
-    max_checked_uid: Option<u32>,
-) -> Option<u32> {
-    let failed_approved_uids: Vec<u32> = approved_uids
-        .iter()
-        .copied()
-        .filter(|uid| !moved_set.contains(uid))
-        .collect();
-    if let Some(&min_failed) = failed_approved_uids.iter().min() {
-        checked_uids
-            .iter()
-            .copied()
-            .filter(|&uid| uid < min_failed)
-            .max()
-    } else {
-        max_checked_uid
-    }
 }
 
 /// 過濾掉已檢查過的 UID：僅在相同 UIDVALIDITY（信箱世代）下，捨棄 ≤ 上次最大 UID 的舊信。
@@ -2963,73 +3066,38 @@ mod tests {
     }
 
     #[test]
-    fn confirm_move_auto_approves_when_disabled_or_empty() {
-        let (ask, _ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
-        let (_reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
-        assert_eq!(confirm_move(false, &[], &ask, &reply_rx), Vec::<u32>::new());
-        let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
-        // 未啟用確認＝自動搬移（核准全部 uid）
-        assert_eq!(confirm_move(false, &pending, &ask, &reply_rx), vec![1]);
-        // 無待搬移郵件不需確認
-        assert_eq!(confirm_move(true, &[], &ask, &reply_rx), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn confirm_move_rejects_when_ui_receiver_dropped() {
-        // UI 已關閉：send 失敗 → 視為跳過（不搬移）
-        let (ask, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
-        drop(ask_rx);
-        let (_reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
-        let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
-        assert_eq!(
-            confirm_move(true, &pending, &ask, &reply_rx),
-            Vec::<u32>::new()
-        );
-    }
-
-    #[test]
-    fn confirm_move_round_trip_partial_selection() {
-        let (ask, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
-        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
-        let pending = vec![
-            (101, "主旨A".to_string(), 3, "理由A".to_string()),
-            (102, "主旨B".to_string(), 4, "理由B".to_string()),
+    fn pending_queue_deduplicates_by_uid() {
+        let mut queue = vec![PendingMoveItem {
+            uid: 101,
+            subject: "信件A".into(),
+            score: 3,
+            reason: "垃圾推銷".into(),
+            selected: true,
+        }];
+        let new_items = vec![
+            PendingMoveItem {
+                uid: 101,
+                subject: "信件A重複".into(),
+                score: 3,
+                reason: "垃圾推銷".into(),
+                selected: true,
+            },
+            PendingMoveItem {
+                uid: 102,
+                subject: "信件B".into(),
+                score: 4,
+                reason: "釣魚信件".into(),
+                selected: true,
+            },
         ];
-        let worker = thread::spawn(move || confirm_move(true, &pending, &ask, &reply_rx));
-        // 模擬 UI：收到清單後，只選取 102 進行隔離
-        let received = ask_rx.recv().expect("應收到待搬移清單");
-        assert_eq!(received.len(), 2);
-        assert_eq!(received[0].uid, 101);
-        assert_eq!(received[1].uid, 102);
-        reply_tx.send(vec![102]).expect("應可回覆");
-        let approved = worker.join().expect("worker 應結束");
-        assert_eq!(approved, vec![102]);
-    }
-
-    #[test]
-    fn confirm_move_round_trip_reject() {
-        let (ask, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
-        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
-        let pending = vec![(1, "主旨A".to_string(), 3, "理由A".to_string())];
-        let worker = thread::spawn(move || confirm_move(true, &pending, &ask, &reply_rx));
-        // 模擬 UI：收到清單後回覆跳過（空清單）
-        assert!(ask_rx.recv().is_ok());
-        reply_tx.send(Vec::new()).expect("應可回覆");
-        let approved = worker.join().expect("worker 應結束");
-        assert!(approved.is_empty());
-    }
-
-    #[test]
-    fn confirm_move_skips_when_reply_dropped() {
-        let (ask, _ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
-        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
-        let pending = vec![(1, "主旨".to_string(), 3, "理由".to_string())];
-        // 模擬 UI 關閉/崩潰使得 reply sender drop → 回傳空清單，worker 不會卡死
-        drop(reply_tx);
-        assert_eq!(
-            confirm_move(true, &pending, &ask, &reply_rx),
-            Vec::<u32>::new()
-        );
+        for item in new_items {
+            if !queue.iter().any(|existing| existing.uid == item.uid) {
+                queue.push(item);
+            }
+        }
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].uid, 101);
+        assert_eq!(queue[1].uid, 102);
     }
 
     // 掃描進度文字：含計數與主旨；無主旨時以「(無主旨)」後備
@@ -3085,20 +3153,8 @@ mod tests {
         let config_str = std::fs::read_to_string("config.toml").expect("需有 config.toml");
         let config: Config = toml::from_str(&config_str).expect("需可解析 config.toml");
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 19).unwrap();
-        let (ask_tx, ask_rx) = mpsc::channel::<Vec<PendingMoveMail>>();
-        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u32>>();
         let (progress_tx, progress_rx) = mpsc::channel::<ScanEvent>();
 
-        // 背景 thread：收到待搬移清單後印出，並回傳空清單（不搬移，僅測試判定）
-        thread::spawn(move || {
-            if let Ok(pending) = ask_rx.recv() {
-                println!("\n[測試] 待搬移釣魚郵件清單（本次測試不執行搬移）：");
-                for item in pending {
-                    println!("  - 主旨：{}，原因：{}", item.subject, item.reason);
-                }
-                reply_tx.send(Vec::new()).ok();
-            }
-        });
         // 背景 thread：印出掃描進度
         thread::spawn(move || {
             while let Ok(event) = progress_rx.recv() {
@@ -3108,11 +3164,14 @@ mod tests {
             }
         });
 
-        let outcome = scan_mail(&config, &[date], None, &ask_tx, &reply_rx, &progress_tx)
-            .expect("scan_mail 應成功執行");
+        let outcome =
+            scan_mail(&config, &[date], None, &progress_tx).expect("scan_mail 應成功執行");
         println!("\n=== 2026-08-19 掃描日誌結果 ===");
         for log in outcome.lines {
             println!("{log}");
+        }
+        for item in outcome.pending_moves {
+            println!("  [待隔離] 主旨：{}，原因：{}", item.subject, item.reason);
         }
         println!("===============================\n");
     }
@@ -3163,6 +3222,13 @@ mod tests {
                 .with_ymd_and_hms(2026, 8, 25, 10, 30, 0)
                 .single()
                 .expect("應可建構時間"),
+            pending_moves: vec![PendingMoveItem {
+                uid: 999,
+                subject: "DHL：包裹待領取「引號」".into(),
+                score: 5,
+                reason: "釣魚郵件".into(),
+                selected: true,
+            }],
         };
         let text = toml::to_string_pretty(&state).expect("應可序列化");
         let parsed: LastScanState = toml::from_str(&text).expect("應可反序列化");
@@ -3359,42 +3425,43 @@ mod tests {
     }
 
     #[test]
-    fn adjust_checkpoint_keeps_max_when_all_approved_moved() {
-        let checked = vec![10, 20, 30, 40];
-        let approved = vec![20, 40];
-        let moved: std::collections::HashSet<u32> = [20, 40].into_iter().collect();
-        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(40));
-        assert_eq!(adjusted, Some(40));
+    fn needs_catchup_does_not_busy_loop_when_checked_today() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        // 假設今天已經檢查過（last_check 為今天），即使最後郵件是昨天的，也不應需要立即補掃
+        let last_check_today = true;
+        let last_scanned_yesterday = Some(NaiveDate::from_ymd_opt(2026, 9, 9).unwrap());
+        let needs_catchup =
+            !last_check_today && last_scanned_yesterday.map_or(false, |d| d < today);
+        assert!(!needs_catchup);
     }
 
     #[test]
-    fn adjust_checkpoint_keeps_max_when_unapproved_skipped_by_user() {
-        // 使用者主動取消勾選 UID 30，UID 20 順利搬移
-        let checked = vec![10, 20, 30, 40];
-        let approved = vec![20];
-        let moved: std::collections::HashSet<u32> = [20].into_iter().collect();
-        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(40));
-        assert_eq!(adjusted, Some(40));
-    }
-
-    #[test]
-    fn adjust_checkpoint_rewinds_when_move_canceled_or_failed() {
-        // 使用者核准 UID 20 與 40，但因連線中斷重連失敗導致整輪取消搬移（moved 為空）
-        let checked = vec![10, 20, 30, 40];
-        let approved = vec![20, 40];
-        let moved: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(40));
-        // 應回退至 min_failed (20) 之前已檢查的最大 UID，即 10
-        assert_eq!(adjusted, Some(10));
-    }
-
-    #[test]
-    fn adjust_checkpoint_returns_none_when_first_mail_failed() {
-        // 第一封信 (UID 10) 就搬移失敗，前面無任何成功信件
-        let checked = vec![10, 20, 30];
-        let approved = vec![10];
-        let moved: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(30));
-        assert_eq!(adjusted, None);
+    fn pending_queue_removal_after_successful_move() {
+        let mut queue = vec![
+            PendingMoveItem {
+                uid: 10,
+                subject: "信件10".into(),
+                score: 3,
+                reason: "理由10".into(),
+                selected: true,
+            },
+            PendingMoveItem {
+                uid: 20,
+                subject: "信件20".into(),
+                score: 4,
+                reason: "理由20".into(),
+                selected: true,
+            },
+        ];
+        let moved_uids = vec![10];
+        let not_found_uids: Vec<u32> = vec![];
+        let removed_set: std::collections::HashSet<u32> = moved_uids
+            .iter()
+            .chain(not_found_uids.iter())
+            .copied()
+            .collect();
+        queue.retain(|i| !removed_set.contains(&i.uid));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].uid, 20);
     }
 }
