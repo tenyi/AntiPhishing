@@ -1856,6 +1856,7 @@ fn scan_mail(
     let mut aborted_by_llm_error = false;
     // 疑似釣魚/惡意廣告郵件暫存（uid、主旨、評分、LLM 理由），該輪結束後確認再搬移
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
+    let mut checked_uids: Vec<u32> = Vec::new();
     // 確保日期由舊到新排序且不重複，保證 UID 嚴格遞增處理
     let mut sorted_dates = dates.to_vec();
     sorted_dates.sort_unstable();
@@ -1921,6 +1922,7 @@ fn scan_mail(
                     match llm_judge(llm_config, &from, &subject, &body, &targets) {
                         Ok(verdict) => {
                             // 本封已完成判定（不論結果），記住檢查進度
+                            checked_uids.push(uid);
                             max_checked_uid =
                                 Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                             last_checked = Some((*date, uid, subject.clone()));
@@ -1946,6 +1948,7 @@ fn scan_mail(
                 }
                 None => {
                     // LLM 未設定：僅計數不判定；仍記住進度，完整警告只在首輪顯示
+                    checked_uids.push(uid);
                     max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                     last_checked = Some((*date, uid, subject.clone()));
                 }
@@ -1984,14 +1987,41 @@ fn scan_mail(
             .ok();
     }
     let approved_uids = confirm_move(config.gui.confirm_before_move, &pending, ask, reply);
-    let mut approved_set: std::collections::HashSet<u32> = approved_uids.into_iter().collect();
+    let mut approved_set: std::collections::HashSet<u32> = approved_uids.iter().copied().collect();
     let mut moved = 0;
     let mut failed = 0;
     let mut moved_uids: Vec<String> = Vec::new();
     if !approved_set.is_empty() {
-        // 搬移前重新 SELECT 刷新狀態並比對 UIDVALIDITY，避免信箱重建後搬錯信
-        match session.select(&config.imap.source_mailbox) {
-            Ok(refreshed) if refreshed.uid_validity == Some(original_uidvalidity) => {}
+        // 搬移前重新 SELECT 刷新狀態並比對 UIDVALIDITY，避免信箱重建後搬錯信。
+        // 若因等待確認過久導致連線中斷或逾時（如 Connection Lost），嘗試重新連線後再次確認。
+        let mut reconnected = false;
+        let select_res = match session.select(&config.imap.source_mailbox) {
+            Ok(refreshed) => Ok(refreshed),
+            Err(first_err) => {
+                lines.push(format!(
+                    "來源信箱連線中斷或逾時（{first_err:#}），嘗試重新建立連線…"
+                ));
+                session.logout().ok();
+                match connect(&config.imap) {
+                    Ok(new_session) => {
+                        session = new_session;
+                        reconnected = true;
+                        session
+                            .select(&config.imap.source_mailbox)
+                            .map_err(|e| anyhow::anyhow!(e))
+                    }
+                    Err(reconnect_err) => Err(anyhow::anyhow!(
+                        "重新連線失敗：{reconnect_err:#}（原連線錯誤：{first_err:#}）"
+                    )),
+                }
+            }
+        };
+        match select_res {
+            Ok(refreshed) if refreshed.uid_validity.unwrap_or(0) == original_uidvalidity => {
+                if reconnected {
+                    lines.push("重新建立連線成功，繼續搬移作業。".into());
+                }
+            }
             Ok(_) => {
                 lines.push("來源信箱 UIDVALIDITY 已變更，為避免誤搬本輪取消搬移。".into());
                 approved_set.clear();
@@ -2014,10 +2044,17 @@ fn scan_mail(
     }
     for (uid, subject, score, reason) in &pending {
         if !approved_set.contains(uid) {
-            lines.push(format!(
-                "跳過搬移〈{}〉（評分 {}；LLM：{}）",
-                subject, score, reason
-            ));
+            if approved_uids.contains(uid) {
+                lines.push(format!(
+                    "因本輪取消搬移未處理〈{}〉（評分 {}；LLM：{}）",
+                    subject, score, reason
+                ));
+            } else {
+                lines.push(format!(
+                    "跳過搬移〈{}〉（評分 {}；LLM：{}）",
+                    subject, score, reason
+                ));
+            }
             continue;
         }
         match move_message(&mut session, *uid, &config.imap.phishing_mailbox) {
@@ -2047,6 +2084,31 @@ fn scan_mail(
         }
     }
     session.logout().ok();
+
+    // 若有核准搬移但未成功搬移的信件（因取消搬移或單封失敗），斷點不可越過該信件，避免下次排程跳過未處理信件
+    let moved_set: std::collections::HashSet<u32> = moved_uids
+        .iter()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .collect();
+    max_checked_uid = adjust_checkpoint_on_move_failure(
+        &checked_uids,
+        &approved_uids,
+        &moved_set,
+        max_checked_uid,
+    );
+    if let Some(&min_failed) = approved_uids
+        .iter()
+        .filter(|uid| !moved_set.contains(uid))
+        .min()
+    {
+        if last_checked
+            .as_ref()
+            .map_or(false, |(_, uid, _)| *uid >= min_failed)
+        {
+            last_checked = None;
+        }
+    }
+
     let scanned_dates = dates_summary(dates);
     if llm.is_none() {
         lines.push(format!(
@@ -2071,6 +2133,30 @@ fn scan_mail(
         last_checked,
         no_new_mail: false,
     })
+}
+
+/// 若有經核准搬移但因錯誤未成功搬移的信件，將斷點限縮於未成功信件之前已檢查的最大 UID，
+/// 避免下次排程掃描跳過未處理完成的釣魚信。
+fn adjust_checkpoint_on_move_failure(
+    checked_uids: &[u32],
+    approved_uids: &[u32],
+    moved_set: &std::collections::HashSet<u32>,
+    max_checked_uid: Option<u32>,
+) -> Option<u32> {
+    let failed_approved_uids: Vec<u32> = approved_uids
+        .iter()
+        .copied()
+        .filter(|uid| !moved_set.contains(uid))
+        .collect();
+    if let Some(&min_failed) = failed_approved_uids.iter().min() {
+        checked_uids
+            .iter()
+            .copied()
+            .filter(|&uid| uid < min_failed)
+            .max()
+    } else {
+        max_checked_uid
+    }
 }
 
 /// 過濾掉已檢查過的 UID：僅在相同 UIDVALIDITY（信箱世代）下，捨棄 ≤ 上次最大 UID 的舊信。
@@ -3270,5 +3356,45 @@ mod tests {
         assert!(subject.contains("momo購物網"));
         assert!(score >= 5);
         assert!(reasons.iter().any(|r| r.contains("品牌偽裝")));
+    }
+
+    #[test]
+    fn adjust_checkpoint_keeps_max_when_all_approved_moved() {
+        let checked = vec![10, 20, 30, 40];
+        let approved = vec![20, 40];
+        let moved: std::collections::HashSet<u32> = [20, 40].into_iter().collect();
+        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(40));
+        assert_eq!(adjusted, Some(40));
+    }
+
+    #[test]
+    fn adjust_checkpoint_keeps_max_when_unapproved_skipped_by_user() {
+        // 使用者主動取消勾選 UID 30，UID 20 順利搬移
+        let checked = vec![10, 20, 30, 40];
+        let approved = vec![20];
+        let moved: std::collections::HashSet<u32> = [20].into_iter().collect();
+        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(40));
+        assert_eq!(adjusted, Some(40));
+    }
+
+    #[test]
+    fn adjust_checkpoint_rewinds_when_move_canceled_or_failed() {
+        // 使用者核准 UID 20 與 40，但因連線中斷重連失敗導致整輪取消搬移（moved 為空）
+        let checked = vec![10, 20, 30, 40];
+        let approved = vec![20, 40];
+        let moved: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(40));
+        // 應回退至 min_failed (20) 之前已檢查的最大 UID，即 10
+        assert_eq!(adjusted, Some(10));
+    }
+
+    #[test]
+    fn adjust_checkpoint_returns_none_when_first_mail_failed() {
+        // 第一封信 (UID 10) 就搬移失敗，前面無任何成功信件
+        let checked = vec![10, 20, 30];
+        let approved = vec![10];
+        let moved: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let adjusted = adjust_checkpoint_on_move_failure(&checked, &approved, &moved, Some(30));
+        assert_eq!(adjusted, None);
     }
 }
