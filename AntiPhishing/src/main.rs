@@ -506,16 +506,43 @@ fn main() -> Result<()> {
             ));
         }
     } else {
-        // 決定要搬移的 uid：LLM 模式預設互動確認（--yes 直接全搬）；傳統模式維持自動搬移
-        let mut approved: std::collections::HashSet<u32> = if llm.is_some() && !args.yes {
-            confirm_move_interactive(&pending).into_iter().collect()
+        let approved_uids: Vec<u32> = if llm.is_some() && !args.yes {
+            confirm_move_interactive(&pending)
         } else {
             pending.iter().map(|(uid, ..)| *uid).collect()
         };
+        let mut approved: std::collections::HashSet<u32> = approved_uids.iter().copied().collect();
         if !approved.is_empty() {
-            // 搬移前重新 SELECT 刷新狀態並比對 UIDVALIDITY，避免信箱重建後搬錯信
-            match session.select(&config.imap.source_mailbox) {
-                Ok(refreshed) if refreshed.uid_validity == original_uidvalidity => {}
+            // 搬移前重新 SELECT 刷新狀態並比對 UIDVALIDITY，避免信箱重建後搬錯信。
+            // 若因等待確認過久導致連線中斷或逾時（如 Connection Lost），嘗試重新連線後再次確認。
+            let mut reconnected = false;
+            let select_res = match session.select(&config.imap.source_mailbox) {
+                Ok(refreshed) => Ok(refreshed),
+                Err(first_err) => {
+                    lines.push(format!(
+                        "來源信箱連線中斷或逾時（{first_err:#}），嘗試重新建立連線…"
+                    ));
+                    session.logout().ok();
+                    match connect(&config.imap) {
+                        Ok(new_session) => {
+                            session = new_session;
+                            reconnected = true;
+                            session
+                                .select(&config.imap.source_mailbox)
+                                .map_err(|e| anyhow::anyhow!(e))
+                        }
+                        Err(reconnect_err) => Err(anyhow::anyhow!(
+                            "重新連線失敗：{reconnect_err:#}（原連線錯誤：{first_err:#}）"
+                        )),
+                    }
+                }
+            };
+            match select_res {
+                Ok(refreshed) if refreshed.uid_validity == original_uidvalidity => {
+                    if reconnected {
+                        lines.push("重新建立連線成功，繼續搬移作業。".into());
+                    }
+                }
                 Ok(_) => {
                     lines.push("來源信箱 UIDVALIDITY 已變更，為避免誤搬本輪取消搬移。".into());
                     approved.clear();
@@ -538,7 +565,13 @@ fn main() -> Result<()> {
         let mut moved_uids: Vec<String> = Vec::new();
         for (uid, subject, score, reason) in &pending {
             if !approved.contains(uid) {
-                lines.push(format!("跳過搬移〈{subject}〉（評分 {score}；{reason}）"));
+                if approved_uids.contains(uid) {
+                    lines.push(format!(
+                        "因本輪取消搬移未處理〈{subject}〉（評分 {score}；{reason}）"
+                    ));
+                } else {
+                    lines.push(format!("跳過搬移〈{subject}〉（評分 {score}；{reason}）"));
+                }
                 continue;
             }
             match move_message(&mut session, *uid, &config.imap.phishing_mailbox) {
