@@ -1737,19 +1737,22 @@ fn llm_config(config: &Config) -> Option<LlmConfig> {
 const LLM_SYSTEM_PROMPT: &str = "你是郵件安全判官。根據使用者提供的郵件內容，判斷該郵件是否為「釣魚、詐欺、詐騙郵件」或「惡意行銷廣告、垃圾推銷、仿冒知名品牌或販賣一般性物品的垃圾廣告郵件」。\
 高風險與排除目標訊號包括：\
 1. 惡意行銷與垃圾廣告：未經請求的推銷廣告、仿冒知名品牌促銷、販賣一般性物品或商品（如香薰瀑布、健康器材、保健品、手錶名品等）、含可疑轉址或假退訂連結（Opt Out）、寄件者與商品內容不合的垃圾郵件。\
-2. 偽裝機構或品牌：寄件網域非其所稱品牌（如 DHL、FedEx、快遞、銀行或知名企業）的官方網域。\
+2. 偽裝機構或品牌：寄件網域非其所稱品牌（如 DHL、FedEx、快遞、銀行、Yahoo 等知名企業）的官方網域，或郵件安全驗證（DMARC/SPF）失敗。\
 3. 詐騙與個資竊取：要求付款或繳費（關稅、手續費、驗證費）、要求提供帳號密碼、緊急施壓、可疑連結、附件追蹤、內含 QR code 或要求用手機掃描（quishing）、籠統稱呼（如「親愛的顧客」）搭配假單號或要求更新地址/電話。\
+4. 異常附件：一般無需附件之郵件（如新聞推播、通知信、系統警告等）卻夾帶 Office 文件（.doc/.docx/.xls/.xlsx 等）、壓縮檔或可執行檔等可疑附件；或附件包含外部追蹤連結。\
 \
 僅輸出嚴格 JSON，不要任何其他文字：{\"is_phishing\": true 或 false, \"reason\": \"簡短理由\"}。\
 只要符合上述釣魚、詐騙或惡意推銷廣告/垃圾信特徵，is_phishing 必須為 true；若為正常商務或私人往來郵件（非垃圾廣告與釣魚），is_phishing 必須為 false。若證據不足或不確定，is_phishing 設為 false。";
 
-/// 組裝送 LLM 的郵件內容：From/Subject/內文（截斷），並附 Word 外部圖片提示。
+/// 組裝送 LLM 的郵件內容：From/Subject/內文（截斷），並附附件清單、Word 外部圖片與安全驗證提示。
 fn llm_user_prompt(
     from: &str,
     subject: &str,
     body: &str,
     max_chars: usize,
+    attachments: &[String],
     docx_targets: &[String],
+    auth_warnings: &[String],
 ) -> String {
     let mut text = String::new();
     text.push_str("From: ");
@@ -1760,10 +1763,20 @@ fn llm_user_prompt(
     text.push('\n');
     text.push_str("Body:\n");
     text.push_str(&body.chars().take(max_chars).collect::<String>());
+    if !attachments.is_empty() {
+        text.push('\n');
+        text.push_str("附件清單：");
+        text.push_str(&attachments.join("、"));
+    }
     if !docx_targets.is_empty() {
         text.push('\n');
         text.push_str("附件提示：Word 文件含外部圖片連結（追蹤）：");
         text.push_str(&docx_targets.join("、"));
+    }
+    if !auth_warnings.is_empty() {
+        text.push('\n');
+        text.push_str("安全驗證提示：");
+        text.push_str(&auth_warnings.join("；"));
     }
     text
 }
@@ -1834,6 +1847,13 @@ static RE_EMAIL_DOMAIN: LazyLock<Regex> =
 static RE_THINKING_TAGS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)<think(?:ing)?\b.*?</think(?:ing)?>").expect("固定正規表示式")
 });
+static RE_HTML_SIGNATURE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<html\b|<!doctype\s+html|<body\b|<\?xml\b|<w:worddocument\b"#)
+        .expect("固定正規表示式")
+});
+static RE_HTML_IMG_SRC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<img\b[^>]*?\bsrc=["'](https?://[^"'\s>]+)["']"#).expect("固定正規表示式")
+});
 
 /// HTML 轉純文字：移除 style/script、base64 內嵌圖（保留 img 的 alt 文字，
 /// 例如「QR Code」），剝離其餘標籤並解譯常見實體字。
@@ -1902,14 +1922,16 @@ fn llm_judge(
     from: &str,
     subject: &str,
     body: &str,
+    attachments: &[String],
     docx_targets: &[String],
+    auth_warnings: &[String],
 ) -> Result<LlmVerdict> {
     let payload = serde_json::json!({
         "model": config.model,
         "temperature": 0,
         "messages": [
             { "role": "system", "content": LLM_SYSTEM_PROMPT },
-            { "role": "user", "content": llm_user_prompt(from, subject, body, config.max_chars, docx_targets) }
+            { "role": "user", "content": llm_user_prompt(from, subject, body, config.max_chars, attachments, docx_targets, auth_warnings) }
         ]
     });
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
@@ -2116,11 +2138,28 @@ fn scan_mail(
                     &subject,
                 )))
                 .ok();
+            let attachments = extract_attachment_filenames(&mail);
             let targets = external_word_image_targets(&mail);
-            let (score, _) =
-                phishing_score(&from, &subject, &score_body, &targets, &config.detection);
+            let auth_warnings = check_auth_failures(&mail);
+            let (score, _) = phishing_score(
+                &from,
+                &subject,
+                &score_body,
+                &attachments,
+                &targets,
+                &auth_warnings,
+                &config.detection,
+            );
             match &llm {
-                Some(llm_config) => match llm_judge(llm_config, &from, &subject, &body, &targets) {
+                Some(llm_config) => match llm_judge(
+                    llm_config,
+                    &from,
+                    &subject,
+                    &body,
+                    &attachments,
+                    &targets,
+                    &auth_warnings,
+                ) {
                     Ok(verdict) => {
                         max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                         last_checked = Some((*date, uid, subject.clone()));
@@ -2545,7 +2584,8 @@ pub fn decode_imap_utf7(s: &str) -> String {
     result
 }
 /// 常見快遞與電商品牌及其官方網域（小寫）：用於偵測 From 顯示名稱偽裝。
-const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 7] = [
+/// 常見快遞與電商品牌及其官方網域（小寫）：用於偵測 From 顯示名稱偽裝。
+const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 8] = [
     ("dhl", &["dhl.com"]),
     ("fedex", &["fedex.com"]),
     ("ups", &["ups.com"]),
@@ -2553,12 +2593,69 @@ const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 7] = [
     ("pchome", &["pchome.com.tw", "pcstore.com.tw"]),
     ("shopee", &["shopee.tw", "shopee.com"]),
     ("蝦皮", &["shopee.tw", "shopee.com"]),
+    ("yahoo", &["yahoo.com", "yahoo.com.tw"]),
 ];
+
+/// 檢查郵件驗證標頭（DMARC / SPF 驗證失敗）
+fn check_auth_failures(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let check_headers = [
+        "Authentication-Results",
+        "ARC-Authentication-Results",
+        "Received-SPF",
+    ];
+    for name in check_headers {
+        for val in mail.headers.get_all_values(name) {
+            let lower = val.to_lowercase();
+            if (lower.contains("dmarc=fail") || lower.contains("dmarc=reject"))
+                && !warnings.iter().any(|w: &String| w.contains("DMARC"))
+            {
+                warnings.push("DMARC 驗證失敗（寄件者網域遭偽造）".into());
+            }
+            if (lower.contains("spf=fail")
+                || lower.contains("spf=softfail")
+                || (name == "Received-SPF"
+                    && (lower.starts_with("fail") || lower.starts_with("softfail"))))
+                && !warnings.iter().any(|w: &String| w.contains("SPF"))
+            {
+                warnings.push("SPF 驗證失敗（發信伺服器未獲授權）".into());
+            }
+        }
+    }
+    warnings
+}
+
+/// 收集所有附件檔名清單（供評分與 LLM 提示參考）
+fn extract_attachment_filenames(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    for part in mail.parts() {
+        let cd = part.get_content_disposition();
+        let is_attachment = matches!(cd.disposition, mailparse::DispositionType::Attachment)
+            || cd.params.contains_key("filename")
+            || part.ctype.params.contains_key("name");
+        if is_attachment {
+            if let Some(name) = cd
+                .params
+                .get("filename")
+                .or_else(|| part.ctype.params.get("name"))
+            {
+                let clean = name.replace(['\r', '\n'], " ").trim().to_string();
+                if !clean.is_empty() && !names.contains(&clean) {
+                    names.push(clean);
+                }
+            }
+        }
+    }
+    names
+}
+
 fn phishing_score(
     from: &str,
     subject: &str,
     body: &str,
+    attachments: &[String],
     targets: &[String],
+    auth_warnings: &[String],
     config: &DetectionConfig,
 ) -> (u32, Vec<String>) {
     let text = format!("{subject}\n{body}").to_lowercase();
@@ -2596,7 +2693,7 @@ fn phishing_score(
         score += 4;
         reasons.push("含 QR code 圖片（quishing）".into());
     }
-    // 品牌偽裝：From 顯示名稱含品牌（如 DHL、momo、蝦皮），但寄件網域非該品牌官方網域
+    // 品牌偽裝：From 顯示名稱含品牌（如 DHL、momo、蝦皮、Yahoo），但寄件網域非該品牌官方網域
     let email_domain = RE_EMAIL_DOMAIN.captures(&from).map(|c| c[1].to_string());
     let display_name = from.split('<').next().unwrap_or(from.as_str()).trim();
     if let Some(domain) = email_domain {
@@ -2613,9 +2710,30 @@ fn phishing_score(
             }
         }
     }
+    // 附件風險評估：夾帶 Office 文件（常見社交工程載體）
+    let has_office_attachment = attachments.iter().any(|att| {
+        let lower = att.to_lowercase();
+        lower.ends_with(".doc")
+            || lower.ends_with(".docx")
+            || lower.ends_with(".docm")
+            || lower.ends_with(".xls")
+            || lower.ends_with(".xlsx")
+            || lower.ends_with(".xlsm")
+            || lower.ends_with(".ppt")
+            || lower.ends_with(".pptx")
+    });
+    if has_office_attachment {
+        score += 2;
+        reasons.push("夾帶 Office 文件附件".into());
+    }
     if !targets.is_empty() {
         score += config.external_word_image_score;
         reasons.push("Word 附件含外部圖片連結".into());
+    }
+    // 郵件安全驗證失敗（DMARC/SPF fail）
+    if !auth_warnings.is_empty() {
+        score += 4;
+        reasons.push(auth_warnings.join("；"));
     }
     if config
         .trusted_sender_domains
@@ -2627,55 +2745,96 @@ fn phishing_score(
     }
     (score, reasons)
 }
+
 fn external_word_image_targets(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
     mail.parts()
-        .filter(|part| is_docx_part(part))
+        .filter(|part| is_word_part(part))
         .filter_map(|part| part.get_body_raw().ok())
-        .flat_map(|bytes| external_word_image_targets_from_docx(&bytes))
+        .flat_map(|bytes| external_word_image_targets_from_word(&bytes))
         .collect()
 }
 
-/// 只對 Word（docx/docm）附件做 zip 解析，避免把所有附件都解 base64 並嘗試開 zip。
-fn is_docx_part(part: &mailparse::ParsedMail<'_>) -> bool {
+/// 對 Word（docx/docm/doc/rtf）附件判定，依 MIME 或副檔名篩選。
+fn is_word_part(part: &mailparse::ParsedMail<'_>) -> bool {
     let mime = part.ctype.mimetype.to_ascii_lowercase();
-    if mime.contains("wordprocessingml.document") {
+    if mime.contains("wordprocessingml.document")
+        || mime.contains("msword")
+        || mime.contains("application/vnd.ms-word")
+    {
         return true;
     }
     part.get_content_disposition()
         .params
         .get("filename")
+        .or_else(|| part.ctype.params.get("name"))
         .map(|name| {
             let lower = name.to_lowercase();
-            lower.ends_with(".docx") || lower.ends_with(".docm")
+            lower.ends_with(".docx")
+                || lower.ends_with(".docm")
+                || lower.ends_with(".doc")
+                || lower.ends_with(".rtf")
         })
         .unwrap_or(false)
 }
 
-fn external_word_image_targets_from_docx(bytes: &[u8]) -> Vec<String> {
-    let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
-        return Vec::new();
-    };
-    let mut targets = Vec::new();
-    for index in 0..archive.len() {
-        let Ok(mut entry) = archive.by_index(index) else {
-            continue;
-        };
-        let Ok(name) = entry.name() else {
-            continue;
-        };
-        if !name.starts_with("word/") || !name.ends_with(".rels") {
-            continue;
+#[allow(dead_code)]
+fn is_docx_part(part: &mailparse::ParsedMail<'_>) -> bool {
+    is_word_part(part)
+}
+
+fn external_word_image_targets_from_word(bytes: &[u8]) -> Vec<String> {
+    // 1. 若為 ZIP 壓縮格式（OOXML docx/docm），解析 word/_rels/*.rels 中的外部圖片關聯
+    if let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) {
+        let mut targets = Vec::new();
+        for index in 0..archive.len() {
+            let Ok(mut entry) = archive.by_index(index) else {
+                continue;
+            };
+            let Ok(name) = entry.name() else {
+                continue;
+            };
+            if !name.starts_with("word/") || !name.ends_with(".rels") {
+                continue;
+            }
+            // .rels 檔案極小；超過上限視為壓縮炸彈，直接略過
+            if entry.size() > MAX_DOCX_RELS_BYTES {
+                continue;
+            }
+            let mut xml = String::new();
+            if entry.read_to_string(&mut xml).is_ok() {
+                targets.extend(external_image_targets_from_relationships(&xml));
+            }
         }
-        // .rels 檔案極小；超過上限視為壓縮炸彈，直接略過
-        if entry.size() > MAX_DOCX_RELS_BYTES {
-            continue;
-        }
-        let mut xml = String::new();
-        if entry.read_to_string(&mut xml).is_ok() {
-            targets.extend(external_image_targets_from_relationships(&xml));
-        }
+        return targets;
     }
-    targets
+
+    // 2. 若非 ZIP 格式，檢查是否為 HTML 格式偽裝的 Word 文件（常見於釣魚社交工程演練與追蹤像素）
+    // 限制檢驗長度（如前 512KB），防禦超大檔案；僅離線文字比對提取 URL，絕不連網
+    let check_bytes = if bytes.len() > 512 * 1024 {
+        &bytes[..512 * 1024]
+    } else {
+        bytes
+    };
+    let text = String::from_utf8_lossy(check_bytes);
+    if RE_HTML_SIGNATURE.is_match(&text) {
+        let mut targets = Vec::new();
+        for cap in RE_HTML_IMG_SRC.captures_iter(&text) {
+            if let Some(m) = cap.get(1) {
+                let url = m.as_str().trim().to_string();
+                if !url.is_empty() && !targets.contains(&url) {
+                    targets.push(url);
+                }
+            }
+        }
+        return targets;
+    }
+
+    Vec::new()
+}
+
+#[allow(dead_code)]
+fn external_word_image_targets_from_docx(bytes: &[u8]) -> Vec<String> {
+    external_word_image_targets_from_word(bytes)
 }
 fn external_image_targets_from_relationships(xml: &str) -> Vec<String> {
     let mut reader = Reader::from_str(xml);
@@ -2866,7 +3025,7 @@ mod tests {
             assert!(from.contains("fote-hotel.biz") || from.contains("Waterfal"));
             assert!(subject.contains("裝飾") || subject.contains("健康"));
             assert!(llm_body.contains("Spirual") || llm_body.contains("香薰"));
-            let prompt = llm_user_prompt(&from, &subject, &llm_body, 6000, &[]);
+            let prompt = llm_user_prompt(&from, &subject, &llm_body, 6000, &[], &[], &[]);
             assert!(prompt.contains("From:"));
             assert!(prompt.contains("Subject:"));
             assert!(prompt.contains("Body:"));
@@ -2890,7 +3049,7 @@ mod tests {
     fn llm_prompt_truncates_body_and_includes_docx_hint() {
         let body = "a".repeat(5000);
         let targets = vec!["https://track.example/pixel.png".into()];
-        let prompt = llm_user_prompt("a@b.com", "主旨", &body, 100, &targets);
+        let prompt = llm_user_prompt("a@b.com", "主旨", &body, 100, &[], &targets, &[]);
         // 內文被截斷至 100 字元
         assert!(prompt.contains(&"a".repeat(100)));
         assert!(!prompt.contains(&"a".repeat(101)));
@@ -2901,8 +3060,82 @@ mod tests {
 
     #[test]
     fn llm_prompt_omits_docx_hint_when_empty() {
-        let prompt = llm_user_prompt("a@b.com", "主旨", "內文", 100, &[]);
+        let prompt = llm_user_prompt("a@b.com", "主旨", "內文", 100, &[], &[], &[]);
         assert!(!prompt.contains("附件提示"));
+        assert!(!prompt.contains("附件清單"));
+        assert!(!prompt.contains("安全驗證提示"));
+    }
+
+    #[test]
+    fn llm_prompt_includes_attachment_and_auth_warnings() {
+        let prompt = llm_user_prompt(
+            "news@yahoo.com",
+            "新聞主旨",
+            "新聞內文",
+            100,
+            &["新聞.doc".into()],
+            &["https://track.example/p.png".into()],
+            &["DMARC 驗證失敗".into()],
+        );
+        assert!(prompt.contains("附件清單：新聞.doc"));
+        assert!(
+            prompt
+                .contains("附件提示：Word 文件含外部圖片連結（追蹤）：https://track.example/p.png")
+        );
+        assert!(prompt.contains("安全驗證提示：DMARC 驗證失敗"));
+    }
+
+    #[test]
+    fn detects_html_doc_external_image_relationship() {
+        let html_doc = r#"
+        <html>
+        <head><title>News</title></head>
+        <body>
+        <p>新聞報導</p>
+        <img src="https://attack.example/tracking.png" width="1" height="1" />
+        </body>
+        </html>
+        "#;
+        let targets = external_word_image_targets_from_word(html_doc.as_bytes());
+        assert_eq!(targets, ["https://attack.example/tracking.png"]);
+    }
+
+    #[test]
+    fn scores_dmarc_and_office_attachment_phishing_signals() {
+        let (score, reasons) = phishing_score(
+            "news@yahoo.com",
+            "尼泊爾西藏洪災",
+            "內文報導",
+            &["災情報導.doc".into()],
+            &["https://attack.example/track.png".into()],
+            &["DMARC 驗證失敗（寄件者網域遭偽造）".into()],
+            &test_detection_config(),
+        );
+        // Office 附件 +2，Word 外部圖片 +5，DMARC 失敗 +4 => 11
+        assert!(score >= 11);
+        assert!(reasons.iter().any(|r| r.contains("Office")));
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("Word 附件含外部圖片連結"))
+        );
+        assert!(reasons.iter().any(|r| r.contains("DMARC")));
+    }
+
+    #[test]
+    fn check_auth_failures_detects_dmarc_and_spf_fail() {
+        let raw = concat!(
+            "From: spoofed@yahoo.com\r\n",
+            "Subject: test\r\n",
+            "ARC-Authentication-Results: i=1; spf=neutral; dmarc=fail action=pct.reject\r\n",
+            "Received-SPF: fail (mail.example: domain of spoofed@yahoo.com does not designate 1.2.3.4 as permitted sender)\r\n\r\n",
+            "body\r\n"
+        );
+        let mail = parse_mail(raw.as_bytes()).expect("應可解析郵件");
+        let warnings = check_auth_failures(&mail);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|w| w.contains("DMARC")));
+        assert!(warnings.iter().any(|w| w.contains("SPF")));
     }
 
     fn test_detection_config() -> DetectionConfig {
@@ -2956,27 +3189,30 @@ mod tests {
         assert_eq!(html_to_text("a &amp;&amp; b"), "a && b");
     }
 
-    // 只對 Word 附件做 zip 解析：依副檔名或 MIME 判別
+    // 對 Word 附件做解析：依副檔名（.doc/.docx/.docm/.rtf）或 MIME 判別
     #[test]
-    fn only_docx_attachments_are_selected_for_zip_parsing() {
+    fn word_attachments_are_selected_for_parsing() {
         let raw = concat!(
             "Content-Type: multipart/mixed; boundary=b\r\n\r\n",
             "--b\r\nContent-Disposition: attachment; filename=\"report.docx\"\r\n",
             "Content-Type: application/octet-stream\r\n\r\nzzz\r\n",
             "--b\r\nContent-Disposition: attachment; filename=\"notes.txt\"\r\n",
             "Content-Type: text/plain\r\n\r\nhello\r\n",
+            "--b\r\nContent-Disposition: attachment; filename=\"news.doc\"\r\n",
+            "Content-Type: application/octet-stream\r\n\r\nzzz\r\n",
             "--b\r\nContent-Disposition: attachment\r\n",
             "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n\r\nzzz\r\n",
             "--b--\r\n"
         );
         let mail = parse_mail(raw.as_bytes()).expect("應可解析 multipart");
         let attachments = &mail.subparts;
-        assert_eq!(attachments.len(), 3);
-        assert!(is_docx_part(&attachments[0]), ".docx 副檔名應命中");
-        assert!(!is_docx_part(&attachments[1]), ".txt 不應命中");
-        assert!(is_docx_part(&attachments[2]), "Word MIME 應命中");
-        // 非 zip 內容不應 panic 且回傳空
-        assert!(external_word_image_targets_from_docx(b"not a zip").is_empty());
+        assert_eq!(attachments.len(), 4);
+        assert!(is_word_part(&attachments[0]), ".docx 副檔名應命中");
+        assert!(!is_word_part(&attachments[1]), ".txt 不應命中");
+        assert!(is_word_part(&attachments[2]), ".doc 副檔名應命中");
+        assert!(is_word_part(&attachments[3]), "Word MIME 應命中");
+        // 非 zip 且非 html 內容不應 panic 且回傳空
+        assert!(external_word_image_targets_from_word(b"not a zip or html").is_empty());
     }
 
     #[test]
@@ -2985,6 +3221,8 @@ mod tests {
             "a@b.com",
             "主旨",
             "<img src=\"x.png\" alt=\"QR Code\">",
+            &[],
+            &[],
             &[],
             &test_detection_config(),
         );
@@ -2999,6 +3237,8 @@ mod tests {
             "包裹",
             "",
             &[],
+            &[],
+            &[],
             &test_detection_config(),
         );
         assert!(score >= 3);
@@ -3009,10 +3249,24 @@ mod tests {
             "發票中獎",
             "",
             &[],
+            &[],
+            &[],
             &test_detection_config(),
         );
         assert!(score_momo >= 3);
         assert!(reasons_momo.iter().any(|r| r.contains("品牌偽裝")));
+
+        let (score_yahoo, reasons_yahoo) = phishing_score(
+            "Yahoo 新聞 <news@social-attack.example>",
+            "新聞快訊",
+            "",
+            &[],
+            &[],
+            &[],
+            &test_detection_config(),
+        );
+        assert!(score_yahoo >= 3);
+        assert!(reasons_yahoo.iter().any(|r| r.contains("品牌偽裝")));
     }
 
     #[test]
@@ -3021,6 +3275,8 @@ mod tests {
             "DHL Express <noreply@dhl.com>",
             "包裹",
             "",
+            &[],
+            &[],
             &[],
             &test_detection_config(),
         );
@@ -3031,9 +3287,22 @@ mod tests {
             "發票開立",
             "",
             &[],
+            &[],
+            &[],
             &test_detection_config(),
         );
         assert!(!reasons_momo.iter().any(|r| r.contains("品牌偽裝")));
+
+        let (_, reasons_yahoo) = phishing_score(
+            "Yahoo 新聞 <news@yahoo.com.tw>",
+            "新聞快訊",
+            "",
+            &[],
+            &[],
+            &[],
+            &test_detection_config(),
+        );
+        assert!(!reasons_yahoo.iter().any(|r| r.contains("品牌偽裝")));
     }
 
     // ===== 搬移確認 =====
@@ -3405,11 +3674,28 @@ mod tests {
         let from = mail.headers.get_first_value("From").unwrap_or_default();
         let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
         let (body, score_body) = extract_body_text(&mail);
+        let attachments = extract_attachment_filenames(&mail);
         let targets = external_word_image_targets(&mail);
+        let auth_warnings = check_auth_failures(&mail);
         let detection_cfg = test_detection_config();
-        let (score, reasons) =
-            phishing_score(&from, &subject, &score_body, &targets, &detection_cfg);
-        let prompt = llm_user_prompt(&from, &subject, &body, 4000, &targets);
+        let (score, reasons) = phishing_score(
+            &from,
+            &subject,
+            &score_body,
+            &attachments,
+            &targets,
+            &auth_warnings,
+            &detection_cfg,
+        );
+        let prompt = llm_user_prompt(
+            &from,
+            &subject,
+            &body,
+            4000,
+            &attachments,
+            &targets,
+            &auth_warnings,
+        );
 
         println!("=== momoSpam.eml 解析結果 ===");
         println!("From: {from}");
