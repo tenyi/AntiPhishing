@@ -443,7 +443,10 @@ fn main() -> Result<()> {
         );
         let total = uids.len();
         for (index, uid) in uids.into_iter().enumerate() {
-            let messages = match session.uid_fetch(uid.to_string(), "RFC822") {
+            let messages = match session
+                .uid_fetch(uid.to_string(), "(FLAGS BODY.PEEK[])")
+                .or_else(|_| session.uid_fetch(uid.to_string(), "(FLAGS RFC822)"))
+            {
                 Ok(messages) => messages,
                 Err(error) => {
                     lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
@@ -454,14 +457,22 @@ fn main() -> Result<()> {
                 lines.push(format!("郵件 UID {uid} 內容為空，略過。"));
                 continue;
             };
+            // 記錄掃描當下是否為未讀取狀態（不含 \Seen 旗標）
+            let was_unread = is_message_unread(message.flags());
             let Some(bytes) = message.body() else {
                 lines.push(format!("郵件 UID {uid} 內文為空，略過。"));
+                if was_unread {
+                    let _ = restore_unread_status(&mut session, uid);
+                }
                 continue;
             };
             let mail = match parse_mail(bytes) {
                 Ok(mail) => mail,
                 Err(error) => {
                     lines.push(format!("無法解析郵件 UID {uid} 內容（略過）：{error:#}"));
+                    if was_unread {
+                        let _ = restore_unread_status(&mut session, uid);
+                    }
                     continue;
                 }
             };
@@ -509,6 +520,9 @@ fn main() -> Result<()> {
                             lines.push(format!(
                                 "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
                             ));
+                            if was_unread {
+                                let _ = restore_unread_status(&mut session, uid);
+                            }
                             aborted_by_llm_error = true;
                             break 'dates;
                         }
@@ -519,6 +533,9 @@ fn main() -> Result<()> {
                         pending.push((uid, subject.clone(), score, reasons.join("；")));
                     }
                 }
+            }
+            if was_unread {
+                let _ = restore_unread_status(&mut session, uid);
             }
         }
     }
@@ -781,6 +798,19 @@ fn finish_login(
         .login(&config.username, &config.password)
         .map_err(|(error, _)| error)
         .context("IMAP 登入失敗")
+}
+
+/// 判斷郵件旗標清單中是否為未讀（不含 \Seen 旗標）。
+fn is_message_unread(flags: &[imap::types::Flag]) -> bool {
+    !flags.iter().any(|f| matches!(f, imap::types::Flag::Seen))
+}
+
+/// 若郵件在掃描前為未讀，於處理後還原未讀狀態（移除 \Seen 旗標）。
+fn restore_unread_status(session: &mut Session<imap::Connection>, uid: u32) -> Result<()> {
+    session
+        .uid_store(uid.to_string(), "-FLAGS.SILENT (\\Seen)")
+        .with_context(|| format!("還原郵件 UID {uid} 未讀狀態失敗"))?;
+    Ok(())
 }
 
 fn move_message(session: &mut Session<imap::Connection>, uid: u32, target: &str) -> Result<()> {
@@ -1655,5 +1685,14 @@ mod tests {
         )
         .expect("有 api_key 時應正常解析");
         assert_eq!(config.api_key, "sk-test123456");
+    }
+
+    #[test]
+    fn detects_message_read_and_unread_flags() {
+        use imap::types::Flag;
+        assert!(is_message_unread(&[]));
+        assert!(is_message_unread(&[Flag::Flagged, Flag::Draft]));
+        assert!(!is_message_unread(&[Flag::Seen]));
+        assert!(!is_message_unread(&[Flag::Seen, Flag::Flagged]));
     }
 }
