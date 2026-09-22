@@ -418,7 +418,6 @@ fn main() -> Result<()> {
 
     let llm = llm_config(&config);
     let mut scanned = 0;
-    let mut aborted_by_llm_error = false;
     // 待搬移清單（uid、主旨、評分、理由）：LLM 模式以 LLM 判定為準，啟發式評分僅供 log 參考；
     // 未設定 LLM 時沿用傳統門檻模式（評分 ≥ threshold）。
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
@@ -429,7 +428,7 @@ fn main() -> Result<()> {
 
     // 進度顯示在 stderr，stdout 保留給判定結果，方便管線處理
     let progress_width = Cell::new(0usize);
-    'dates: for date in &dates {
+    for date in &dates {
         let mut uids: Vec<u32> = session
             .uid_search(format!("ON {}", date.format("%d-%b-%Y")))
             .with_context(|| format!("搜尋 {date} 郵件失敗"))?
@@ -515,16 +514,21 @@ fn main() -> Result<()> {
                             ));
                         }
                         Err(error) => {
-                            // LLM 判定失敗多半是 API 設定錯誤或服務不可用：提前中止本輪，
-                            // 避免每封信都等滿逾時、整輪耗時數小時且全部略過
                             lines.push(format!(
-                                "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
+                                "LLM 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
                             ));
-                            if was_unread {
-                                let _ = restore_unread_status(&mut session, uid);
+                            if score >= config.detection.threshold {
+                                let fallback_reason = format!(
+                                    "LLM 判定失敗，退回規則評分達標（{score}分）：{}",
+                                    reasons.join("；")
+                                );
+                                pending.push((uid, subject.clone(), score, fallback_reason));
+                            } else {
+                                lines.push(format!(
+                                    "略過〈{}〉（評分 {score}，未達門檻；LLM 判定失敗）",
+                                    subject
+                                ));
                             }
-                            aborted_by_llm_error = true;
-                            break 'dates;
                         }
                     }
                 }
@@ -540,18 +544,6 @@ fn main() -> Result<()> {
         }
     }
     clear_progress(&progress_width);
-
-    if aborted_by_llm_error && llm.is_some() {
-        session.logout().ok();
-        for line in &lines {
-            println!("{line}");
-        }
-        println!(
-            "{}：已掃描 {scanned} 封後因 LLM 判定失敗中止，未搬移。",
-            dates_summary(&dates)
-        );
-        return Ok(());
-    }
 
     let mut moved = 0;
     let mut failed = 0;

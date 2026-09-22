@@ -2085,13 +2085,12 @@ fn scan_mail(
     let mut scanned = 0;
     let mut max_checked_uid: Option<u32> = None;
     let mut last_checked: Option<(NaiveDate, u32, String)> = None;
-    let mut aborted_by_llm_error = false;
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
     let mut sorted_dates = dates.to_vec();
     sorted_dates.sort_unstable();
     sorted_dates.dedup();
 
-    'dates: for date in &sorted_dates {
+    for date in &sorted_dates {
         let mut uids: Vec<u32> = session
             .uid_search(format!("ON {}", date.format("%d-%b-%Y")))
             .with_context(|| format!("搜尋 {date} 郵件失敗"))?
@@ -2156,7 +2155,7 @@ fn scan_mail(
             let attachments = extract_attachment_filenames(&mail);
             let targets = external_word_image_targets(&mail);
             let auth_warnings = check_auth_failures(&mail);
-            let (score, _) = phishing_score(
+            let (score, reasons) = phishing_score(
                 &from,
                 &subject,
                 &score_body,
@@ -2188,14 +2187,23 @@ fn scan_mail(
                         }
                     }
                     Err(error) => {
+                        max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                        last_checked = Some((*date, uid, subject.clone()));
                         lines.push(format!(
-                            "LLM 判斷失敗，中止本輪掃描（剩餘郵件未檢查）：〈{subject}〉：{error:#}"
+                            "LLM 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
                         ));
-                        if was_unread {
-                            let _ = restore_unread_status(&mut session, uid);
+                        if score >= config.detection.threshold {
+                            let fallback_reason = format!(
+                                "LLM 判定失敗，退回規則評分達標（{score}分）：{}",
+                                reasons.join("；")
+                            );
+                            pending.push((uid, subject.clone(), score, fallback_reason));
+                        } else {
+                            lines.push(format!(
+                                "略過〈{}〉（評分 {score}，未達門檻；LLM 判定失敗）",
+                                subject
+                            ));
                         }
-                        aborted_by_llm_error = true;
-                        break 'dates;
                     }
                 },
                 None => {
@@ -2216,21 +2224,6 @@ fn scan_mail(
             max_checked_uid: None,
             last_checked: None,
             no_new_mail: true,
-            pending_moves: Vec::new(),
-        });
-    }
-    if aborted_by_llm_error && llm.is_some() {
-        session.logout().ok();
-        lines.push(format!(
-            "{}：已掃描 {scanned} 封後因 LLM 判定失敗中止，未搬移。",
-            dates_summary(&sorted_dates)
-        ));
-        return Ok(ScanOutcome {
-            lines,
-            uidvalidity: original_uidvalidity,
-            max_checked_uid,
-            last_checked,
-            no_new_mail: false,
             pending_moves: Vec::new(),
         });
     }
