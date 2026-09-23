@@ -402,6 +402,7 @@ fn build_cli_command(config: &LlmConfig) -> Result<(String, Vec<String>)> {
                 "-p".to_string(),
                 "--tools".to_string(),
                 "".to_string(),
+                "--dangerously-skip-permissions".to_string(),
                 "--output-format".to_string(),
                 "text".to_string(),
             ];
@@ -418,8 +419,7 @@ fn build_cli_command(config: &LlmConfig) -> Result<(String, Vec<String>)> {
                 "--ephemeral".to_string(),
                 "--color".to_string(),
                 "never".to_string(),
-                "-s".to_string(),
-                "read-only".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
             ];
             if !model.is_empty() {
                 args.push("-m".to_string());
@@ -430,6 +430,7 @@ fn build_cli_command(config: &LlmConfig) -> Result<(String, Vec<String>)> {
         }
         LlmBackend::Agy => {
             let mut args = vec![
+                "--dangerously-skip-permissions".to_string(),
                 "--output-format".to_string(),
                 "text".to_string(),
                 "--disable-slash-commands".to_string(),
@@ -2176,6 +2177,7 @@ mod tests {
         assert_eq!(prog, "claude");
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"--tools".to_string()));
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"claude-3-7-sonnet".to_string()));
 
@@ -2189,6 +2191,7 @@ mod tests {
         let (prog, args) = build_cli_command(&config_codex).unwrap();
         assert_eq!(prog, "codex");
         assert!(args.contains(&"exec".to_string()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(args.contains(&"-".to_string()));
 
         let config_agy: LlmConfig = toml::from_str(
@@ -2200,6 +2203,7 @@ mod tests {
         assert_eq!(config_agy.effective_backend(), Some(LlmBackend::Agy));
         let (prog, args) = build_cli_command(&config_agy).unwrap();
         assert_eq!(prog, "agy");
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"--disable-slash-commands".to_string()));
 
