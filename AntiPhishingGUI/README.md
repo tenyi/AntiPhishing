@@ -78,7 +78,7 @@ max_chars = 6000              # 郵件內文最大字元數
 
 | 後端 (`backend`) | 依賴工具 | 必要欄位 | 可選欄位 | 特性說明 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`jev`** | TypeSafe Jev API | `backend = "jev"`, `api_key` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，換算為 0~jev_max_score 分數並與規則分數加總判定（混合評分制）。 |
+| **`jev`** | TypeSafe Jev API | `backend = "jev"`, `api_key` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，依比例換算為 0~jev_max_score 分數（未滿 60% 不計分，60%~100% 線性換算）並與規則分數加總判定（混合評分制）。 |
 | **`claude`** | Claude Code (`claude`) | `backend = "claude"` | `model`, `timeout_secs`, `max_chars` | 自動以 `-p --tools "" --output-format text` 執行，**直接使用本機已登入的 Claude 憑據**，免開本機 API Server、免設定 API Key。 |
 | **`agy`** | Antigravity CLI (`agy`) | `backend = "agy"` | `model`, `timeout_secs`, `max_chars` | 自動以 `--output-format text --disable-slash-commands` 執行，**直接使用本機已登入的 agy 憑據**，停用斜線指令。 |
 | **`codex`** | OpenAI Codex CLI (`codex`) | `backend = "codex"` | `model`, `timeout_secs`, `max_chars` | 自動以 `exec --skip-git-repo-check --ephemeral --color never -s read-only -` 執行，沙箱唯讀不儲存 session。 |
@@ -151,7 +151,7 @@ base_url = "https://api.typesafe.ai"
 # model 留空預設為 "jev-latest"
 model = "jev-latest"
 api_key = "sk-typesafe-..."              # 必填：TypeSafe API Key
-jev_max_score = 5                        # Jev 換算分數上限（預設 5）
+jev_max_score = 5                        # Jev 換算分數上限（預設 5；機率 <0.6 不計分，0.6~1.0 線性換算）
 timeout_secs = 120
 max_chars = 6000
 ```
@@ -160,7 +160,7 @@ max_chars = 6000
 > - **白名單直接安全豁免**：寄件來源符合 `trusted_sender_domains` 且未發生 SPF/DMARC 偽造失敗者，直接豁免略過（不耗費 token、不送 LLM/Jev、不搬移）；若安全驗證失敗則取消白名單豁免並告警送檢。
 > - **安全驗證與傳輸狀態感知**：自動解析最外層受信邊界之 SPF、DKIM、DMARC 狀態與 TLS 加密，完整注入至 LLM 與 Jev Prompt，並指示模型對來源正常的資安通報或垃圾信隔離明細不予誤判。
 > - 若皆未設定 `[llm]`，或 `backend` 與 `base_url` 皆留空，則自動停用 LLM 判定（GUI 模式下不會搬移任何郵件，傳統評分僅供執行紀錄參考）。
-> - 在 Jev 模式下，Jev 評定的釣魚機率會依比例換算為 \(0 \sim \text{jev\_max\_score}\) 分並與安全規則分數加總，達到 `threshold` 門檻才進行隔離（可於 GUI 設定面板調整後端模式與 Jev 評分上限）。
+> - 在 Jev 模式下，Jev 評定的釣魚機率未滿 60% 不計分，60%~100% 依比例換算為 \(0 \sim \text{jev\_max\_score}\) 分並與安全規則分數加總，達到 `threshold` 門檻才進行隔離（可於 GUI 設定面板調整後端模式與 Jev 評分上限）。
 
 程式不會開啟 Word 或連線下載附件內容；DOCX 僅檢查 ZIP 內的 Word relationship XML，找出外部 HTTP(S) 圖片連結。
 

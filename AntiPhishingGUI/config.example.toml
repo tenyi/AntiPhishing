@@ -39,14 +39,14 @@ font_family = "Noto Sans TC"
 # 若未指定 backend：當 base_url 非空時自動以 api 模式運作；若皆留空即停用 LLM 判定（不搬移任何郵件）。
 # 啟用後：
 #   - 一般 LLM 模式（api/claude/codex/agy/command）：LLM 判定為真者才隔離，評分僅供 log 參考。
-#   - Jev 模式（jev）：採混合評分制，Jev 評定釣魚機率換算為 0~jev_max_score 分與規則分數加總，達標（>= threshold）才隔離。
+#   - Jev 模式（jev）：採混合評分制，Jev 評定釣魚機率未滿 60% 不計分，60%~100% 依比例換算為 0~jev_max_score 分與規則分數加總，達標（>= threshold）才隔離。
 [llm]
 # backend = "api"
 base_url = "http://127.0.0.1:11434/v1"
 model = "llama3.1"
 # 可選：API 金鑰（若使用地端免認證模型如 Ollama 可留空；若使用需認證模型或 Jev 必須填入）
 api_key = ""
-# 可選：當 backend = "jev" 時的分數換算上限，預設 5
+# 可選：當 backend = "jev" 時的分數換算上限（未滿 60% 不計分，60%~100% 線性換算），預設 5
 # jev_max_score = 5
 # 可選：當 backend = "command" 時執行的自訂命令字串（例如 "ollama run llama3.1"）
 # command = ""

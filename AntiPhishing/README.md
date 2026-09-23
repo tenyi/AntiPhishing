@@ -31,7 +31,7 @@ cargo run -- --date 2026-08-05 -y         # 跳過互動確認，直接搬移全
 
 | 後端 (`backend`) | 依賴工具 | 必要欄位 | 可選欄位 | 特性與預設參數 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`jev`** | TypeSafe Jev API | `backend = "jev"`, `api_key` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，換算為 0~jev_max_score 分數並與規則分數加總判定（混合評分制）。 |
+| **`jev`** | TypeSafe Jev API | `backend = "jev"`, `api_key` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，依比例換算為 0~jev_max_score 分數（未滿 60% 不計分，60%~100% 線性換算）並與規則分數加總判定（混合評分制）。 |
 | **`claude`** | Claude Code (`claude`) | `backend = "claude"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `-p --tools "" --output-format text`，直接使用本機登入憑據，無須 API 金鑰，停用本地工具安全隔離。 |
 | **`agy`** | Antigravity CLI (`agy`) | `backend = "agy"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `--output-format text --disable-slash-commands`，直接使用本機登入憑據，停用斜線指令。 |
 | **`codex`** | OpenAI Codex CLI (`codex`) | `backend = "codex"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `exec --skip-git-repo-check --ephemeral --color never -s read-only -`，沙箱唯讀不儲存 session。 |
@@ -104,7 +104,7 @@ base_url = "https://api.typesafe.ai"
 # model 留空預設為 "jev-latest"
 model = "jev-latest"
 api_key = "sk-typesafe-..."              # 必填：TypeSafe API Key
-jev_max_score = 5                        # Jev 換算分數上限（預設 5）
+jev_max_score = 5                        # Jev 換算分數上限（預設 5；機率 <0.6 不計分，0.6~1.0 線性換算）
 timeout_secs = 120
 max_chars = 6000
 ```
@@ -116,7 +116,7 @@ max_chars = 6000
 - **白名單直接安全豁免**：寄件來源命中 `trusted_sender_domains` 且未發生 SPF/DMARC 偽造失敗者，直接豁免略過（不耗費 token、不送 LLM/Jev、不搬移）；若安全驗證失敗則取消白名單豁免並告警送檢。
 - **安全驗證與傳輸加密資訊傳遞**：每封信件自動解析最外層受信邊界之 SPF、DKIM、DMARC 狀態與 TLS 加密，注入至 LLM 與 Jev Prompt，並指示模型對來源正常的資安通報或垃圾信隔離明細不予誤判。
 - **一般 LLM 模式（api / claude / agy / codex / command）**：每封信的內文連同寄件者、主旨送 LLM 判定；LLM 判定為「釣魚、詐欺、惡意行銷廣告或垃圾推銷」者列為待搬移（啟發式規則評分僅供 log 參考）。
-- **Jev 模式（jev，混合評分制）**：每封信送 TypeSafe Jev API 判定得到釣魚機率 \(p \in [0.0, 1.0]\)，換算為 \(0 \sim \text{jev\_max\_score}\) 分並與規則分數加總；總分達到 `threshold`（預設 5 分）者列為待搬移。這讓 Jev 做為其中一種分數共同評估，避免單一模型 100% 獨斷。
+- **Jev 模式（jev，混合評分制）**：每封信送 TypeSafe Jev API 判定得到釣魚機率 \(p \in [0.0, 1.0]\)，未滿 60% 不計分，\(0.6 \sim 1.0\) 依比例換算為 \(0 \sim \text{jev\_max\_score}\) 分並與規則分數加總；總分達到 `threshold`（預設 5 分）者列為待搬移。這讓 Jev 做為其中一種分數共同評估，避免單一模型 100% 獨斷。
 
 預設於掃描結束後列出清單互動確認：
 

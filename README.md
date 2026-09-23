@@ -55,6 +55,7 @@ AntiPhishing/
 ├── docs/                      # 系統架構與設計藍圖文件
 ├── AGENTS.md                  # AI Agent 開發慣例與守則
 ├── CLAUDE.md                  # 專案指引與版號規範
+├── DETECTION.md               # 釣魚郵件判定機制與防護體系說明書
 ├── LICENSE.txt                # Apache 2.0 授權條款
 └── README.md                  # 專案總覽文件
 ```
@@ -119,7 +120,7 @@ api_key = ""
 # base_url = "https://api.typesafe.ai"  # 選填，預設 https://api.typesafe.ai
 # model = "jev-latest"                  # 選填，預設 jev-latest
 # api_key = "sk-..."                   # 必填
-# jev_max_score = 5                     # Jev 分數換算上限（預設 5）
+# jev_max_score = 5                     # Jev 分數換算上限（預設 5；機率 <0.6 不計分，0.6~1.0 線性換算）
 
 # [共用設定]
 # 模型名稱。CLI 模式留空則自動使用該 CLI 預設模型；亦可明確指定（如 "claude-3-7-sonnet"、"o3-mini"）

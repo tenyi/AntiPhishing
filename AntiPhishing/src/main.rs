@@ -685,6 +685,18 @@ fn parse_jev_probability(val: &serde_json::Value) -> Result<f64> {
     bail!("Jev 回應 answers.is_phishing 缺少有效的 noul 機率數值：{val}")
 }
 
+/// 依 Jev 釣魚機率換算為分數：
+/// - 0.6 (60%) 以下不計分 (0分)
+/// - 0.6 ~ 1.0 依比例線性換算為 0 ~ max_score
+pub fn calculate_jev_points(prob: f64, max_score: u32) -> u32 {
+    if prob < 0.6 {
+        0
+    } else {
+        let ratio = ((prob - 0.6) / 0.4).clamp(0.0, 1.0);
+        (ratio * max_score as f64).round() as u32
+    }
+}
+
 /// 透過 TypeSafe System One API (Jev) 取得單一郵件釣魚機率（0.0 ~ 1.0）。
 fn llm_judge_jev(
     config: &LlmConfig,
@@ -993,7 +1005,7 @@ fn main() -> Result<()> {
                             ) {
                                 Ok(prob) => {
                                     let jev_points =
-                                        (prob * llm_config.jev_max_score as f64).round() as u32;
+                                        calculate_jev_points(prob, llm_config.jev_max_score);
                                     let final_score = score + jev_points;
                                     let mut combined_reasons = reasons.clone();
                                     combined_reasons.push(format!(
@@ -2715,23 +2727,38 @@ mod tests {
     #[test]
     fn jev_composite_scoring_calculation() {
         let max_score = 5u32;
-        // 0.88 * 5 = 4.4 -> round = 4
-        let prob = 0.88f64;
-        let points = (prob * max_score as f64).round() as u32;
-        assert_eq!(points, 4);
 
-        // 基礎規則評分 2 分 + Jev 4 分 = 6 分 (超過 threshold 5)
+        // < 0.6 不計分
+        assert_eq!(calculate_jev_points(0.15, max_score), 0);
+        assert_eq!(calculate_jev_points(0.55, max_score), 0);
+        assert_eq!(calculate_jev_points(0.599, max_score), 0);
+
+        // 0.6 ~ 1.0 依比例線性換算：((prob - 0.6) / 0.4) * 5
+        // 0.60: 0.0 * 5 = 0
+        assert_eq!(calculate_jev_points(0.60, max_score), 0);
+        // 0.70: 0.25 * 5 = 1.25 -> 1
+        assert_eq!(calculate_jev_points(0.70, max_score), 1);
+        // 0.80: 0.50 * 5 = 2.50 -> 3
+        assert_eq!(calculate_jev_points(0.80, max_score), 3);
+        // 0.88: 0.70 * 5 = 3.50 -> 4
+        assert_eq!(calculate_jev_points(0.88, max_score), 4);
+        // 0.90: 0.75 * 5 = 3.75 -> 4
+        assert_eq!(calculate_jev_points(0.90, max_score), 4);
+        // 1.00: 1.00 * 5 = 5.00 -> 5
+        assert_eq!(calculate_jev_points(1.00, max_score), 5);
+
+        // 基礎規則評分 2 分 + Jev (0.88 -> 4分) = 6 分 (超過 threshold 5)
         let base_score = 2u32;
+        let points = calculate_jev_points(0.88, max_score);
         let final_score = base_score + points;
         assert_eq!(final_score, 6);
         assert!(final_score >= 5);
 
-        // 低機率 0.15 * 5 = 0.75 -> round = 1
-        let low_prob = 0.15f64;
-        let low_points = (low_prob * max_score as f64).round() as u32;
-        assert_eq!(low_points, 1);
+        // 低機率 0.55 -> 0分，最終得分 2 分 (未達 threshold 5)
+        let low_points = calculate_jev_points(0.55, max_score);
+        assert_eq!(low_points, 0);
         let low_final = base_score + low_points;
-        assert_eq!(low_final, 3);
+        assert_eq!(low_final, 2);
         assert!(low_final < 5);
     }
 
