@@ -47,9 +47,9 @@ start_minimized_to_tray = false
 log_retention_days = 30       # 每日日誌保留天數；0 表示永不清理
 font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整路徑
 
-# LLM 智慧判定設定（支援 Claude Code / Agy / Codex CLI 與 OpenAI API）
+# LLM 智慧判定設定（支援 Claude Code / Agy / Codex CLI、Jev API 與 OpenAI API）
 [llm]
-backend = "claude"            # 可選 "claude"、"agy"、"codex"、"api"、"command"
+backend = "claude"            # 可選 "claude"、"agy"、"codex"、"api"、"jev"、"command"
 model = ""                    # 可選。CLI 模式留空使用該工具預設模型，亦可指定特定模型
 timeout_secs = 120            # 逾時時間（秒）
 max_chars = 6000              # 郵件內文最大字元數
@@ -58,7 +58,7 @@ max_chars = 6000              # 郵件內文最大字元數
 設定說明：
 
 - `protocol = "imaps"` 通常使用 993 埠；STARTTLS 請改用 `protocol = "starttls"` 並填入伺服器要求的埠號。
-- `threshold` 是判定門檻。傳統評分模式下達到門檻的郵件會搬到 `phishing_mailbox`；LLM 模式下評分僅供 log 參考。
+- `threshold` 是判定門檻。傳統評分模式下達到門檻的郵件會搬到 `phishing_mailbox`；一般 LLM 模式下評分僅供 log 參考；Jev 模式下採混合評分制，Jev 機率分數與規則分數加總達標才隔離。
 - `external_word_image_score` 用於 DOCX 外部圖片追蹤偵測；預設 5 分。
 - `check_interval_minutes` 是排程掃描間隔，範圍為 1–1440 分鐘。
 - `log_retention_days` 是每日日誌檔的保留天數，超過即於啟動時刪除；預設 30，設為 0 表示永不清理。
@@ -70,14 +70,15 @@ max_chars = 6000              # 郵件內文最大字元數
 
 ---
 
-## LLM 智慧判定設定（支援 Claude Code / Agy / Codex 等 CLI 工具）
+## LLM 智慧判定設定（支援 Claude Code / Agy / Codex 等 CLI 工具與 Jev API）
 
-本程式支援透過 **Claude Code CLI**、**Antigravity CLI**、**OpenAI Codex CLI** 或 **OpenAI 相容 HTTP API** 智慧判定釣魚與垃圾推銷郵件。
+本程式支援透過 **Claude Code CLI**、**Antigravity CLI**、**OpenAI Codex CLI**、**TypeSafe Jev (System One) API** 或 **OpenAI 相容 HTTP API** 智慧判定釣魚與垃圾推銷郵件。
 
 ### 後端模式對照與特性
 
 | 後端 (`backend`) | 依賴工具 | 必要欄位 | 可選欄位 | 特性說明 |
 | :--- | :--- | :--- | :--- | :--- |
+| **`jev`** | TypeSafe Jev API | `backend = "jev"`, `api_key` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，換算為 0~jev_max_score 分數並與規則分數加總判定（混合評分制）。 |
 | **`claude`** | Claude Code (`claude`) | `backend = "claude"` | `model`, `timeout_secs`, `max_chars` | 自動以 `-p --tools "" --output-format text` 執行，**直接使用本機已登入的 Claude 憑據**，免開本機 API Server、免設定 API Key。 |
 | **`agy`** | Antigravity CLI (`agy`) | `backend = "agy"` | `model`, `timeout_secs`, `max_chars` | 自動以 `--output-format text --disable-slash-commands` 執行，**直接使用本機已登入的 agy 憑據**，停用斜線指令。 |
 | **`codex`** | OpenAI Codex CLI (`codex`) | `backend = "codex"` | `model`, `timeout_secs`, `max_chars` | 自動以 `exec --skip-git-repo-check --ephemeral --color never -s read-only -` 執行，沙箱唯讀不儲存 session。 |
@@ -140,7 +141,26 @@ timeout_secs = 120
 max_chars = 6000
 ```
 
-> **注意**：若皆未設定 `[llm]`，或 `backend` 與 `base_url` 皆留空，則自動停用 LLM 判定（GUI 模式下不會搬移任何郵件，傳統評分僅供執行紀錄參考）。
+#### 6. 使用 TypeSafe Jev API (`backend = "jev"`，混合評分制)
+適合使用 TypeSafe System One 模型（以機率為核心的判定）：
+```toml
+[llm]
+backend = "jev"
+# base_url 留空預設為 "https://api.typesafe.ai"
+base_url = "https://api.typesafe.ai"
+# model 留空預設為 "jev-latest"
+model = "jev-latest"
+api_key = "sk-typesafe-..."              # 必填：TypeSafe API Key
+jev_max_score = 5                        # Jev 換算分數上限（預設 5）
+timeout_secs = 120
+max_chars = 6000
+```
+
+> **注意**：
+> - **白名單直接安全豁免**：寄件來源符合 `trusted_sender_domains` 且未發生 SPF/DMARC 偽造失敗者，直接豁免略過（不耗費 token、不送 LLM/Jev、不搬移）；若安全驗證失敗則取消白名單豁免並告警送檢。
+> - **安全驗證與傳輸狀態感知**：自動解析最外層受信邊界之 SPF、DKIM、DMARC 狀態與 TLS 加密，完整注入至 LLM 與 Jev Prompt，並指示模型對來源正常的資安通報或垃圾信隔離明細不予誤判。
+> - 若皆未設定 `[llm]`，或 `backend` 與 `base_url` 皆留空，則自動停用 LLM 判定（GUI 模式下不會搬移任何郵件，傳統評分僅供執行紀錄參考）。
+> - 在 Jev 模式下，Jev 評定的釣魚機率會依比例換算為 \(0 \sim \text{jev\_max\_score}\) 分並與安全規則分數加總，達到 `threshold` 門檻才進行隔離（可於 GUI 設定面板調整後端模式與 Jev 評分上限）。
 
 程式不會開啟 Word 或連線下載附件內容；DOCX 僅檢查 ZIP 內的 Word relationship XML，找出外部 HTTP(S) 圖片連結。
 

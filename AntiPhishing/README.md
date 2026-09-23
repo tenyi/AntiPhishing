@@ -25,12 +25,13 @@ cargo run -- --date 2026-08-05 -y         # 跳過互動確認，直接搬移全
 
 ## LLM 智慧判定（建議）
 
-支援地端/雲端 OpenAI 相容 API，以及直接以命令列呼叫 **Claude Code CLI**、**Antigravity CLI**、**OpenAI Codex CLI** 或**自訂命令**。
+支援地端/雲端 OpenAI 相容 API、**TypeSafe Jev (System One)** API，以及直接以命令列呼叫 **Claude Code CLI**、**Antigravity CLI**、**OpenAI Codex CLI** 或**自訂命令**。
 
 ### 後端模式對照與快速設定
 
 | 後端 (`backend`) | 依賴工具 | 必要欄位 | 可選欄位 | 特性與預設參數 |
 | :--- | :--- | :--- | :--- | :--- |
+| **`jev`** | TypeSafe Jev API | `backend = "jev"`, `api_key` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，換算為 0~jev_max_score 分數並與規則分數加總判定（混合評分制）。 |
 | **`claude`** | Claude Code (`claude`) | `backend = "claude"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `-p --tools "" --output-format text`，直接使用本機登入憑據，無須 API 金鑰，停用本地工具安全隔離。 |
 | **`agy`** | Antigravity CLI (`agy`) | `backend = "agy"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `--output-format text --disable-slash-commands`，直接使用本機登入憑據，停用斜線指令。 |
 | **`codex`** | OpenAI Codex CLI (`codex`) | `backend = "codex"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `exec --skip-git-repo-check --ephemeral --color never -s read-only -`，沙箱唯讀不儲存 session。 |
@@ -93,18 +94,38 @@ timeout_secs = 120
 max_chars = 6000
 ```
 
+#### 範例 6：使用 TypeSafe Jev API (`backend = "jev"`，混合評分制)
+適合使用 TypeSafe System One 模型（以機率為核心的判定）：
+```toml
+[llm]
+backend = "jev"
+# base_url 留空預設為 "https://api.typesafe.ai"
+base_url = "https://api.typesafe.ai"
+# model 留空預設為 "jev-latest"
+model = "jev-latest"
+api_key = "sk-typesafe-..."              # 必填：TypeSafe API Key
+jev_max_score = 5                        # Jev 換算分數上限（預設 5）
+timeout_secs = 120
+max_chars = 6000
+```
+
 ---
 
 ### 判定流程與搬移確認
 
-啟用後每封信的 text/plain 與 HTML 內文（轉純文字、去除 style/base64 噪音）連同寄件者、主旨送 LLM 判定；LLM 判定為「釣魚、詐欺、惡意行銷廣告或垃圾推銷」者列為待搬移，預設於掃描結束後列出清單互動確認：
+- **白名單直接安全豁免**：寄件來源命中 `trusted_sender_domains` 且未發生 SPF/DMARC 偽造失敗者，直接豁免略過（不耗費 token、不送 LLM/Jev、不搬移）；若安全驗證失敗則取消白名單豁免並告警送檢。
+- **安全驗證與傳輸加密資訊傳遞**：每封信件自動解析最外層受信邊界之 SPF、DKIM、DMARC 狀態與 TLS 加密，注入至 LLM 與 Jev Prompt，並指示模型對來源正常的資安通報或垃圾信隔離明細不予誤判。
+- **一般 LLM 模式（api / claude / agy / codex / command）**：每封信的內文連同寄件者、主旨送 LLM 判定；LLM 判定為「釣魚、詐欺、惡意行銷廣告或垃圾推銷」者列為待搬移（啟發式規則評分僅供 log 參考）。
+- **Jev 模式（jev，混合評分制）**：每封信送 TypeSafe Jev API 判定得到釣魚機率 \(p \in [0.0, 1.0]\)，換算為 \(0 \sim \text{jev\_max\_score}\) 分並與規則分數加總；總分達到 `threshold`（預設 5 分）者列為待搬移。這讓 Jev 做為其中一種分數共同評估，避免單一模型 100% 獨斷。
+
+預設於掃描結束後列出清單互動確認：
 
 ```text
 以下 2 封郵件判定為釣魚／惡意廣告：
   [0] UID 123　評分 7　〈DHL：包裹待領取〉
       理由：偽裝 DHL 且要求支付關稅
   [1] UID 124　評分 5　〈限時優惠〉
-      理由：未經請求的推銷廣告
+      理由：Jev 評定釣魚機率 88%（+4分）；含 2 個可疑關鍵字
 搬移方式：[a]全部搬移 [s]全部跳過 [c]逐封決定？
 ```
 
@@ -121,6 +142,6 @@ max_chars = 6000
 - HTML 內嵌 QR code 圖片（quishing）：+4
 - 品牌偽裝（顯示名稱含 DHL/FedEx/UPS 但非官方網域）：+3
 - Word 附件的外部圖片（開啟時可能回連追蹤伺服器）：+5
-- 信任寄件網域：-3（最低為 0）
+- 信任寄件網域：未被直接豁免時扣 3 分（最低為 0）
 
 Word 附件的檢查只讀取 DOCX ZIP 中的 relationship XML，不會開啟 Word、下載圖片或連線至附件所列網址。這是輔助分類工具，不能保證偵測所有釣魚信。請先使用 `--dry-run` 調整規則。

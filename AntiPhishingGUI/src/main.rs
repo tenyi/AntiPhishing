@@ -1399,6 +1399,7 @@ impl eframe::App for App {
                             "agy" => "Antigravity CLI (agy)",
                             "codex" => "OpenAI Codex CLI (codex)",
                             "command" => "自訂命令列 (command)",
+                            "jev" => "TypeSafe Jev API (jev)",
                             _ => "OpenAI 相容 HTTP API (api)",
                         })
                         .show_ui(ui, |ui| {
@@ -1406,6 +1407,7 @@ impl eframe::App for App {
                             ui.selectable_value(&mut current_backend, "agy".into(), "Antigravity CLI (agy)");
                             ui.selectable_value(&mut current_backend, "codex".into(), "OpenAI Codex CLI (codex)");
                             ui.selectable_value(&mut current_backend, "api".into(), "OpenAI 相容 HTTP API (api)");
+                            ui.selectable_value(&mut current_backend, "jev".into(), "TypeSafe Jev API (jev)");
                             ui.selectable_value(&mut current_backend, "command".into(), "自訂命令列 (command)");
                         });
                     self.config.llm.backend = Some(current_backend.clone());
@@ -1413,17 +1415,24 @@ impl eframe::App for App {
 
                     let is_api = current_backend == "api";
                     let is_cmd = current_backend == "command";
+                    let is_jev = current_backend == "jev";
 
                     if is_cmd {
                         field(ui, "自訂命令", &mut self.config.llm.command);
                         ui.end_row();
                     }
 
-                    if is_api {
+                    if is_api || is_jev {
                         field(ui, "伺服器網址", &mut self.config.llm.base_url);
                         ui.end_row();
                         ui.label("API 金鑰");
                         ui.add(egui::TextEdit::singleline(&mut self.config.llm.api_key).password(true));
+                        ui.end_row();
+                    }
+
+                    if is_jev {
+                        ui.label("Jev 評分上限");
+                        ui.add(egui::DragValue::new(&mut self.config.llm.jev_max_score).range(1..=50));
                         ui.end_row();
                     }
 
@@ -1452,6 +1461,9 @@ impl eframe::App for App {
                     }
                     Some(LlmBackend::Api) => {
                         ui.small("✔ 使用 OpenAI 相容 API：支援 Ollama / LM Studio 或雲端服務；地端免認證模型 API 金鑰可留空。");
+                    }
+                    Some(LlmBackend::Jev) => {
+                        ui.small("✔ 使用 TypeSafe Jev API (System One)：採混合評分制，Jev 評定釣魚機率換算為 0~分數上限並與安全規則加總判定；API 金鑰為必填。");
                     }
                     None => {
                         ui.small("⚠ LLM 判定未啟用（若欲使用請選擇 CLI 後端或填入 API 伺服器網址）。未啟用時不會搬移任何郵件。");
@@ -1748,6 +1760,7 @@ enum LlmBackend {
     Codex,
     Agy,
     Command,
+    Jev,
 }
 
 impl LlmBackend {
@@ -1758,16 +1771,17 @@ impl LlmBackend {
             "codex" | "codex-cli" => Some(Self::Codex),
             "agy" | "agy-cli" | "antigravity" => Some(Self::Agy),
             "command" | "cmd" | "custom" => Some(Self::Command),
+            "jev" | "typesafe" | "systemone" => Some(Self::Jev),
             _ => None,
         }
     }
 }
 
 /// LLM 判定設定，存於 config.toml 的 `[llm]`；
-/// 支援 API 與命令列呼叫（claude、codex、agy、command）。
+/// 支援 API 與命令列呼叫（claude、codex、agy、command、jev）。
 #[derive(Clone, Serialize, Deserialize)]
 struct LlmConfig {
-    /// 後端類型：api、claude、codex、agy、command
+    /// 後端類型：api、claude、codex、agy、command、jev
     #[serde(default)]
     backend: Option<String>,
     #[serde(default)]
@@ -1779,12 +1793,18 @@ struct LlmConfig {
     /// backend = "command" 時執行的自訂命令字串
     #[serde(default)]
     command: String,
+    /// Jev 混合評分模式下的分數換算上限（預設 5）
+    #[serde(default = "default_jev_max_score")]
+    jev_max_score: u32,
     #[serde(default = "default_llm_timeout_secs")]
     timeout_secs: u64,
     #[serde(default = "default_llm_max_chars")]
     max_chars: usize,
 }
 
+fn default_jev_max_score() -> u32 {
+    5
+}
 fn default_llm_timeout_secs() -> u64 {
     120
 }
@@ -1800,6 +1820,7 @@ impl Default for LlmConfig {
             model: String::new(),
             api_key: String::new(),
             command: String::new(),
+            jev_max_score: default_jev_max_score(),
             timeout_secs: default_llm_timeout_secs(),
             max_chars: default_llm_max_chars(),
         }
@@ -1848,6 +1869,11 @@ fn llm_config(config: &Config) -> Option<LlmConfig> {
         LlmBackend::Claude | LlmBackend::Codex | LlmBackend::Agy => {
             // CLI 模式已指定 backend 即為有效，model 為可選
         }
+        LlmBackend::Jev => {
+            if config.llm.api_key.trim().is_empty() {
+                return None;
+            }
+        }
     }
     Some(config.llm.clone())
 }
@@ -1859,6 +1885,7 @@ const LLM_SYSTEM_PROMPT: &str = "你是郵件安全判官。根據使用者提�
 2. 偽裝機構或品牌：寄件網域非其所稱品牌（如 DHL、FedEx、快遞、銀行、Yahoo 等知名企業）的官方網域，或郵件安全驗證（DMARC/SPF）失敗。\
 3. 詐騙與個資竊取：要求付款或繳費（關稅、手續費、驗證費）、要求提供帳號密碼、緊急施壓、可疑連結、附件追蹤、內含 QR code 或要求用手機掃描（quishing）、籠統稱呼（如「親愛的顧客」）搭配假單號或要求更新地址/電話。\
 4. 異常附件：一般無需附件之郵件（如新聞推播、通知信、系統警告等）卻夾帶 Office 文件（.doc/.docx/.xls/.xlsx 等）、壓縮檔或可執行檔等可疑附件；或附件包含外部追蹤連結。\
+5. 資安通報與隔離報告排除：若郵件主旨或內文為企業資安通報、垃圾信隔離明細、防毒/SOC分析回報（如 Hinet SOC、防垃圾信通知等），且其安全驗證（SPF/DKIM/DMARC）通過或無偽造警示，即使內文引用被攔截之惡意網址或樣本，亦屬於正常資安服務通知，不得判定為釣魚郵件（is_phishing 必須為 false）。\
 \
 僅輸出嚴格 JSON，不要任何其他文字：{\"is_phishing\": true 或 false, \"reason\": \"簡短理由\"}。\
 只要符合上述釣魚、詐騙或惡意推銷廣告/垃圾信特徵，is_phishing 必須為 true；若為正常商務或私人往來郵件（非垃圾廣告與釣魚），is_phishing 必須為 false。若證據不足或不確定，is_phishing 設為 false。";
@@ -1871,6 +1898,7 @@ fn llm_user_prompt(
     max_chars: usize,
     attachments: &[String],
     docx_targets: &[String],
+    auth_summary: &str,
     auth_warnings: &[String],
 ) -> String {
     let mut text = String::new();
@@ -1892,9 +1920,14 @@ fn llm_user_prompt(
         text.push_str("附件提示：Word 文件含外部圖片連結（追蹤）：");
         text.push_str(&docx_targets.join("、"));
     }
+    if !auth_summary.is_empty() {
+        text.push('\n');
+        text.push_str("安全驗證狀態：");
+        text.push_str(auth_summary);
+    }
     if !auth_warnings.is_empty() {
         text.push('\n');
-        text.push_str("安全驗證提示：");
+        text.push_str("安全驗證警示：");
         text.push_str(&auth_warnings.join("；"));
     }
     text
@@ -2110,6 +2143,9 @@ fn build_cli_command(config: &LlmConfig) -> Result<(String, Vec<String>)> {
         LlmBackend::Api => {
             bail!("Api 後端不支援透過命令列執行");
         }
+        LlmBackend::Jev => {
+            bail!("Jev 後端不支援透過命令列執行");
+        }
     }
 }
 
@@ -2193,6 +2229,7 @@ fn llm_judge_api(
     body: &str,
     attachments: &[String],
     docx_targets: &[String],
+    auth_summary: &str,
     auth_warnings: &[String],
 ) -> Result<LlmVerdict> {
     let payload = serde_json::json!({
@@ -2200,7 +2237,7 @@ fn llm_judge_api(
         "temperature": 0,
         "messages": [
             { "role": "system", "content": LLM_SYSTEM_PROMPT },
-            { "role": "user", "content": llm_user_prompt(from, subject, body, config.max_chars, attachments, docx_targets, auth_warnings) }
+            { "role": "user", "content": llm_user_prompt(from, subject, body, config.max_chars, attachments, docx_targets, auth_summary, auth_warnings) }
         ]
     });
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
@@ -2264,6 +2301,7 @@ fn llm_judge_cli(
     body: &str,
     attachments: &[String],
     docx_targets: &[String],
+    auth_summary: &str,
     auth_warnings: &[String],
 ) -> Result<LlmVerdict> {
     let (program, args) = build_cli_command(config)?;
@@ -2274,6 +2312,7 @@ fn llm_judge_cli(
         config.max_chars,
         attachments,
         docx_targets,
+        auth_summary,
         auth_warnings,
     );
     let full_prompt = format!("{LLM_SYSTEM_PROMPT}\n\n=== 待判定郵件 ===\n{user_prompt}");
@@ -2281,6 +2320,121 @@ fn llm_judge_cli(
     let output_text = run_cli_with_stdin(&program, &args, &full_prompt, timeout)?;
     parse_llm_verdict(&output_text)
         .with_context(|| format!("CLI ({program}) 原始回應為：{output_text:?}"))
+}
+
+/// 解析 Jev 回傳的 JSON，擷取 is_phishing 的機率值 (0.0 ~ 1.0)。
+fn parse_jev_probability(val: &serde_json::Value) -> Result<f64> {
+    let answer = val
+        .get("answers")
+        .and_then(|a| a.get("is_phishing"))
+        .context("Jev 回應缺少 answers.is_phishing")?;
+
+    if let Some(noul) = answer.get("noul").and_then(|n| n.as_f64()) {
+        return Ok(noul.clamp(0.0, 1.0));
+    }
+    if let Some(score) = answer.get("score").and_then(|s| s.as_f64()) {
+        return Ok(score.clamp(0.0, 1.0));
+    }
+    bail!("Jev 回應 answers.is_phishing 缺少有效的 noul 機率數值：{val}")
+}
+
+/// 透過 TypeSafe System One API (Jev) 取得單一郵件釣魚機率（0.0 ~ 1.0）。
+fn llm_judge_jev(
+    config: &LlmConfig,
+    from: &str,
+    subject: &str,
+    body: &str,
+    attachments: &[String],
+    docx_targets: &[String],
+    auth_summary: &str,
+    auth_warnings: &[String],
+) -> Result<f64> {
+    let base_url = if config.base_url.trim().is_empty() {
+        "https://api.typesafe.ai"
+    } else {
+        config.base_url.trim().trim_end_matches('/')
+    };
+    let model = if config.model.trim().is_empty() {
+        "jev-latest"
+    } else {
+        config.model.trim()
+    };
+    let url = format!("{base_url}/v1/systemone");
+
+    let user_content = llm_user_prompt(
+        from,
+        subject,
+        body,
+        config.max_chars,
+        attachments,
+        docx_targets,
+        auth_summary,
+        auth_warnings,
+    );
+
+    let payload = serde_json::json!({
+        "state": user_content,
+        "model": model,
+        "questions": {
+            "is_phishing": {
+                "type": "noul",
+                "instructions": "判斷此郵件是否為釣魚、詐欺、詐騙郵件，或未經請求的惡意行銷廣告、垃圾推銷、仿冒知名品牌之垃圾廣告郵件？",
+                "criteria": {
+                    "true": "符合釣魚、詐欺、要求帳密/款項、偽裝機構品牌、異常附件追蹤或惡意促銷垃圾信",
+                    "false": "正常商務或私人溝通往來郵件；或安全驗證通過且來源正常的資安通報、垃圾信隔離明細、防毒/SOC回報郵件"
+                }
+            }
+        }
+    });
+
+    let agent_config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(config.timeout_secs)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(agent_config);
+
+    let mut request = agent.post(&url);
+    let api_key = config.api_key.trim();
+    if !api_key.is_empty() {
+        request = request.header("Authorization", &format!("Bearer {api_key}"));
+    }
+
+    let mut response = request
+        .send_json(payload)
+        .map_err(|error| anyhow::anyhow!("Jev API 請求失敗：{error}"))?;
+
+    let status = response.status();
+    if (300..=399).contains(&status.as_u16()) {
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("未知");
+        bail!(
+            "Jev 伺服器回傳重定向 (HTTP {}) 至 {}，請檢查 [llm].base_url 設定",
+            status.as_u16(),
+            location
+        );
+    }
+    if !status.is_success() {
+        let err_body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|_| "(無法讀取回應內文)".into());
+        bail!(
+            "Jev 伺服器回傳錯誤 (HTTP {})：{}",
+            status.as_u16(),
+            err_body
+        );
+    }
+
+    let resp_val: serde_json::Value = response
+        .body_mut()
+        .read_json()
+        .map_err(|error| anyhow::anyhow!("Jev 回應不是 JSON：{error}"))?;
+
+    parse_jev_probability(&resp_val)
 }
 
 /// 呼叫指定之 LLM 後端（API 或 CLI）取得單一郵件判定。
@@ -2291,6 +2445,7 @@ fn llm_judge(
     body: &str,
     attachments: &[String],
     docx_targets: &[String],
+    auth_summary: &str,
     auth_warnings: &[String],
 ) -> Result<LlmVerdict> {
     let backend = config
@@ -2304,6 +2459,7 @@ fn llm_judge(
             body,
             attachments,
             docx_targets,
+            auth_summary,
             auth_warnings,
         ),
         LlmBackend::Claude | LlmBackend::Codex | LlmBackend::Agy | LlmBackend::Command => {
@@ -2314,8 +2470,27 @@ fn llm_judge(
                 body,
                 attachments,
                 docx_targets,
+                auth_summary,
                 auth_warnings,
             )
+        }
+        LlmBackend::Jev => {
+            let prob = llm_judge_jev(
+                config,
+                from,
+                subject,
+                body,
+                attachments,
+                docx_targets,
+                auth_summary,
+                auth_warnings,
+            )?;
+            let is_phishing = prob >= 0.75;
+            let reason = format!("Jev 評定釣魚機率 {:.0}%", prob * 100.0);
+            Ok(LlmVerdict {
+                is_phishing,
+                reason,
+            })
         }
     }
 }
@@ -2493,7 +2668,35 @@ fn scan_mail(
                 .ok();
             let attachments = extract_attachment_filenames(&mail);
             let targets = external_word_image_targets(&mail);
-            let auth_warnings = check_auth_failures(&mail);
+            let auth_status = check_auth_status(&mail);
+            let auth_warnings = auth_status.warnings.clone();
+            let auth_summary = auth_status.summary();
+
+            // 白名單直接安全豁免檢查：若寄件來源符合 trusted_sender_domains，且安全驗證無失敗警告，直接豁免跳過
+            if let Some(matched) =
+                is_trusted_sender(&from, &config.detection.trusted_sender_domains)
+            {
+                if auth_warnings.is_empty() {
+                    max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                    last_checked = Some((*date, uid, subject.clone()));
+                    lines.push(format!(
+                        "略過〈{}〉（寄件來源在信任清單：{}，且通過安全驗證）",
+                        subject, matched
+                    ));
+                    if used_fallback && was_unread {
+                        let _ = restore_unread_status(&mut session, uid);
+                    }
+                    continue;
+                } else {
+                    lines.push(format!(
+                        "注意：〈{}〉寄件來源雖符合信任清單 ({})，但安全驗證失敗（{}），取消白名單豁免並送檢",
+                        subject,
+                        matched,
+                        auth_warnings.join("；")
+                    ));
+                }
+            }
+
             let (score, reasons) = phishing_score(
                 &from,
                 &subject,
@@ -2505,7 +2708,82 @@ fn scan_mail(
             );
             match &llm {
                 Some(llm_config) => {
-                    if llm_consecutive_failures >= 3 {
+                    if llm_config.effective_backend() == Some(LlmBackend::Jev) {
+                        max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                        last_checked = Some((*date, uid, subject.clone()));
+                        if llm_consecutive_failures >= 3 {
+                            lines.push(format!(
+                                "略過〈{}〉（Jev 連續失敗熔斷，採規則評分 {score}）",
+                                subject
+                            ));
+                            if score >= config.detection.threshold {
+                                let fallback_reason = format!(
+                                    "Jev 熔斷；規則評分達標（{score}分）：{}",
+                                    reasons.join("；")
+                                );
+                                pending.push((uid, subject.clone(), score, fallback_reason));
+                            }
+                        } else {
+                            match llm_judge_jev(
+                                llm_config,
+                                &from,
+                                &subject,
+                                &body,
+                                &attachments,
+                                &targets,
+                                &auth_summary,
+                                &auth_warnings,
+                            ) {
+                                Ok(prob) => {
+                                    let jev_points =
+                                        (prob * llm_config.jev_max_score as f64).round() as u32;
+                                    let final_score = score + jev_points;
+                                    let mut combined_reasons = reasons.clone();
+                                    combined_reasons.push(format!(
+                                        "Jev 評定釣魚機率 {:.0}%（+{jev_points}分）",
+                                        prob * 100.0
+                                    ));
+                                    if final_score >= config.detection.threshold {
+                                        pending.push((
+                                            uid,
+                                            subject.clone(),
+                                            final_score,
+                                            combined_reasons.join("；"),
+                                        ));
+                                    } else {
+                                        lines.push(format!(
+                                            "略過〈{}〉（評分 {final_score}，未達門檻；Jev 機率 {:.0}%）",
+                                            subject,
+                                            prob * 100.0
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    llm_consecutive_failures += 1;
+                                    lines.push(format!(
+                                        "Jev 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
+                                    ));
+                                    if score >= config.detection.threshold {
+                                        let fallback_reason = format!(
+                                            "Jev 判定失敗，退回規則評分達標（{score}分）：{}",
+                                            reasons.join("；")
+                                        );
+                                        pending.push((
+                                            uid,
+                                            subject.clone(),
+                                            score,
+                                            fallback_reason,
+                                        ));
+                                    } else {
+                                        lines.push(format!(
+                                            "略過〈{}〉（評分 {score}，未達門檻；Jev 判定失敗）",
+                                            subject
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    } else if llm_consecutive_failures >= 3 {
                         // 熔斷：本日期內已連續失敗 ≥3 次，跳過 LLM 直接採規則評分
                         max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                         last_checked = Some((*date, uid, subject.clone()));
@@ -2528,6 +2806,7 @@ fn scan_mail(
                             &body,
                             &attachments,
                             &targets,
+                            &auth_summary,
                             &auth_warnings,
                         ) {
                             Ok(verdict) => {
@@ -2996,7 +3275,37 @@ const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 8] = [
     ),
 ];
 
-/// 檢查郵件驗證標頭（DMARC / SPF 驗證失敗）
+/// 郵件安全驗證解析狀態（SPF / DKIM / DMARC / TLS）
+#[derive(Debug, Default, Clone)]
+struct EmailAuthStatus {
+    pub spf: Option<String>,
+    pub dkim: Option<String>,
+    pub dmarc: Option<String>,
+    pub tls: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+impl EmailAuthStatus {
+    /// 組合給 LLM / Jev 的安全驗證狀態摘要字串
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ref spf) = self.spf {
+            parts.push(format!("SPF: {spf}"));
+        }
+        if let Some(ref dkim) = self.dkim {
+            parts.push(format!("DKIM: {dkim}"));
+        }
+        if let Some(ref dmarc) = self.dmarc {
+            parts.push(format!("DMARC: {dmarc}"));
+        }
+        if let Some(ref tls) = self.tls {
+            parts.push(format!("TLS 傳輸加密: {tls}"));
+        }
+        parts.join("；")
+    }
+}
+
+/// 檢查並解析郵件驗證標頭（SPF / DKIM / DMARC / TLS）與偽造警示
 ///
 /// 規則：
 /// - `Authentication-Results` / `ARC-Authentication-Results`：只信任 `i=1`（最外層
@@ -3004,9 +3313,8 @@ const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 8] = [
 ///   沒有 `i=` 視為受信邊界（多數現代 MTA 預設）。
 /// - `Received-SPF`：hop-local 結果，不做 i= 過濾。
 /// - `spf=softfail` 不視為偽造（常見於 forwarding / 授權第三方 / mailing list）。
-///   若 DKIM 通過且 DMARC pass，仍屬合法郵件。
-fn check_auth_failures(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
-    let mut warnings = Vec::new();
+fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
+    let mut status = EmailAuthStatus::default();
     let check_headers = [
         "Authentication-Results",
         "ARC-Authentication-Results",
@@ -3024,19 +3332,93 @@ fn check_auth_failures(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
                 }
             }
             let lower = val.to_lowercase();
+            // 解析 DMARC 狀態
+            if status.dmarc.is_none() {
+                if lower.contains("dmarc=pass") {
+                    status.dmarc = Some("pass".to_string());
+                } else if lower.contains("dmarc=fail") {
+                    status.dmarc = Some("fail".to_string());
+                } else if lower.contains("dmarc=none") {
+                    status.dmarc = Some("none".to_string());
+                }
+            }
+            // 解析 DKIM 狀態
+            if status.dkim.is_none() {
+                if lower.contains("dkim=pass") {
+                    status.dkim = Some("pass".to_string());
+                } else if lower.contains("dkim=fail") {
+                    status.dkim = Some("fail".to_string());
+                } else if lower.contains("dkim=none") {
+                    status.dkim = Some("none".to_string());
+                }
+            }
+            // 解析 SPF 狀態
+            if status.spf.is_none() {
+                if name == "Received-SPF" {
+                    if lower.starts_with("pass") {
+                        status.spf = Some("pass".to_string());
+                    } else if lower.starts_with("fail") {
+                        status.spf = Some("fail".to_string());
+                    } else if lower.starts_with("softfail") {
+                        status.spf = Some("softfail".to_string());
+                    } else if lower.starts_with("neutral") {
+                        status.spf = Some("neutral".to_string());
+                    } else if lower.starts_with("none") {
+                        status.spf = Some("none".to_string());
+                    }
+                } else if lower.contains("spf=pass") {
+                    status.spf = Some("pass".to_string());
+                } else if lower.contains("spf=fail") {
+                    status.spf = Some("fail".to_string());
+                } else if lower.contains("spf=softfail") {
+                    status.spf = Some("softfail".to_string());
+                } else if lower.contains("spf=neutral") {
+                    status.spf = Some("neutral".to_string());
+                } else if lower.contains("spf=none") {
+                    status.spf = Some("none".to_string());
+                }
+            }
+
+            // 偽造警告判斷
             if (lower.contains("dmarc=fail") || lower.contains("dmarc=reject"))
-                && !warnings.iter().any(|w: &String| w.contains("DMARC"))
+                && !status.warnings.iter().any(|w: &String| w.contains("DMARC"))
             {
-                warnings.push("DMARC 驗證失敗（寄件者網域遭偽造）".into());
+                status
+                    .warnings
+                    .push("DMARC 驗證失敗（寄件者網域遭偽造）".into());
             }
             let spf_failed =
                 lower.contains("spf=fail") || (name == "Received-SPF" && lower.starts_with("fail"));
-            if spf_failed && !warnings.iter().any(|w: &String| w.contains("SPF")) {
-                warnings.push("SPF 驗證失敗（發信伺服器未獲授權）".into());
+            if spf_failed && !status.warnings.iter().any(|w: &String| w.contains("SPF")) {
+                status
+                    .warnings
+                    .push("SPF 驗證失敗（發信伺服器未獲授權）".into());
             }
         }
     }
-    warnings
+
+    // 解析傳輸加密（Received 標頭）
+    for val in mail.headers.get_all_values("Received") {
+        let lower = val.to_lowercase();
+        if lower.contains("using tlsv1.3") || lower.contains("tlsv1.3") {
+            status.tls = Some("TLSv1.3".to_string());
+            break;
+        } else if lower.contains("using tlsv1.2") || lower.contains("tlsv1.2") {
+            status.tls = Some("TLSv1.2".to_string());
+            break;
+        } else if lower.contains("using tls") || lower.contains("with esmtps") {
+            status.tls = Some("TLS (SMTPS)".to_string());
+            break;
+        }
+    }
+
+    status
+}
+
+/// 兼容既有直接取得警示之處
+#[allow(dead_code)]
+fn check_auth_failures(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
+    check_auth_status(mail).warnings
 }
 
 /// 從 Authentication-Results 標頭值中解析 `i=<n>` instance number。
@@ -3045,6 +3427,22 @@ fn parse_auth_results_instance(value: &str) -> Option<u32> {
         let token = token.trim();
         if let Some(rest) = token.strip_prefix("i=") {
             return rest.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// 檢查寄件者是否命中信任清單（不區分大小寫）
+fn is_trusted_sender(from: &str, trusted_domains: &[String]) -> Option<String> {
+    let from_lower = from.to_lowercase();
+    for d in trusted_domains {
+        let trimmed = d.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let d_lower = trimmed.to_lowercase();
+        if from_lower.contains(&d_lower) {
+            return Some(trimmed.to_string());
         }
     }
     None
@@ -3454,7 +3852,7 @@ mod tests {
             assert!(from.contains("fote-hotel.biz") || from.contains("Waterfal"));
             assert!(subject.contains("裝飾") || subject.contains("健康"));
             assert!(llm_body.contains("Spirual") || llm_body.contains("香薰"));
-            let prompt = llm_user_prompt(&from, &subject, &llm_body, 6000, &[], &[], &[]);
+            let prompt = llm_user_prompt(&from, &subject, &llm_body, 6000, &[], &[], "", &[]);
             assert!(prompt.contains("From:"));
             assert!(prompt.contains("Subject:"));
             assert!(prompt.contains("Body:"));
@@ -3478,7 +3876,7 @@ mod tests {
     fn llm_prompt_truncates_body_and_includes_docx_hint() {
         let body = "a".repeat(5000);
         let targets = vec!["https://track.example/pixel.png".into()];
-        let prompt = llm_user_prompt("a@b.com", "主旨", &body, 100, &[], &targets, &[]);
+        let prompt = llm_user_prompt("a@b.com", "主旨", &body, 100, &[], &targets, "", &[]);
         // 內文被截斷至 100 字元
         assert!(prompt.contains(&"a".repeat(100)));
         assert!(!prompt.contains(&"a".repeat(101)));
@@ -3489,10 +3887,10 @@ mod tests {
 
     #[test]
     fn llm_prompt_omits_docx_hint_when_empty() {
-        let prompt = llm_user_prompt("a@b.com", "主旨", "內文", 100, &[], &[], &[]);
+        let prompt = llm_user_prompt("a@b.com", "主旨", "內文", 100, &[], &[], "", &[]);
         assert!(!prompt.contains("附件提示"));
         assert!(!prompt.contains("附件清單"));
-        assert!(!prompt.contains("安全驗證提示"));
+        assert!(!prompt.contains("安全驗證警示"));
     }
 
     #[test]
@@ -3504,6 +3902,7 @@ mod tests {
             100,
             &["新聞.doc".into()],
             &["https://track.example/p.png".into()],
+            "SPF: pass；DKIM: pass；DMARC: pass；TLS 傳輸加密: TLSv1.3",
             &["DMARC 驗證失敗".into()],
         );
         assert!(prompt.contains("附件清單：新聞.doc"));
@@ -3511,7 +3910,12 @@ mod tests {
             prompt
                 .contains("附件提示：Word 文件含外部圖片連結（追蹤）：https://track.example/p.png")
         );
-        assert!(prompt.contains("安全驗證提示：DMARC 驗證失敗"));
+        assert!(
+            prompt.contains(
+                "安全驗證狀態：SPF: pass；DKIM: pass；DMARC: pass；TLS 傳輸加密: TLSv1.3"
+            )
+        );
+        assert!(prompt.contains("安全驗證警示：DMARC 驗證失敗"));
     }
 
     #[test]
@@ -4214,7 +4618,9 @@ mod tests {
         let (body, score_body) = extract_body_text(&mail);
         let attachments = extract_attachment_filenames(&mail);
         let targets = external_word_image_targets(&mail);
-        let auth_warnings = check_auth_failures(&mail);
+        let auth_status = check_auth_status(&mail);
+        let auth_warnings = &auth_status.warnings;
+        let auth_summary = auth_status.summary();
         let detection_cfg = test_detection_config();
         let (score, reasons) = phishing_score(
             &from,
@@ -4222,7 +4628,7 @@ mod tests {
             &score_body,
             &attachments,
             &targets,
-            &auth_warnings,
+            auth_warnings,
             &detection_cfg,
         );
         let prompt = llm_user_prompt(
@@ -4232,7 +4638,8 @@ mod tests {
             4000,
             &attachments,
             &targets,
-            &auth_warnings,
+            &auth_summary,
+            auth_warnings,
         );
 
         println!("=== momoSpam.eml 解析結果 ===");
@@ -4386,5 +4793,162 @@ mod tests {
             assert_eq!(prog, "sh");
             assert_eq!(args, vec!["-c", "ollama run llama3.1"]);
         }
+    }
+
+    #[test]
+    fn llm_config_jev_backend_parsing() {
+        for alias in &["jev", "typesafe", "systemone"] {
+            let config_text = format!(
+                r#"
+                backend = "{alias}"
+                api_key = "test-key"
+                "#
+            );
+            let config: LlmConfig = toml::from_str(&config_text).unwrap();
+            assert_eq!(config.effective_backend(), Some(LlmBackend::Jev));
+        }
+
+        let toml_without_key = r#"
+            [imap]
+            host = "imap.example.com"
+            port = 993
+            protocol = "imaps"
+            username = "u"
+            password = "p"
+            source_mailbox = "INBOX"
+            phishing_mailbox = "Spam"
+            [detection]
+            threshold = 5
+            [gui]
+            [llm]
+            backend = "jev"
+            "#;
+        let config_no_key: Config = toml::from_str(toml_without_key).unwrap();
+        assert!(
+            llm_config(&config_no_key).is_none(),
+            "Jev 後端若無 api_key 應為無效"
+        );
+
+        let toml_with_key = r#"
+            [imap]
+            host = "imap.example.com"
+            port = 993
+            protocol = "imaps"
+            username = "u"
+            password = "p"
+            source_mailbox = "INBOX"
+            phishing_mailbox = "Spam"
+            [detection]
+            threshold = 5
+            [gui]
+            [llm]
+            backend = "jev"
+            api_key = "sk-typesafe-123"
+            jev_max_score = 6
+            "#;
+        let config_with_key: Config = toml::from_str(toml_with_key).unwrap();
+        let effective = llm_config(&config_with_key).expect("具備 api_key 應為有效 Jev 設定");
+        assert_eq!(effective.effective_backend(), Some(LlmBackend::Jev));
+        assert_eq!(effective.jev_max_score, 6);
+    }
+
+    #[test]
+    fn parse_jev_probability_noul_and_score() {
+        let json_noul = serde_json::json!({
+            "model": "jev-1.13.0",
+            "answers": {
+                "is_phishing": {
+                    "type": "noul",
+                    "noul": 0.88
+                }
+            }
+        });
+        let prob = parse_jev_probability(&json_noul).expect("應解析 noul 機率");
+        assert!((prob - 0.88).abs() < 1e-6);
+
+        let json_clamped = serde_json::json!({
+            "answers": {
+                "is_phishing": {
+                    "type": "noul",
+                    "noul": 1.25
+                }
+            }
+        });
+        let clamped = parse_jev_probability(&json_clamped).expect("超過 1.0 應被 clamp");
+        assert_eq!(clamped, 1.0);
+
+        let json_score = serde_json::json!({
+            "answers": {
+                "is_phishing": {
+                    "type": "score",
+                    "score": 0.72
+                }
+            }
+        });
+        let score_prob = parse_jev_probability(&json_score).expect("應支援 score 備援");
+        assert!((score_prob - 0.72).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jev_composite_scoring_calculation() {
+        let max_score = 5u32;
+        // 0.88 * 5 = 4.4 -> round = 4
+        let prob = 0.88f64;
+        let points = (prob * max_score as f64).round() as u32;
+        assert_eq!(points, 4);
+
+        // 基礎規則評分 2 分 + Jev 4 分 = 6 分 (超過 threshold 5)
+        let base_score = 2u32;
+        let final_score = base_score + points;
+        assert_eq!(final_score, 6);
+        assert!(final_score >= 5);
+
+        // 低機率 0.15 * 5 = 0.75 -> round = 1
+        let low_prob = 0.15f64;
+        let low_points = (low_prob * max_score as f64).round() as u32;
+        assert_eq!(low_points, 1);
+        let low_final = base_score + low_points;
+        assert_eq!(low_final, 3);
+        assert!(low_final < 5);
+    }
+
+    #[test]
+    fn test_is_trusted_sender_matching() {
+        let trusted = vec!["soc.hinet.net".to_string(), "internal.corp".to_string()];
+        assert_eq!(
+            is_trusted_sender("Hinet SOC 病毒回報 <soc-report@soc.hinet.net>", &trusted),
+            Some("soc.hinet.net".to_string())
+        );
+        assert_eq!(
+            is_trusted_sender("Service <notice@HiNet.Net>", &["hinet.net".to_string()]),
+            Some("hinet.net".to_string())
+        );
+        assert_eq!(
+            is_trusted_sender("Attacker <evil@phishing.com>", &trusted),
+            None
+        );
+    }
+
+    #[test]
+    fn test_check_auth_status_pass_and_tls_summary() {
+        let raw = concat!(
+            "From: Service <service@example.com>\r\n",
+            "Authentication-Results: mx.example.com; dkim=pass header.i=@example.com; spf=pass smtp.mailfrom=service@example.com; dmarc=pass\r\n",
+            "Received: from mail.example.com by mx.example.com with ESMTPS (using TLSv1.3)\r\n",
+            "\r\n",
+            "This is a legitimate system notification.\r\n"
+        );
+        let mail = mailparse::parse_mail(raw.as_bytes()).unwrap();
+        let status = check_auth_status(&mail);
+        assert_eq!(status.spf.as_deref(), Some("pass"));
+        assert_eq!(status.dkim.as_deref(), Some("pass"));
+        assert_eq!(status.dmarc.as_deref(), Some("pass"));
+        assert_eq!(status.tls.as_deref(), Some("TLSv1.3"));
+        assert!(status.warnings.is_empty());
+        let summary = status.summary();
+        assert!(summary.contains("SPF: pass"));
+        assert!(summary.contains("DKIM: pass"));
+        assert!(summary.contains("DMARC: pass"));
+        assert!(summary.contains("TLS 傳輸加密: TLSv1.3"));
     }
 }

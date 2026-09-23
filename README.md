@@ -11,13 +11,15 @@
 
 - **多後端 LLM 智慧判定**：
   - 支援地端/雲端 **OpenAI 相容 HTTP API**（例如 Ollama / LM Studio / llama.cpp / vLLM / OpenAI 相容服務）。
+  - 支援 **TypeSafe Jev (System One)** API：以 `noul` primitive 取得精確釣魚機率，採**混合評分制（Composite Scoring）**將機率換算為分數，與安全規則加總判定（非 100% 一票專斷）。
   - 支援直接透過命令列呼叫 **Claude Code CLI (`claude`)**、**OpenAI Codex CLI (`codex`)**、**Antigravity CLI (`agy`)** 或**自訂命令 (`command`)**。
   - 提示詞採用 stdin 管道安全串流傳入，無命令列長度限制；外部 CLI 預設封鎖本地操作權限與工具呼叫，安全隔離。
 - **深層威脅特徵識別**：
   - **釣魚與詐欺**：偽裝知名品牌（DHL、FedEx、銀行等）、要求更新個資或繳費、緊急施壓等行為。
   - **惡意行銷與推銷廣告**：仿冒促銷、未經請求推銷、一般性商品廣告、假退訂連結（Opt-Out）。
   - **Quishing 偵測**：識別 HTML 內嵌 QR Code 與手機掃描提示。
-  - **安全驗證比對**：解析郵件標頭檢查 DMARC / SPF 驗證狀態，識別冒名偽造。
+  - **白名單直接安全豁免**：寄件來源符合 `trusted_sender_domains` 且未發生 SPF/DMARC 偽造失敗時，直接安全豁免跳過（不耗費 token、不搬移）；若有驗證失敗則取消豁免並警示送檢。
+  - **安全驗證與傳輸狀態感知**：解析最外層受信邊界之 SPF、DKIM、DMARC 驗證結果與 TLS (SMTPS) 加密狀態，完整注入 LLM / Jev Prompt；資安通報與隔離報告在驗證通過時排除誤判。
   - **DOCX 外部圖片追蹤**：安全離線解析 Word 附件關聯 XML，偵測外部 Web Bug / 開啟追蹤圖片（不啟動 Office、不下載外部資源）。
 - **搬移確認機制（防誤判）**：
   - **CLI 版**：掃描完成後列出判定清單，支援 `[a]` 全部搬移、`[s]` 全部跳過、`[c]` 逐封決定；可帶 `-y` 參數非互動直接搬移。
@@ -105,12 +107,19 @@ external_word_image_score = 5
 
 # --- LLM 智慧判定設定 ---
 [llm]
-# 後端類型：可選 "api" (預設)、"claude"、"codex"、"agy"、"command"
+# 後端類型：可選 "api" (預設)、"jev"、"claude"、"codex"、"agy"、"command"
 backend = "claude"
 
 # [api 模式適用]
 base_url = "http://127.0.0.1:11434/v1"
 api_key = ""
+
+# [jev 模式適用（TypeSafe Jev System One 混合評分）]
+# backend = "jev"
+# base_url = "https://api.typesafe.ai"  # 選填，預設 https://api.typesafe.ai
+# model = "jev-latest"                  # 選填，預設 jev-latest
+# api_key = "sk-..."                   # 必填
+# jev_max_score = 5                     # Jev 分數換算上限（預設 5）
 
 # [共用設定]
 # 模型名稱。CLI 模式留空則自動使用該 CLI 預設模型；亦可明確指定（如 "claude-3-7-sonnet"、"o3-mini"）
