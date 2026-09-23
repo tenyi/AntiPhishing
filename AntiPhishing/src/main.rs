@@ -436,22 +436,28 @@ fn main() -> Result<()> {
             .collect();
         // 由小到大排序：處理順序穩定，進度計數也與 UID 對應
         uids.sort_unstable();
+        // LLM 連續失敗熔斷：本日期內連續失敗 ≥3 次後，本輪剩餘信件直接採規則評分，
+        // 避免 LLM 服務當機時每封都等待逾時上限。
+        let mut llm_consecutive_failures: u32 = 0;
         show_progress(
             &progress_width,
             format!("搜尋 {date}：找到 {} 封待檢查", uids.len()),
         );
         let total = uids.len();
         for (index, uid) in uids.into_iter().enumerate() {
-            let messages = match session
-                .uid_fetch(uid.to_string(), "(FLAGS BODY.PEEK[])")
-                .or_else(|_| session.uid_fetch(uid.to_string(), "(FLAGS RFC822)"))
-            {
-                Ok(messages) => messages,
-                Err(error) => {
-                    lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
-                    continue;
-                }
-            };
+            // BODY.PEEK[] 依 RFC 3501 § 6.4.5 不會觸發 \Seen；RFC822 fallback 在多數伺服器上會。
+            // 只在 fallback 路徑才還原未讀，避免對未讀信件多發一次無意義的 STORE。
+            let (messages, used_fallback) =
+                match session.uid_fetch(uid.to_string(), "(FLAGS BODY.PEEK[])") {
+                    Ok(messages) => (messages, false),
+                    Err(_) => match session.uid_fetch(uid.to_string(), "(FLAGS RFC822)") {
+                        Ok(messages) => (messages, true),
+                        Err(error) => {
+                            lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
+                            continue;
+                        }
+                    },
+                };
             let Some(message) = messages.iter().next() else {
                 lines.push(format!("郵件 UID {uid} 內容為空，略過。"));
                 continue;
@@ -460,7 +466,7 @@ fn main() -> Result<()> {
             let was_unread = is_message_unread(message.flags());
             let Some(bytes) = message.body() else {
                 lines.push(format!("郵件 UID {uid} 內文為空，略過。"));
-                if was_unread {
+                if used_fallback && was_unread {
                     let _ = restore_unread_status(&mut session, uid);
                 }
                 continue;
@@ -469,7 +475,7 @@ fn main() -> Result<()> {
                 Ok(mail) => mail,
                 Err(error) => {
                     lines.push(format!("無法解析郵件 UID {uid} 內容（略過）：{error:#}"));
-                    if was_unread {
+                    if used_fallback && was_unread {
                         let _ = restore_unread_status(&mut session, uid);
                     }
                     continue;
@@ -495,39 +501,55 @@ fn main() -> Result<()> {
             );
             match &llm {
                 Some(llm_config) => {
-                    match llm_judge(
-                        llm_config,
-                        &from,
-                        &subject,
-                        &body,
-                        &attachments,
-                        &targets,
-                        &auth_warnings,
-                    ) {
-                        Ok(verdict) if verdict.is_phishing => {
-                            pending.push((uid, subject.clone(), score, verdict.reason));
+                    if llm_consecutive_failures >= 3 {
+                        // 熔斷：本日期內已連續失敗 ≥3 次，跳過 LLM 直接採規則評分
+                        lines.push(format!(
+                            "略過〈{}〉（LLM 連續失敗熔斷，採規則評分 {score}）",
+                            subject
+                        ));
+                        if score >= config.detection.threshold {
+                            let fallback_reason = format!(
+                                "LLM 熔斷；規則評分達標（{score}分）：{}",
+                                reasons.join("；")
+                            );
+                            pending.push((uid, subject.clone(), score, fallback_reason));
                         }
-                        Ok(verdict) => {
-                            lines.push(format!(
-                                "略過〈{}〉（評分 {score}；LLM：{}）",
-                                subject, verdict.reason
-                            ));
-                        }
-                        Err(error) => {
-                            lines.push(format!(
-                                "LLM 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
-                            ));
-                            if score >= config.detection.threshold {
-                                let fallback_reason = format!(
-                                    "LLM 判定失敗，退回規則評分達標（{score}分）：{}",
-                                    reasons.join("；")
-                                );
-                                pending.push((uid, subject.clone(), score, fallback_reason));
-                            } else {
+                    } else {
+                        match llm_judge(
+                            llm_config,
+                            &from,
+                            &subject,
+                            &body,
+                            &attachments,
+                            &targets,
+                            &auth_warnings,
+                        ) {
+                            Ok(verdict) if verdict.is_phishing => {
+                                pending.push((uid, subject.clone(), score, verdict.reason));
+                            }
+                            Ok(verdict) => {
                                 lines.push(format!(
-                                    "略過〈{}〉（評分 {score}，未達門檻；LLM 判定失敗）",
-                                    subject
+                                    "略過〈{}〉（評分 {score}；LLM：{}）",
+                                    subject, verdict.reason
                                 ));
+                            }
+                            Err(error) => {
+                                llm_consecutive_failures += 1;
+                                lines.push(format!(
+                                    "LLM 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
+                                ));
+                                if score >= config.detection.threshold {
+                                    let fallback_reason = format!(
+                                        "LLM 判定失敗，退回規則評分達標（{score}分）：{}",
+                                        reasons.join("；")
+                                    );
+                                    pending.push((uid, subject.clone(), score, fallback_reason));
+                                } else {
+                                    lines.push(format!(
+                                        "略過〈{}〉（評分 {score}，未達門檻；LLM 判定失敗）",
+                                        subject
+                                    ));
+                                }
                             }
                         }
                     }
@@ -538,7 +560,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            if was_unread {
+            if used_fallback && was_unread {
                 let _ = restore_unread_status(&mut session, uid);
             }
         }
@@ -919,10 +941,29 @@ const BRAND_OFFICIAL_DOMAINS: [(&str, &[&str]); 8] = [
     ("pchome", &["pchome.com.tw", "pcstore.com.tw"]),
     ("shopee", &["shopee.tw", "shopee.com"]),
     ("蝦皮", &["shopee.tw", "shopee.com"]),
-    ("yahoo", &["yahoo.com", "yahoo.com.tw"]),
+    (
+        "yahoo",
+        &[
+            "yahoo.com",
+            "yahoo.com.tw",
+            "yahoo.co.jp",
+            "yahoo.com.hk",
+            "yahoo.co.uk",
+            "yahoo.com.au",
+            "yahoo.com.sg",
+        ],
+    ),
 ];
 
 /// 檢查郵件驗證標頭（DMARC / SPF 驗證失敗）
+///
+/// 規則：
+/// - `Authentication-Results` / `ARC-Authentication-Results`：只信任 `i=1`（最外層
+///   受信邊界）。inner hop 的 ARC 結果略過，避免 forwarding / mailing list 殘留誤判。
+///   沒有 `i=` 視為受信邊界（多數現代 MTA 預設）。
+/// - `Received-SPF`：hop-local 結果，不做 i= 過濾。
+/// - `spf=softfail` 不視為偽造（常見於 forwarding / 授權第三方 / mailing list）。
+///   若 DKIM 通過且 DMARC pass，仍屬合法郵件。
 fn check_auth_failures(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
     let mut warnings = Vec::new();
     let check_headers = [
@@ -932,23 +973,40 @@ fn check_auth_failures(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
     ];
     for name in check_headers {
         for val in mail.headers.get_all_values(name) {
+            if matches!(
+                name,
+                "Authentication-Results" | "ARC-Authentication-Results"
+            ) {
+                let instance = parse_auth_results_instance(&val);
+                if !matches!(instance, Some(1) | None) {
+                    continue;
+                }
+            }
             let lower = val.to_lowercase();
             if (lower.contains("dmarc=fail") || lower.contains("dmarc=reject"))
                 && !warnings.iter().any(|w: &String| w.contains("DMARC"))
             {
                 warnings.push("DMARC 驗證失敗（寄件者網域遭偽造）".into());
             }
-            if (lower.contains("spf=fail")
-                || lower.contains("spf=softfail")
-                || (name == "Received-SPF"
-                    && (lower.starts_with("fail") || lower.starts_with("softfail"))))
-                && !warnings.iter().any(|w: &String| w.contains("SPF"))
-            {
+            let spf_failed =
+                lower.contains("spf=fail") || (name == "Received-SPF" && lower.starts_with("fail"));
+            if spf_failed && !warnings.iter().any(|w: &String| w.contains("SPF")) {
                 warnings.push("SPF 驗證失敗（發信伺服器未獲授權）".into());
             }
         }
     }
     warnings
+}
+
+/// 從 Authentication-Results 標頭值中解析 `i=<n>` instance number。
+fn parse_auth_results_instance(value: &str) -> Option<u32> {
+    for token in value.split(';') {
+        let token = token.trim();
+        if let Some(rest) = token.strip_prefix("i=") {
+            return rest.trim().parse::<u32>().ok();
+        }
+    }
+    None
 }
 
 /// 收集所有附件檔名清單（供評分與 LLM 提示參考）
@@ -1025,7 +1083,11 @@ fn phishing_score(
     if let Some(domain) = email_domain {
         for (brand, officials) in BRAND_OFFICIAL_DOMAINS {
             if display_name.contains(brand)
-                && !officials.iter().any(|official| domain.ends_with(official))
+                // 嚴格比對：官方網域本身或「.官方網域」結尾，避免 evil-dhl.com 偽裝
+                && !officials.iter().any(|official| {
+                    domain == *official
+                        || domain.ends_with(&format!(".{official}"))
+                })
             {
                 score += 3;
                 reasons.push(format!(
@@ -1360,6 +1422,116 @@ mod tests {
             &bare_config(),
         );
         assert!(!reasons_yahoo.iter().any(|r| r.contains("品牌偽裝")));
+    }
+
+    // 回歸（F1）：lookalike 網域（evil-dhl.com 等）在嚴格比對下必須觸發品牌偽裝。
+    // 修正前 loose `ends_with(official)` 會把它誤判為 DHL 官方，導致攻擊者漏抓。
+    #[test]
+    fn scores_brand_spoofing_for_lookalike_domain() {
+        let (_, reasons) = phishing_score(
+            "DHL Express <noreply@evil-dhl.com>",
+            "包裹",
+            "",
+            &[],
+            &[],
+            &[],
+            &bare_config(),
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("品牌偽裝")),
+            "evil-dhl.com 應被判定為品牌偽裝（DHL lookalike），實際 reasons = {reasons:?}"
+        );
+
+        let (_, reasons_attack) = phishing_score(
+            "DHL <noreply@attackerdhl.com>",
+            "包裹",
+            "",
+            &[],
+            &[],
+            &[],
+            &bare_config(),
+        );
+        assert!(
+            reasons_attack.iter().any(|r| r.contains("品牌偽裝")),
+            "attackerdhl.com 應被判定為品牌偽裝，實際 reasons = {reasons_attack:?}"
+        );
+    }
+
+    // 回歸（F2）：ARC 內層 hop（i=2）的 DMARC fail 不應警告，避免 forwarding 殘留誤判。
+    #[test]
+    fn check_auth_failures_ignores_inner_hop_dmarc() {
+        let raw = concat!(
+            "From: friend@example.com\r\n",
+            "Subject: hi\r\n",
+            "ARC-Authentication-Results: i=2; dmarc=fail\r\n",
+            "ARC-Authentication-Results: i=1; dmarc=pass\r\n",
+            "Received-SPF: pass\r\n\r\n",
+            "body\r\n"
+        );
+        let mail = parse_mail(raw.as_bytes()).expect("應可解析郵件");
+        let warnings = check_auth_failures(&mail);
+        assert!(
+            warnings.is_empty(),
+            "i=1 pass + i=2 fail 不應觸發警告，實際為 {warnings:?}"
+        );
+    }
+
+    // 回歸（F2）：spf=softfail 不視為偽造（forwarding / mailing list 常見）。
+    #[test]
+    fn check_auth_failures_skips_spf_softfail() {
+        let raw = concat!(
+            "From: newsletter@example.com\r\n",
+            "Subject: news\r\n",
+            "Authentication-Results: i=1; spf=softfail smtp.mailfrom=example.com\r\n",
+            "Received-SPF: softfail\r\n\r\n",
+            "body\r\n"
+        );
+        let mail = parse_mail(raw.as_bytes()).expect("應可解析郵件");
+        let warnings = check_auth_failures(&mail);
+        assert!(
+            !warnings.iter().any(|w| w.contains("SPF")),
+            "spf=softfail 不應觸發 SPF 警告，實際為 {warnings:?}"
+        );
+    }
+
+    // 回歸（F2）：i=1（最外層受信邊界）的 dmarc=fail 仍應觸發警告。
+    #[test]
+    fn check_auth_failures_trusts_boundary_i_one_dmarc_fail() {
+        let raw = concat!(
+            "From: spoof@evil.com\r\n",
+            "Subject: urgent\r\n",
+            "Authentication-Results: i=1; dmarc=fail action=quarantine\r\n\r\n",
+            "body\r\n"
+        );
+        let mail = parse_mail(raw.as_bytes()).expect("應可解析郵件");
+        let warnings = check_auth_failures(&mail);
+        assert!(warnings.iter().any(|w| w.contains("DMARC")));
+    }
+
+    // 回歸（F3）：RFC 2047 編碼的中文附件檔名應在擷取時已被解碼，
+    // 後續 Office / Word 副檔名比對才能命中。
+    #[test]
+    fn extracts_attachment_filename_decoded_from_rfc2047() {
+        let raw = concat!(
+            "From: x@example.com\r\n",
+            "Subject: doc\r\n",
+            "Content-Type: multipart/mixed; boundary=BOUND\r\n",
+            "\r\n",
+            "--BOUND\r\n",
+            "Content-Type: application/octet-stream;\r\n",
+            " name=\"=?UTF-8?B?5paH5rWL6K6u56uZ5paH5qGjLn?=\"\r\n",
+            "Content-Disposition: attachment;\r\n",
+            " filename=\"=?UTF-8?B?5paH5rWL6K6u56uZ5paH5qGjLmRvY3g=?=\"\r\n",
+            "\r\n",
+            "fake docx body\r\n",
+            "--BOUND--\r\n"
+        );
+        let mail = parse_mail(raw.as_bytes()).expect("應可解析郵件");
+        let names = extract_attachment_filenames(&mail);
+        assert!(
+            names.iter().any(|n| n.ends_with(".docx")),
+            "RFC 2047 編碼的 .docx 附件檔名未正確解碼為中文，names = {names:?}"
+        );
     }
 
     // 回歸：multipart/alternative 的內文在 subparts 裡，get_body() 回傳空。
