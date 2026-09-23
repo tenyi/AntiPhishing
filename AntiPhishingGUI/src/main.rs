@@ -6,6 +6,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::mpsc::{Receiver, TryRecvError},
     sync::{Arc, LazyLock, mpsc},
     thread,
@@ -1382,15 +1383,53 @@ impl eframe::App for App {
                     ui.end_row();
                 });
                 ui.separator();
-                ui.heading("LLM 判定（地端或雲端模型）");
+                ui.heading("LLM 智慧判定");
                 egui::Grid::new("llm_grid").num_columns(2).show(ui, |ui| {
-                    field(ui, "伺服器網址", &mut self.config.llm.base_url);
+                    ui.label("後端模式");
+                    let mut current_backend = self.config.llm.backend.clone().unwrap_or_else(|| {
+                        if !self.config.llm.base_url.trim().is_empty() {
+                            "api".to_string()
+                        } else {
+                            "claude".to_string()
+                        }
+                    });
+                    egui::ComboBox::from_id_salt("llm_backend_select")
+                        .selected_text(match current_backend.as_str() {
+                            "claude" => "Claude Code CLI (claude)",
+                            "agy" => "Antigravity CLI (agy)",
+                            "codex" => "OpenAI Codex CLI (codex)",
+                            "command" => "自訂命令列 (command)",
+                            _ => "OpenAI 相容 HTTP API (api)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut current_backend, "claude".into(), "Claude Code CLI (claude)");
+                            ui.selectable_value(&mut current_backend, "agy".into(), "Antigravity CLI (agy)");
+                            ui.selectable_value(&mut current_backend, "codex".into(), "OpenAI Codex CLI (codex)");
+                            ui.selectable_value(&mut current_backend, "api".into(), "OpenAI 相容 HTTP API (api)");
+                            ui.selectable_value(&mut current_backend, "command".into(), "自訂命令列 (command)");
+                        });
+                    self.config.llm.backend = Some(current_backend.clone());
                     ui.end_row();
+
+                    let is_api = current_backend == "api";
+                    let is_cmd = current_backend == "command";
+
+                    if is_cmd {
+                        field(ui, "自訂命令", &mut self.config.llm.command);
+                        ui.end_row();
+                    }
+
+                    if is_api {
+                        field(ui, "伺服器網址", &mut self.config.llm.base_url);
+                        ui.end_row();
+                        ui.label("API 金鑰");
+                        ui.add(egui::TextEdit::singleline(&mut self.config.llm.api_key).password(true));
+                        ui.end_row();
+                    }
+
                     field(ui, "模型名稱", &mut self.config.llm.model);
                     ui.end_row();
-                    ui.label("API 金鑰");
-                    ui.add(egui::TextEdit::singleline(&mut self.config.llm.api_key).password(true));
-                    ui.end_row();
+
                     ui.label("逾時（秒）");
                     ui.add(egui::DragValue::new(&mut self.config.llm.timeout_secs).range(10..=600));
                     ui.end_row();
@@ -1398,7 +1437,26 @@ impl eframe::App for App {
                     ui.add(egui::DragValue::new(&mut self.config.llm.max_chars).range(500..=50000));
                     ui.end_row();
                 });
-                ui.small("留空伺服器網址或模型名稱即停用 LLM 判定；地端免認證模型（如 Ollama / LM Studio）API 金鑰可留空。");
+                match self.config.llm.effective_backend() {
+                    Some(LlmBackend::Claude) => {
+                        ui.small("✔ 使用本機 Claude Code CLI：直接使用已登入的 Claude 憑據，免填伺服器網址與金鑰；模型名稱留空則使用 CLI 預設模型。");
+                    }
+                    Some(LlmBackend::Agy) => {
+                        ui.small("✔ 使用本機 Antigravity CLI (agy)：直接使用本機 agy 憑據，免填伺服器網址與金鑰；模型名稱留空則使用 CLI 預設模型。");
+                    }
+                    Some(LlmBackend::Codex) => {
+                        ui.small("✔ 使用本機 OpenAI Codex CLI (codex)：沙箱唯讀執行；模型名稱留空則使用 CLI 預設模型。");
+                    }
+                    Some(LlmBackend::Command) => {
+                        ui.small("✔ 使用自訂命令列：將透過 stdin 送入 Prompt 並解析標準輸出回傳之判定。");
+                    }
+                    Some(LlmBackend::Api) => {
+                        ui.small("✔ 使用 OpenAI 相容 API：支援 Ollama / LM Studio 或雲端服務；地端免認證模型 API 金鑰可留空。");
+                    }
+                    None => {
+                        ui.small("⚠ LLM 判定未啟用（若欲使用請選擇 CLI 後端或填入 API 伺服器網址）。未啟用時不會搬移任何郵件。");
+                    }
+                }
                 ui.separator();
                 ui.heading("偵測規則");
                 ui.horizontal(|ui| {
@@ -1682,16 +1740,45 @@ fn create_tray() -> Result<Tray> {
     })
 }
 
-/// LLM 判定設定，存於 config.toml 的 `[llm]`（OpenAI 相容 API）；
-/// `base_url` 或 `model` 為空字串即視為未設定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LlmBackend {
+    Api,
+    Claude,
+    Codex,
+    Agy,
+    Command,
+}
+
+impl LlmBackend {
+    fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "api" | "http" | "openai" => Some(Self::Api),
+            "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
+            "codex" | "codex-cli" => Some(Self::Codex),
+            "agy" | "agy-cli" | "antigravity" => Some(Self::Agy),
+            "command" | "cmd" | "custom" => Some(Self::Command),
+            _ => None,
+        }
+    }
+}
+
+/// LLM 判定設定，存於 config.toml 的 `[llm]`；
+/// 支援 API 與命令列呼叫（claude、codex、agy、command）。
 #[derive(Clone, Serialize, Deserialize)]
 struct LlmConfig {
+    /// 後端類型：api、claude、codex、agy、command
+    #[serde(default)]
+    backend: Option<String>,
     #[serde(default)]
     base_url: String,
     #[serde(default)]
     model: String,
     #[serde(default)]
     api_key: String,
+    /// backend = "command" 時執行的自訂命令字串
+    #[serde(default)]
+    command: String,
     #[serde(default = "default_llm_timeout_secs")]
     timeout_secs: u64,
     #[serde(default = "default_llm_max_chars")]
@@ -1708,11 +1795,30 @@ fn default_llm_max_chars() -> usize {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            backend: None,
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
+            command: String::new(),
             timeout_secs: default_llm_timeout_secs(),
             max_chars: default_llm_max_chars(),
+        }
+    }
+}
+
+impl LlmConfig {
+    /// 解析出實際應使用的後端類型；若未指定 backend 則依 base_url 是否非空回退為 Api
+    fn effective_backend(&self) -> Option<LlmBackend> {
+        if let Some(ref b) = self.backend {
+            let trimmed = b.trim();
+            if !trimmed.is_empty() {
+                return LlmBackend::from_str_loose(trimmed);
+            }
+        }
+        if !self.base_url.trim().is_empty() {
+            Some(LlmBackend::Api)
+        } else {
+            None
         }
     }
 }
@@ -1725,10 +1831,23 @@ struct LlmVerdict {
     reason: String,
 }
 
-/// 由 Config 取得有效的 LLM 設定；未設定（URL 或 model 為空）回 None。
+/// 由 Config 取得有效的 LLM 設定；未設定（無法判定後端或缺少必要參數）回 None。
 fn llm_config(config: &Config) -> Option<LlmConfig> {
-    if config.llm.base_url.trim().is_empty() || config.llm.model.trim().is_empty() {
-        return None;
+    let backend = config.llm.effective_backend()?;
+    match backend {
+        LlmBackend::Api => {
+            if config.llm.base_url.trim().is_empty() || config.llm.model.trim().is_empty() {
+                return None;
+            }
+        }
+        LlmBackend::Command => {
+            if config.llm.command.trim().is_empty() {
+                return None;
+            }
+        }
+        LlmBackend::Claude | LlmBackend::Codex | LlmBackend::Agy => {
+            // CLI 模式已指定 backend 即為有效，model 為可選
+        }
     }
     Some(config.llm.clone())
 }
@@ -1916,8 +2035,157 @@ fn parse_llm_verdict(text: &str) -> Result<LlmVerdict> {
     serde_json::from_str(text).context("LLM 回應不是有效的判定 JSON")
 }
 
-/// 呼叫 OpenAI 相容的 /chat/completions 取得單一郵件判定。
-fn llm_judge(
+/// 組合命令列程式與引數清單
+fn build_cli_command(config: &LlmConfig) -> Result<(String, Vec<String>)> {
+    let backend = config
+        .effective_backend()
+        .context("未設定有效的 LLM 後端")?;
+    let model = config.model.trim();
+
+    match backend {
+        LlmBackend::Claude => {
+            let mut args = vec![
+                "-p".to_string(),
+                "--tools".to_string(),
+                "".to_string(),
+                "--output-format".to_string(),
+                "text".to_string(),
+            ];
+            if !model.is_empty() {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            Ok(("claude".to_string(), args))
+        }
+        LlmBackend::Codex => {
+            let mut args = vec![
+                "exec".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--ephemeral".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
+                "-s".to_string(),
+                "read-only".to_string(),
+            ];
+            if !model.is_empty() {
+                args.push("-m".to_string());
+                args.push(model.to_string());
+            }
+            args.push("-".to_string());
+            Ok(("codex".to_string(), args))
+        }
+        LlmBackend::Agy => {
+            let mut args = vec![
+                "--output-format".to_string(),
+                "text".to_string(),
+                "--disable-slash-commands".to_string(),
+            ];
+            if !model.is_empty() {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            Ok(("agy".to_string(), args))
+        }
+        LlmBackend::Command => {
+            let cmd_str = config.command.trim();
+            if cmd_str.is_empty() {
+                bail!("backend 設為 command，但未設定 command 命令字串");
+            }
+            #[cfg(windows)]
+            {
+                Ok((
+                    "cmd".to_string(),
+                    vec!["/C".to_string(), cmd_str.to_string()],
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                Ok((
+                    "sh".to_string(),
+                    vec!["-c".to_string(), cmd_str.to_string()],
+                ))
+            }
+        }
+        LlmBackend::Api => {
+            bail!("Api 後端不支援透過命令列執行");
+        }
+    }
+}
+
+/// 執行外部 CLI 命令，透過 stdin 送入 prompt，並讀取 stdout 回傳純文字。
+/// 具備逾時防護與防管線緩衝區死鎖設計。
+fn run_cli_with_stdin(
+    program: &str,
+    args: &[String],
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("無法啟動外部 CLI 命令：{program}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .with_context(|| format!("無法將 Prompt 寫入 {program} 的 stdin"))?;
+    }
+
+    let mut stdout_pipe = child.stdout.take().context("無法取得子行程 stdout")?;
+    let mut stderr_pipe = child.stderr.take().context("無法取得子行程 stderr")?;
+
+    let stdout_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let poll_interval = Duration::from_millis(50);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("檢查 {program} 行程狀態失敗"))?
+        {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "CLI 命令 ({program}) 執行逾時（超過 {} 秒），已終止該行程",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(poll_interval);
+    };
+
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    let stdout_text = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+    if !status.success() {
+        bail!(
+            "CLI 命令 ({program}) 執行失敗 (結束代碼 {:?})：\n{}",
+            status.code(),
+            stderr_text.trim()
+        );
+    }
+
+    Ok(stdout_text)
+}
+
+/// 透過 OpenAI 相容的 /chat/completions 取得單一郵件判定。
+fn llm_judge_api(
     config: &LlmConfig,
     from: &str,
     subject: &str,
@@ -1985,6 +2253,70 @@ fn llm_judge(
         .and_then(|choice| choice["message"]["content"].as_str())
         .context("LLM 回應缺少 choices[0].message.content")?;
     parse_llm_verdict(content)
+}
+
+/// 透過外部 CLI 取得單一郵件判定。
+fn llm_judge_cli(
+    config: &LlmConfig,
+    from: &str,
+    subject: &str,
+    body: &str,
+    attachments: &[String],
+    docx_targets: &[String],
+    auth_warnings: &[String],
+) -> Result<LlmVerdict> {
+    let (program, args) = build_cli_command(config)?;
+    let user_prompt = llm_user_prompt(
+        from,
+        subject,
+        body,
+        config.max_chars,
+        attachments,
+        docx_targets,
+        auth_warnings,
+    );
+    let full_prompt = format!("{LLM_SYSTEM_PROMPT}\n\n=== 待判定郵件 ===\n{user_prompt}");
+    let timeout = Duration::from_secs(config.timeout_secs);
+    let output_text = run_cli_with_stdin(&program, &args, &full_prompt, timeout)?;
+    parse_llm_verdict(&output_text)
+        .with_context(|| format!("CLI ({program}) 原始回應為：{output_text:?}"))
+}
+
+/// 呼叫指定之 LLM 後端（API 或 CLI）取得單一郵件判定。
+fn llm_judge(
+    config: &LlmConfig,
+    from: &str,
+    subject: &str,
+    body: &str,
+    attachments: &[String],
+    docx_targets: &[String],
+    auth_warnings: &[String],
+) -> Result<LlmVerdict> {
+    let backend = config
+        .effective_backend()
+        .context("未設定有效的 LLM 後端")?;
+    match backend {
+        LlmBackend::Api => llm_judge_api(
+            config,
+            from,
+            subject,
+            body,
+            attachments,
+            docx_targets,
+            auth_warnings,
+        ),
+        LlmBackend::Claude | LlmBackend::Codex | LlmBackend::Agy | LlmBackend::Command => {
+            llm_judge_cli(
+                config,
+                from,
+                subject,
+                body,
+                attachments,
+                docx_targets,
+                auth_warnings,
+            )
+        }
+    }
 }
 
 /// 執行獨立的隔離搬移任務（於獨立短暫的 IMAP session 中進行）
@@ -2314,7 +2646,7 @@ fn scan_mail(
     let scanned_dates = dates_summary(dates);
     if llm.is_none() {
         lines.push(format!(
-            "LLM 未設定（config.toml 的 [llm] base_url 或 model 為空）。{scanned_dates}：已掃描 {scanned} 封，未搬移。"
+            "LLM 未設定（未指定 backend = \"claude\" / \"agy\" 等 CLI 或 API 伺服器網址）。{scanned_dates}：已掃描 {scanned} 封，未搬移。"
         ));
     } else if config.gui.confirm_before_move {
         let found = pending_moves.len();
@@ -3963,5 +4295,92 @@ mod tests {
         assert!(is_message_unread(&[Flag::Flagged, Flag::Draft]));
         assert!(!is_message_unread(&[Flag::Seen]));
         assert!(!is_message_unread(&[Flag::Seen, Flag::Flagged]));
+    }
+
+    #[test]
+    fn llm_config_backward_compatibility_defaults_to_api() {
+        let config: Config = toml::from_str(
+            r#"
+            [imap]
+            host = "imap.example.com"
+            port = 993
+            protocol = "imaps"
+            username = "u"
+            password = "p"
+            source_mailbox = "INBOX"
+            phishing_mailbox = "Spam"
+            [detection]
+            threshold = 5
+            [gui]
+            [llm]
+            base_url = "http://localhost:11434/v1"
+            model = "llama3.1"
+            "#,
+        )
+        .unwrap();
+        let effective = llm_config(&config).expect("舊版設定應自動推斷為有效 LLM");
+        assert_eq!(effective.effective_backend(), Some(LlmBackend::Api));
+    }
+
+    #[test]
+    fn llm_config_cli_backends_parse_and_build_commands() {
+        let config_claude: LlmConfig = toml::from_str(
+            r#"
+            backend = "claude"
+            model = "claude-3-7-sonnet"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config_claude.effective_backend(), Some(LlmBackend::Claude));
+        let (prog, args) = build_cli_command(&config_claude).unwrap();
+        assert_eq!(prog, "claude");
+        assert!(args.contains(&"-p".to_string()));
+        assert!(args.contains(&"--tools".to_string()));
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"claude-3-7-sonnet".to_string()));
+
+        let config_codex: LlmConfig = toml::from_str(
+            r#"
+            backend = "codex"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config_codex.effective_backend(), Some(LlmBackend::Codex));
+        let (prog, args) = build_cli_command(&config_codex).unwrap();
+        assert_eq!(prog, "codex");
+        assert!(args.contains(&"exec".to_string()));
+        assert!(args.contains(&"-".to_string()));
+
+        let config_agy: LlmConfig = toml::from_str(
+            r#"
+            backend = "agy"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config_agy.effective_backend(), Some(LlmBackend::Agy));
+        let (prog, args) = build_cli_command(&config_agy).unwrap();
+        assert_eq!(prog, "agy");
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"--disable-slash-commands".to_string()));
+
+        let config_cmd: LlmConfig = toml::from_str(
+            r#"
+            backend = "command"
+            command = "ollama run llama3.1"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config_cmd.effective_backend(), Some(LlmBackend::Command));
+        let (prog, args) = build_cli_command(&config_cmd).unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(prog, "cmd");
+            assert_eq!(args, vec!["/C", "ollama run llama3.1"]);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(prog, "sh");
+            assert_eq!(args, vec!["-c", "ollama run llama3.1"]);
+        }
     }
 }

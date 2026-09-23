@@ -26,14 +26,24 @@ log_retention_days = 30
 # 可選：Noto Sans TC、微軟正黑體、Microsoft JhengHei，或本機 .ttf/.ttc/.otf 完整路徑。
 font_family = "Noto Sans TC"
 
-# 地端 LLM 判定（OpenAI 相容 API，例如 Ollama / LM Studio / llama.cpp）。
-# base_url 或 model 留空即停用 LLM 判定（不搬移任何郵件）。
+# LLM 智慧判定設定。
+# 支援 OpenAI 相容 HTTP API，以及命令列呼叫 Claude Code CLI / OpenAI Codex CLI / Antigravity CLI / 自訂命令。
+# backend 可選值：
+#   "api"     : 地端/雲端 OpenAI 相容 API（例如 Ollama / LM Studio / llama.cpp / vLLM）
+#   "claude"  : Claude Code CLI (claude)
+#   "codex"   : OpenAI Codex CLI (codex)
+#   "agy"     : Antigravity CLI (agy)
+#   "command" : 自訂命令列（透過 stdin 傳入 Prompt）
+# 若未指定 backend：當 base_url 非空時自動以 api 模式運作；若皆留空即停用 LLM 判定（不搬移任何郵件）。
 [llm]
+# backend = "api"
 base_url = "http://127.0.0.1:11434/v1"
 model = "llama3.1"
 # 可選：API 金鑰（若使用地端免認證模型如 Ollama 可留空；若使用需認證模型請填入）
 api_key = ""
-# 可選：單一請求逾時（秒），預設 120
+# 可選：當 backend = "command" 時執行的自訂命令字串（例如 "ollama run llama3.1"）
+# command = ""
+# 可選：單一請求或命令執行逾時（秒），預設 120
 timeout_secs = 120
 # 可選：送給 LLM 的郵件內文最大字元數，預設 6000
 max_chars = 6000

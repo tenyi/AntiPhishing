@@ -23,20 +23,81 @@ cargo run -- --date 2026-08-05 -y         # 跳過互動確認，直接搬移全
 - 搬移方式為先複製到 `phishing_mailbox`，再以 UID EXPUNGE 只清除本輪已搬移的信件；目標信箱不存在時會自動建立。
 - 搬移前會重新比對 UIDVALIDITY，避免信箱重建後誤搬。
 
-## LLM 判定（建議）
+## LLM 智慧判定（建議）
 
-在 `config.toml` 加入 `[llm]`（base_url 或 model 留空即停用）：
+支援地端/雲端 OpenAI 相容 API，以及直接以命令列呼叫 **Claude Code CLI**、**Antigravity CLI**、**OpenAI Codex CLI** 或**自訂命令**。
 
+### 後端模式對照與快速設定
+
+| 後端 (`backend`) | 依賴工具 | 必要欄位 | 可選欄位 | 特性與預設參數 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`claude`** | Claude Code (`claude`) | `backend = "claude"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `-p --tools "" --output-format text`，直接使用本機登入憑據，無須 API 金鑰，停用本地工具安全隔離。 |
+| **`agy`** | Antigravity CLI (`agy`) | `backend = "agy"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `--output-format text --disable-slash-commands`，直接使用本機登入憑據，停用斜線指令。 |
+| **`codex`** | OpenAI Codex CLI (`codex`) | `backend = "codex"` | `model`, `timeout_secs`, `max_chars` | 自動帶入 `exec --skip-git-repo-check --ephemeral --color never -s read-only -`，沙箱唯讀不儲存 session。 |
+| **`api`** | HTTP 伺服器 (Ollama 等) | `base_url`, `model` | `api_key`, `timeout_secs`, `max_chars` | 標準 OpenAI 相容 API（未指定 `backend` 時若 `base_url` 非空自動採用此模式）。 |
+| **`command`** | 任意自訂命令 | `backend = "command"`, `command` | `timeout_secs`, `max_chars` | 執行自訂命令（如 `ollama run llama3.1`），將 Prompt 經 stdin 管道輸入。 |
+
+> **提示**：使用 CLI 工具模式（`claude` / `agy` / `codex`）前，請先確保該工具已安裝於系統環境變數 PATH 中並完成初次登入（例如可於終端機執行 `claude --version` 或 `agy --version`）。
+
+---
+
+### 常見設定範例
+
+#### 範例 1：使用 Anthropic Claude Code CLI（超省事，免開 API Server、免填 Key）
 ```toml
 [llm]
-base_url = "http://127.0.0.1:11434/v1"   # Ollama / LM Studio / llama.cpp 或雲端 API
-model = "llama3.1"
-api_key = ""                             # 可選：API 金鑰（地端免認證模型可留空）
-timeout_secs = 120                       # 可選：單一請求逾時（秒）
-max_chars = 6000                         # 可選：送給 LLM 的內文最大字元數
+backend = "claude"
+# model 留空即使用 Claude Code 當前預設模型；亦可指定例如 "claude-3-7-sonnet" 或 "claude-3-5-haiku"
+model = ""
+timeout_secs = 120
+max_chars = 6000
 ```
 
-啟用後每封信的 text/plain 與 HTML 內文（轉純文字、去除 style/base64 噪音）連同寄件者、主旨送地端 LLM 判定；LLM 判定為「釣魚、詐欺、惡意行銷廣告或垃圾推銷」者列為待搬移，預設於掃描結束後列出清單互動確認：
+#### 範例 2：使用 Google DeepMind Antigravity CLI (`agy`)
+```toml
+[llm]
+backend = "agy"
+# model 留空即使用 agy 當前預設模型；亦可指定例如 "gemini-2.5-pro" 或 "gemini-2.5-flash"
+model = ""
+timeout_secs = 120
+max_chars = 6000
+```
+
+#### 範例 3：使用 OpenAI Codex CLI (`codex`)
+```toml
+[llm]
+backend = "codex"
+# model 留空即使用 codex 預設模型；亦可指定例如 "o3-mini"
+model = ""
+timeout_secs = 120
+max_chars = 6000
+```
+
+#### 範例 4：使用地端 Ollama / LM Studio (OpenAI 相容 HTTP API)
+```toml
+[llm]
+backend = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3.1"
+api_key = ""                             # 地端免認證模型可留空
+timeout_secs = 120
+max_chars = 6000
+```
+
+#### 範例 5：使用自訂命令列 (`command`)
+```toml
+[llm]
+backend = "command"
+command = "ollama run llama3.1"
+timeout_secs = 120
+max_chars = 6000
+```
+
+---
+
+### 判定流程與搬移確認
+
+啟用後每封信的 text/plain 與 HTML 內文（轉純文字、去除 style/base64 噪音）連同寄件者、主旨送 LLM 判定；LLM 判定為「釣魚、詐欺、惡意行銷廣告或垃圾推銷」者列為待搬移，預設於掃描結束後列出清單互動確認：
 
 ```text
 以下 2 封郵件判定為釣魚／惡意廣告：
@@ -48,7 +109,7 @@ max_chars = 6000                         # 可選：送給 LLM 的內文最大�
 ```
 
 - `[a]` 全部搬移、`[s]` 全部跳過（直接按 Enter 亦為跳過）、`[c]` 逐封決定。
-- LLM 請求失敗（服務不可用、設定錯誤）時退回規則評分判讀：本封若啟發式分數達 `threshold` 仍會被列入待搬移清單，掃描繼續執行而不中斷；同一日期內若 LLM 連續失敗 ≥3 次，本輪後續信件直接採規則評分。
+- LLM 請求失敗（工具異常、服務不可用）時退回規則評分判讀：本封若啟發式分數達 `threshold` 仍會被列入待搬移清單，掃描繼續執行而不中斷；同一日期內若 LLM 連續失敗 ≥3 次，本輪後續信件直接採規則評分。
 - 未設定 LLM 時沿用傳統門檻模式：啟發式評分 ≥ `threshold` 即自動搬移（維持舊有行為，不互動確認）。
 
 ## 傳統評分規則（log 參考；未設定 LLM 時為搬移依據）

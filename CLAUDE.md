@@ -7,7 +7,7 @@
 - `AntiPhishing/`：CLI 版（`anti-phishing`），以地端 LLM 判定釣魚／惡意廣告郵件並搬移；未設定 LLM 時回退傳統評分門檻。
 - `AntiPhishingGUI/`：GUI 版（`anti-phishing-gui`），同判定核心的 Windows 桌面工具（eframe + 系統匣）；細節見 `AntiPhishingGUI/CLAUDE.md`。
 
-兩版共用概念：IMAP 掃描（`scan_mail`）、LLM 判定（`llm_judge`，OpenAI 相容 API）、DOCX 外部圖片偵測、搬移確認。修改共用邏輯時，**兩版都要同步修改並各自驗證**。
+兩版共用概念：IMAP 掃描（`scan_mail`）、LLM 判定（`llm_judge`，OpenAI 相容 API 或 Claude/Codex/Agy CLI）、DOCX 外部圖片偵測、搬移確認。修改共用邏輯時，**兩版都要同步修改並各自驗證**。
 
 ## 版號規範（必守）
 

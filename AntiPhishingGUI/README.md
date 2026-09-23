@@ -46,12 +46,19 @@ hide_taskbar_when_minimized = true
 start_minimized_to_tray = false
 log_retention_days = 30       # 每日日誌保留天數；0 表示永不清理
 font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整路徑
+
+# LLM 智慧判定設定（支援 Claude Code / Agy / Codex CLI 與 OpenAI API）
+[llm]
+backend = "claude"            # 可選 "claude"、"agy"、"codex"、"api"、"command"
+model = ""                    # 可選。CLI 模式留空使用該工具預設模型，亦可指定特定模型
+timeout_secs = 120            # 逾時時間（秒）
+max_chars = 6000              # 郵件內文最大字元數
 ```
 
 設定說明：
 
 - `protocol = "imaps"` 通常使用 993 埠；STARTTLS 請改用 `protocol = "starttls"` 並填入伺服器要求的埠號。
-- `threshold` 是判定門檻。分數達到門檻的郵件會搬到 `phishing_mailbox`。
+- `threshold` 是判定門檻。傳統評分模式下達到門檻的郵件會搬到 `phishing_mailbox`；LLM 模式下評分僅供 log 參考。
 - `external_word_image_score` 用於 DOCX 外部圖片追蹤偵測；預設 5 分。
 - `check_interval_minutes` 是排程掃描間隔，範圍為 1–1440 分鐘。
 - `log_retention_days` 是每日日誌檔的保留天數，超過即於啟動時刪除；預設 30，設為 0 表示永不清理。
@@ -60,7 +67,80 @@ font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整
 - `hide_taskbar_when_minimized` 開啟後，縮小至系統匣時隱藏工作列項目。
 - `start_minimized_to_tray` 開啟後，下次啟動時不顯示主視窗，直接留在 Windows 系統匣。
 - `font_family` 可填 `Noto Sans TC`、`微軟正黑體`、`Microsoft JhengHei`，或 `.ttf/.ttc/.otf` 字型檔完整路徑；變更後需重新啟動程式。
-- `[llm]` 為 LLM 釣魚判定（OpenAI 相容 API，支援地端 Ollama / LM Studio 或雲端 API）；`base_url` 須以 `/v1` 結尾；若使用需認證的模型可填入 `api_key`（地端免認證模型可留空）。`base_url` 或 `model` 留空即停用 LLM 判定，掃描不會搬移任何郵件；LLM 失敗時該封跳過並記於執行紀錄。
+
+---
+
+## LLM 智慧判定設定（支援 Claude Code / Agy / Codex 等 CLI 工具）
+
+本程式支援透過 **Claude Code CLI**、**Antigravity CLI**、**OpenAI Codex CLI** 或 **OpenAI 相容 HTTP API** 智慧判定釣魚與垃圾推銷郵件。
+
+### 後端模式對照與特性
+
+| 後端 (`backend`) | 依賴工具 | 必要欄位 | 可選欄位 | 特性說明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`claude`** | Claude Code (`claude`) | `backend = "claude"` | `model`, `timeout_secs`, `max_chars` | 自動以 `-p --tools "" --output-format text` 執行，**直接使用本機已登入的 Claude 憑據**，免開本機 API Server、免設定 API Key。 |
+| **`agy`** | Antigravity CLI (`agy`) | `backend = "agy"` | `model`, `timeout_secs`, `max_chars` | 自動以 `--output-format text --disable-slash-commands` 執行，**直接使用本機已登入的 agy 憑據**，停用斜線指令。 |
+| **`codex`** | OpenAI Codex CLI (`codex`) | `backend = "codex"` | `model`, `timeout_secs`, `max_chars` | 自動以 `exec --skip-git-repo-check --ephemeral --color never -s read-only -` 執行，沙箱唯讀不儲存 session。 |
+| **`api`** | HTTP 伺服器 (Ollama 等) | `base_url`, `model` | `api_key`, `timeout_secs`, `max_chars` | 標準 OpenAI 相容 API（未指定 `backend` 時若 `base_url` 非空自動採用此模式）。 |
+| **`command`** | 任意自訂命令 | `backend = "command"`, `command` | `timeout_secs`, `max_chars` | 執行自訂指令字串（如 `ollama run llama3.1`），將 Prompt 透過 stdin 傳入。 |
+
+> **事前準備**：使用 CLI 模式前，請先於 Windows 終端機確認該工具已安裝且可執行（例如可正常執行 `claude --version` 或 `agy --version` 並已完成登入授權）。
+
+### 各模式 `config.toml` 設定範例
+
+#### 1. 使用 Claude Code CLI (`backend = "claude"`)
+最推薦的方式之一，無需在本機常駐 Ollama，只要本機有安裝 Claude Code 即可：
+```toml
+[llm]
+backend = "claude"
+# model 留空使用 Claude Code 當前預設模型；亦可指定如 "claude-3-7-sonnet"、"claude-3-5-haiku"
+model = ""
+timeout_secs = 120
+max_chars = 6000
+```
+
+#### 2. 使用 Google DeepMind Antigravity CLI (`backend = "agy"`)
+適合使用 Google Antigravity 生態系的使用者：
+```toml
+[llm]
+backend = "agy"
+# model 留空使用 agy 預設模型；亦可指定特定模型
+model = ""
+timeout_secs = 120
+max_chars = 6000
+```
+
+#### 3. 使用 OpenAI Codex CLI (`backend = "codex"`)
+```toml
+[llm]
+backend = "codex"
+# model 留空使用 codex 預設模型；亦可指定如 "o3-mini"
+model = ""
+timeout_secs = 120
+max_chars = 6000
+```
+
+#### 4. 使用地端 Ollama / LM Studio (`backend = "api"`)
+```toml
+[llm]
+backend = "api"
+base_url = "http://127.0.0.1:11434/v1"
+model = "llama3.1"
+api_key = ""                             # 地端免認證模型可留空
+timeout_secs = 120
+max_chars = 6000
+```
+
+#### 5. 使用自訂命令列 (`backend = "command"`)
+```toml
+[llm]
+backend = "command"
+command = "ollama run llama3.1"
+timeout_secs = 120
+max_chars = 6000
+```
+
+> **注意**：若皆未設定 `[llm]`，或 `backend` 與 `base_url` 皆留空，則自動停用 LLM 判定（GUI 模式下不會搬移任何郵件，傳統評分僅供執行紀錄參考）。
 
 程式不會開啟 Word 或連線下載附件內容；DOCX 僅檢查 ZIP 內的 Word relationship XML，找出外部 HTTP(S) 圖片連結。
 
