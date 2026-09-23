@@ -108,7 +108,7 @@ flowchart TD
 
 ## 4. 第三道防線：啟發式規則評分機制（Heuristic Rules）
 
-每個檢測項目依其風險程度賦予權重分數（基準門檻 `threshold = 5`）：
+每個檢測項目依其風險程度賦予權重分數（基準門檻 `threshold = 8`）：
 
 | 檢測維度 | 規則說明 | 評分調整 | 備註 |
 | :--- | :--- | :---: | :--- |
@@ -118,7 +118,7 @@ flowchart TD
 | **混淆連結** | URL 中含有 `@` 符號（常用於遮蔽真實主機名稱） | **+3** | 高度可疑特徵 |
 | **Quishing 攻擊** | HTML 內嵌 QR Code 圖片且含手機掃描相關文字 | **+4** | 跨裝置二維碼釣魚 |
 | **品牌偽裝冒名** | 寄件者顯示名稱宣稱知名企業（DHL、FedEx、UPS、Momo、PChome、Shopee 等），但發信網域非官方白名單 | **+3** | 冒名促銷/詐欺 |
-| **Word 外部圖片追蹤** | 離線解析 `.docx` 附件 relationship XML，發現外部 HTTP(S) 圖片 Web Bug | **+5** | 預設單獨達標觸發門檻 |
+| **Word 外部圖片追蹤** | 離線解析 `.docx` 附件 relationship XML，發現外部 HTTP(S) 圖片 Web Bug | **+6** | 預設加 6 分（可自訂） |
 | **信任寄件來源** | 命中 `trusted_sender_domains`（若未被直接安全豁免） | **-3** | 最低降至 0 分 |
 
 ---
@@ -145,13 +145,13 @@ flowchart TD
    - 透過 TypeSafe Jev 的 `noul` primitive，詢問 `is_phishing` 機率 \( p \in [0.0, 1.0] \)。
 2. **換算分數公式**：
    - 當 \( p < 0.6 \)（未滿 60%）：不計分，\(\text{Jev 分數} = 0\)。
-   - 當 \( p \ge 0.6 \)：將 \( 0.6 \sim 1.0 \) 線性映射至 \( 0 \sim \text{jev\_max\_score} \)（預設 `jev_max_score = 5`）：
+   - 當 \( p \ge 0.6 \)：將 \( 0.6 \sim 1.0 \) 線性映射至 \( 0 \sim \text{jev\_max\_score} \)（預設 `jev_max_score = 10`）：
    $$\text{ratio} = \min\left(1.0, \frac{p - 0.6}{0.4}\right)$$
    $$\text{Jev 分數} = \text{round}(\text{ratio} \times \text{jev\_max\_score})$$
 3. **加總判定**：
    $$\text{最終分數} = \text{基礎啟發式規則分數} + \text{Jev 分數}$$
    - 當 $\text{最終分數} \ge \text{threshold}$ 時，才判定為釣魚/垃圾信並進行隔離。
-   - 範例：若信件內含可疑關鍵字（2分），Jev 評估釣魚機率 80%（ratio = 0.5，換算得 3分），最終得分 $2 + 3 = 5 \ge 5$（達標隔離）；若釣魚機率僅 55%（未達 60% 不計分），最終得分 $2 + 0 = 2 < 5$（略過）。
+   - 範例：若信件內含可疑關鍵字（2分），Jev 評估釣魚機率 84%（ratio = 0.6，換算得 6分），最終得分 $2 + 6 = 8 \ge 8$（達標隔離）；若釣魚機率僅 55%（未達 60% 不計分），最終得分 $2 + 0 = 2 < 8$（略過）。
 
 ### 5.3 資安通報與隔離明細排除標準
 在 System Prompt 與 Jev criteria 中明確注入了排除條件（Signal 5）：

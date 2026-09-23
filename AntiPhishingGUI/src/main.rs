@@ -64,6 +64,7 @@ struct ImapConfig {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct DetectionConfig {
+    #[serde(default = "default_threshold")]
     threshold: u32,
     #[serde(default)]
     suspicious_sender_domains: Vec<String>,
@@ -95,6 +96,9 @@ struct GuiConfig {
     log_retention_days: u32,
 }
 
+fn default_threshold() -> u32 {
+    8
+}
 fn default_interval_minutes() -> u64 {
     10
 }
@@ -105,7 +109,7 @@ fn default_log_retention_days() -> u32 {
     LOG_RETENTION_DAYS as u32
 }
 fn default_external_word_image_score() -> u32 {
-    5
+    6
 }
 fn default_font_family() -> String {
     "Noto Sans TC".into()
@@ -133,11 +137,11 @@ impl Default for Config {
                 phishing_mailbox: "Phishing".into(),
             },
             detection: DetectionConfig {
-                threshold: 5,
+                threshold: 8,
                 suspicious_sender_domains: Vec::new(),
                 trusted_sender_domains: Vec::new(),
                 suspicious_keywords: default_keywords(),
-                external_word_image_score: 5,
+                external_word_image_score: 6,
             },
             gui: GuiConfig {
                 check_interval_minutes: 10,
@@ -441,9 +445,27 @@ struct ScanOutcome {
     pending_moves: Vec<PendingMoveItem>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ActiveView {
+    Dashboard,
+    Settings(SettingsTab),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsTab {
+    Imap,
+    Llm,
+    Detection,
+    Schedule,
+}
+
 struct App {
     config: Config,
     status: String,
+    /// 目前顯示的視圖（主畫面或設定各大項）
+    active_view: ActiveView,
+    /// 儲存設定成功後的提示時間戳（用於暫時顯示已儲存提示）
+    settings_saved_toast: Option<Instant>,
     /// 掃描進行中的即時進度（目前檢查哪封信）；空字串表示無掃描進行
     scan_progress: String,
     /// 執行紀錄（僅保留當日條目；完整歷史見每日日誌檔）
@@ -490,8 +512,14 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, config: Config, status: String) -> Self {
         let font_status = apply_configured_font(&cc.egui_ctx, &config.gui.font_family);
         let tray = create_tray().ok();
-        let hide_window_on_startup = config.gui.start_minimized_to_tray && tray.is_some();
-        if config.gui.start_minimized_to_tray && !hide_window_on_startup {
+        let (active_view, hide_window_on_startup, startup_scan_pending) =
+            determine_initial_view(&config, tray.is_some());
+        let config_invalid = matches!(active_view, ActiveView::Settings(_));
+        if config_invalid {
+            // 無設定或設定無效時：主動進入設定畫面，並強制顯示視窗避免靜默縮小到系統匣
+            cc.egui_ctx
+                .send_viewport_cmd(ViewportCommand::Visible(true));
+        } else if config.gui.start_minimized_to_tray && !hide_window_on_startup {
             cc.egui_ctx
                 .send_viewport_cmd(ViewportCommand::Visible(true));
         }
@@ -521,6 +549,9 @@ impl App {
         if removed > 0 {
             status.push_str(&format!(" 已清理 {removed} 個過期日誌檔。"));
         }
+        if config_invalid {
+            status.push_str(" ⚠ 設定不完整，請先完成 IMAP 信箱等設定後儲存。");
+        }
         let logs = backfill
             .into_iter()
             .map(|line| LogEntry { date: today, line })
@@ -537,6 +568,8 @@ impl App {
             next_check: Instant::now() + interval(&config),
             config,
             status,
+            active_view,
+            settings_saved_toast: None,
             scan_progress: String::new(),
             logs,
             log_error_reported: false,
@@ -548,7 +581,7 @@ impl App {
             move_status: String::new(),
             tray,
             allow_exit: false,
-            startup_scan_pending: true,
+            startup_scan_pending,
             hide_window_on_startup,
             mailboxes: Vec::new(),
             mailbox_receiver: None,
@@ -598,7 +631,10 @@ impl App {
             Ok(())
         })();
         match result {
-            Ok(()) => self.status = "設定已儲存。".into(),
+            Ok(()) => {
+                self.status = "設定已儲存。".into();
+                self.settings_saved_toast = Some(Instant::now());
+            }
             Err(error) => self.status = format!("儲存失敗：{error}"),
         }
     }
@@ -1241,296 +1277,118 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         }
     }
-}
 
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.poll(ctx);
-        if !self.allow_exit
-            && ctx.input(|input| input.viewport().close_requested())
-            && self.config.gui.minimize_to_tray
-            && self.tray.is_some()
-        {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            if self.config.gui.hide_taskbar_when_minimized {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            } else {
-                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-            }
-        }
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        // 上方最多 2/3：設定區（可捲動，恆顯示垂直捲軸）
-        let settings_max = ui.available_height() * 2.0 / 3.0;
-        egui::ScrollArea::vertical()
-            .id_salt("settings_scroll_area")
-            .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .max_height(settings_max)
-            .show(ui, |ui| {
-                ui.heading("AntiPhishing 郵件防護");
-                if self.receiver.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new(&self.status)
-                                .color(egui::Color32::from_rgb(255, 140, 0))
-                                .strong(),
-                        );
-                    });
-                } else {
-                    ui.label(&self.status);
+    fn ui_dashboard(&mut self, ui: &mut egui::Ui) {
+        // 頂部列：標題與系統設定按鈕
+        ui.horizontal(|ui| {
+            ui.heading("AntiPhishing 郵件防護");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn = egui::Button::new(egui::RichText::new("⚙ 系統設定").strong());
+                if ui.add(btn).clicked() {
+                    self.active_view = ActiveView::Settings(SettingsTab::Imap);
                 }
-                // 上次完成掃描的時間（含無新郵件的空掃）；空掃不寫執行紀錄，只更新此處
-                if let Some(last_check) = self.last_check {
-                    ui.small(format!(
-                        "最後檢查時間：{}",
-                        last_check.format("%Y-%m-%d %H:%M:%S")
-                    ));
-                }
-                // 跨重啟由進度檔回復的最後判定郵件資訊
-                if let Some((uid, subject, mail_date)) = &self.last_mail {
-                    ui.small(format!("上次檢查至 UID {uid}〈{subject}〉（{mail_date}）"));
-                }
-                if !self.pending_queue.is_empty() {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "⚠️ 目前有 {} 封疑似釣魚／惡意廣告郵件待確認隔離",
-                                self.pending_queue.len()
-                            ))
-                            .color(egui::Color32::from_rgb(240, 80, 80))
-                            .strong(),
-                        );
-                        if ui.button("檢視並隔離").clicked() {
-                            self.show_confirm_dialog = true;
-                        }
-                    });
-                }
-                if self.move_receiver.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new(&self.move_status)
-                                .color(egui::Color32::from_rgb(230, 80, 80))
-                                .strong(),
-                        );
-                    });
-                }
-                // 掃描進行中顯示即時進度（目前檢查哪封信）；完成後自動消失
-                if !self.scan_progress.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new(&self.scan_progress)
-                                .color(egui::Color32::from_rgb(0, 160, 230))
-                                .small()
-                                .strong(),
-                        );
-                    });
-                }
-                ui.separator();
-                ui.heading("IMAP 信箱");
-                egui::Grid::new("imap").num_columns(2).show(ui, |ui| {
-                    field(ui, "伺服器", &mut self.config.imap.host);
-                    ui.label("連接埠");
-                    ui.add(egui::DragValue::new(&mut self.config.imap.port).range(1..=65535));
-                    ui.end_row();
-                    ui.label("協定");
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.config.imap.protocol, "imaps".into(), "IMAPS");
-                        ui.radio_value(&mut self.config.imap.protocol, "starttls".into(), "STARTTLS");
-                    });
-                    ui.end_row();
-                    field(ui, "帳號", &mut self.config.imap.username);
-                    ui.end_row();
-                    ui.label("密碼 / App Password");
-                    ui.add(egui::TextEdit::singleline(&mut self.config.imap.password).password(true));
-                    ui.end_row();
-                    ui.label("信箱清單");
-                    ui.horizontal(|ui| {
-                        let is_fetching = self.mailbox_receiver.is_some();
-                        let btn_text = if is_fetching {
-                            "取得中…"
-                        } else {
-                            "從伺服器取得信箱清單"
-                        };
-                        if ui.add_enabled(!is_fetching, egui::Button::new(btn_text)).clicked() {
-                            self.fetch_mailboxes();
-                        }
-                        if !self.mailboxes.is_empty() {
-                            ui.label(format!("（已載入 {} 個信箱）", self.mailboxes.len()));
-                        }
-                    });
-                    ui.end_row();
-                    mailbox_field(
-                        ui,
-                        "來源信箱",
-                        "source_mailbox_combo",
-                        &mut self.config.imap.source_mailbox,
-                        &self.mailboxes,
-                    );
-                    ui.end_row();
-                    mailbox_field(
-                        ui,
-                        "釣魚信箱",
-                        "phishing_mailbox_combo",
-                        &mut self.config.imap.phishing_mailbox,
-                        &self.mailboxes,
-                    );
-                    ui.end_row();
-                });
-                ui.separator();
-                ui.heading("LLM 智慧判定");
-                egui::Grid::new("llm_grid").num_columns(2).show(ui, |ui| {
-                    ui.label("後端模式");
-                    let mut current_backend = self.config.llm.backend.clone().unwrap_or_else(|| {
-                        if !self.config.llm.base_url.trim().is_empty() {
-                            "api".to_string()
-                        } else {
-                            "claude".to_string()
-                        }
-                    });
-                    egui::ComboBox::from_id_salt("llm_backend_select")
-                        .selected_text(match current_backend.as_str() {
-                            "claude" => "Claude Code CLI (claude)",
-                            "agy" => "Antigravity CLI (agy)",
-                            "codex" => "OpenAI Codex CLI (codex)",
-                            "command" => "自訂命令列 (command)",
-                            "jev" => "TypeSafe Jev API (jev)",
-                            _ => "OpenAI 相容 HTTP API (api)",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut current_backend, "claude".into(), "Claude Code CLI (claude)");
-                            ui.selectable_value(&mut current_backend, "agy".into(), "Antigravity CLI (agy)");
-                            ui.selectable_value(&mut current_backend, "codex".into(), "OpenAI Codex CLI (codex)");
-                            ui.selectable_value(&mut current_backend, "api".into(), "OpenAI 相容 HTTP API (api)");
-                            ui.selectable_value(&mut current_backend, "jev".into(), "TypeSafe Jev API (jev)");
-                            ui.selectable_value(&mut current_backend, "command".into(), "自訂命令列 (command)");
-                        });
-                    self.config.llm.backend = Some(current_backend.clone());
-                    ui.end_row();
-
-                    let is_api = current_backend == "api";
-                    let is_cmd = current_backend == "command";
-                    let is_jev = current_backend == "jev";
-
-                    if is_cmd {
-                        field(ui, "自訂命令", &mut self.config.llm.command);
-                        ui.end_row();
-                    }
-
-                    if is_api || is_jev {
-                        field(ui, "伺服器網址", &mut self.config.llm.base_url);
-                        ui.end_row();
-                        ui.label("API 金鑰");
-                        ui.add(egui::TextEdit::singleline(&mut self.config.llm.api_key).password(true));
-                        ui.end_row();
-                    }
-
-                    if is_jev {
-                        ui.label("Jev 評分上限");
-                        ui.add(egui::DragValue::new(&mut self.config.llm.jev_max_score).range(1..=50));
-                        ui.end_row();
-                    }
-
-                    field(ui, "模型名稱", &mut self.config.llm.model);
-                    ui.end_row();
-
-                    ui.label("逾時（秒）");
-                    ui.add(egui::DragValue::new(&mut self.config.llm.timeout_secs).range(10..=600));
-                    ui.end_row();
-                    ui.label("內文最大字數");
-                    ui.add(egui::DragValue::new(&mut self.config.llm.max_chars).range(500..=50000));
-                    ui.end_row();
-                });
-                match self.config.llm.effective_backend() {
-                    Some(LlmBackend::Claude) => {
-                        ui.small("✔ 使用本機 Claude Code CLI：直接使用已登入的 Claude 憑據，免填伺服器網址與金鑰；模型名稱留空則使用 CLI 預設模型。");
-                    }
-                    Some(LlmBackend::Agy) => {
-                        ui.small("✔ 使用本機 Antigravity CLI (agy)：直接使用本機 agy 憑據，免填伺服器網址與金鑰；模型名稱留空則使用 CLI 預設模型。");
-                    }
-                    Some(LlmBackend::Codex) => {
-                        ui.small("✔ 使用本機 OpenAI Codex CLI (codex)：沙箱唯讀執行；模型名稱留空則使用 CLI 預設模型。");
-                    }
-                    Some(LlmBackend::Command) => {
-                        ui.small("✔ 使用自訂命令列：將透過 stdin 送入 Prompt 並解析標準輸出回傳之判定。");
-                    }
-                    Some(LlmBackend::Api) => {
-                        ui.small("✔ 使用 OpenAI 相容 API：支援 Ollama / LM Studio 或雲端服務；地端免認證模型 API 金鑰可留空。");
-                    }
-                    Some(LlmBackend::Jev) => {
-                        ui.small("✔ 使用 TypeSafe Jev API (System One)：採混合評分制，Jev 評定釣魚機率換算為 0~分數上限並與安全規則加總判定；API 金鑰為必填。");
-                    }
-                    None => {
-                        ui.small("⚠ LLM 判定未啟用（若欲使用請選擇 CLI 後端或填入 API 伺服器網址）。未啟用時不會搬移任何郵件。");
-                    }
-                }
-                ui.separator();
-                ui.heading("偵測規則");
-                ui.horizontal(|ui| {
-                    ui.label("判定門檻");
-                    ui.add(egui::DragValue::new(&mut self.config.detection.threshold).range(1..=100));
-                    ui.label("Word 外部圖片分數");
-                    ui.add(egui::DragValue::new(&mut self.config.detection.external_word_image_score).range(0..=100));
-                });
-                multiline(ui, "可疑寄件網域（每行一個）", &mut self.config.detection.suspicious_sender_domains);
-                multiline(ui, "信任寄件網域（每行一個）", &mut self.config.detection.trusted_sender_domains);
-                multiline(ui, "可疑關鍵字（每行一個）", &mut self.config.detection.suspicious_keywords);
-                ui.separator();
-                ui.heading("排程與系統匣");
-                ui.horizontal(|ui| {
-                    ui.label("每隔（分鐘）");
-                    ui.add(egui::DragValue::new(&mut self.config.gui.check_interval_minutes).range(1..=1440));
-                    ui.label(format!(
-                        "下次檢查：{} 秒後",
-                        self.next_check.saturating_duration_since(Instant::now()).as_secs()
-                    ));
-                });
-                ui.checkbox(&mut self.config.gui.minimize_to_tray, "關閉視窗時縮小至 Windows 系統匣");
-                ui.checkbox(&mut self.config.gui.hide_taskbar_when_minimized, "縮小至系統匣時隱藏工作列項目");
-                ui.checkbox(&mut self.config.gui.start_minimized_to_tray, "啟動時直接縮小至 Windows 系統匣（下次啟動生效）");
-                ui.checkbox(&mut self.config.gui.confirm_before_move, "搬移前先確認（可個別選取要隔離的郵件）");
-                ui.horizontal(|ui| {
-                    ui.label("中文字型（重啟後套用）");
-                    ui.text_edit_singleline(&mut self.config.gui.font_family);
-                });
-                ui.small("系統匣選單提供顯示視窗、立即掃描與結束程式。密碼會以明文儲存在 config.toml，請使用 App Password 並保護該檔案。");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("儲存設定").clicked() {
-                        self.save();
-                    }
-                    // 掃描進行中停用按鈕，避免按下被靜默忽略
-                    let scan_busy = self.receiver.is_some();
-                    let scan_button = egui::Button::new("立即掃描指定日期");
-                    if ui
-                        .add_enabled(!scan_busy, scan_button)
-                        .clicked()
-                    {
-                        self.start_scan(false);
-                    }
-                    if scan_busy {
-                        ui.spinner();
-                        let progress_display = if self.scan_progress.is_empty() {
-                            "掃描進行中…"
-                        } else {
-                            &self.scan_progress
-                        };
-                        ui.label(
-                            egui::RichText::new(progress_display)
-                                .color(egui::Color32::from_rgb(255, 140, 0))
-                                .strong(),
-                        );
-                    }
-                    ui.label("日期");
-                    ui.text_edit_singleline(&mut self.date_text);
-                });
             });
-        // 下方 1/3：執行紀錄（恆顯示，最新優先）
+        });
+
+        // 狀態與提示
+        if self.receiver.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(&self.status)
+                        .color(egui::Color32::from_rgb(255, 140, 0))
+                        .strong(),
+                );
+            });
+        } else {
+            ui.label(&self.status);
+        }
+        // 上次完成掃描的時間（含無新郵件的空掃）；空掃不寫執行紀錄，只更新此處
+        if let Some(last_check) = self.last_check {
+            ui.small(format!(
+                "最後檢查時間：{}",
+                last_check.format("%Y-%m-%d %H:%M:%S")
+            ));
+        }
+        // 跨重啟由進度檔回復的最後判定郵件資訊
+        if let Some((uid, subject, mail_date)) = &self.last_mail {
+            ui.small(format!("上次檢查至 UID {uid}〈{subject}〉（{mail_date}）"));
+        }
+        if !self.pending_queue.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠️ 目前有 {} 封疑似釣魚／惡意廣告郵件待確認隔離",
+                        self.pending_queue.len()
+                    ))
+                    .color(egui::Color32::from_rgb(240, 80, 80))
+                    .strong(),
+                );
+                if ui.button("檢視並隔離").clicked() {
+                    self.show_confirm_dialog = true;
+                }
+            });
+        }
+        if self.move_receiver.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(&self.move_status)
+                        .color(egui::Color32::from_rgb(230, 80, 80))
+                        .strong(),
+                );
+            });
+        }
+        // 掃描進行中顯示即時進度（目前檢查哪封信）；完成後自動消失
+        if !self.scan_progress.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(&self.scan_progress)
+                        .color(egui::Color32::from_rgb(0, 160, 230))
+                        .small()
+                        .strong(),
+                );
+            });
+        }
+
+        ui.separator();
+
+        // 立即掃描與排程資訊列
+        ui.horizontal(|ui| {
+            // 掃描進行中停用按鈕，避免按下被靜默忽略
+            let scan_busy = self.receiver.is_some();
+            let scan_button = egui::Button::new("立即掃描指定日期");
+            if ui.add_enabled(!scan_busy, scan_button).clicked() {
+                self.start_scan(false);
+            }
+            if scan_busy {
+                ui.spinner();
+                let progress_display = if self.scan_progress.is_empty() {
+                    "掃描進行中…"
+                } else {
+                    &self.scan_progress
+                };
+                ui.label(
+                    egui::RichText::new(progress_display)
+                        .color(egui::Color32::from_rgb(255, 140, 0))
+                        .strong(),
+                );
+            }
+            ui.label("日期");
+            ui.text_edit_singleline(&mut self.date_text);
+
+            ui.add_space(12.0);
+            ui.label(format!(
+                "下次檢查：{} 秒後",
+                self.next_check
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+            ));
+        });
+
+        // 執行紀錄（佔據滿版剩餘垂直空間）
         ui.separator();
         ui.horizontal(|ui| {
             ui.heading("執行紀錄");
@@ -1557,11 +1415,372 @@ impl eframe::App for App {
                 if self.logs.is_empty() {
                     ui.small("尚無執行紀錄");
                 } else {
-                    for entry in self.logs.iter().rev().take(20) {
+                    for entry in self.logs.iter().rev().take(50) {
                         ui.label(&entry.line);
                     }
                 }
             });
+    }
+
+    fn ui_settings(&mut self, ui: &mut egui::Ui, current_tab: SettingsTab) {
+        // 頂部控制列：返回與儲存
+        ui.horizontal(|ui| {
+            if ui
+                .button(egui::RichText::new("◀ 返回監控主畫面").strong())
+                .clicked()
+            {
+                self.active_view = ActiveView::Dashboard;
+            }
+
+            ui.add_space(10.0);
+
+            if ui
+                .button(egui::RichText::new("💾 儲存設定").strong())
+                .clicked()
+            {
+                self.save();
+            }
+
+            if let Some(saved_at) = self.settings_saved_toast {
+                if saved_at.elapsed() < Duration::from_secs(4) {
+                    ui.label(
+                        egui::RichText::new("✔ 設定已成功儲存")
+                            .color(egui::Color32::from_rgb(80, 220, 100))
+                            .strong(),
+                    );
+                } else {
+                    self.settings_saved_toast = None;
+                }
+            }
+        });
+
+        ui.separator();
+
+        // 四大項導覽列
+        ui.horizontal(|ui| {
+            let tabs = [
+                (SettingsTab::Imap, "📧 IMAP 信箱"),
+                (SettingsTab::Llm, "🤖 LLM 智慧判定"),
+                (SettingsTab::Detection, "🛡 偵測規則"),
+                (SettingsTab::Schedule, "⏱ 排程與系統匣"),
+            ];
+
+            for (tab, label) in tabs {
+                let is_selected = current_tab == tab;
+                let rich_text = if is_selected {
+                    egui::RichText::new(label)
+                        .strong()
+                        .color(egui::Color32::WHITE)
+                } else {
+                    egui::RichText::new(label)
+                };
+                let btn = egui::Button::new(rich_text).selected(is_selected);
+                if ui.add(btn).clicked() {
+                    self.active_view = ActiveView::Settings(tab);
+                }
+            }
+        });
+
+        ui.separator();
+
+        // 細項設定內容區
+        egui::ScrollArea::vertical()
+            .id_salt("settings_tab_scroll")
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .max_height(ui.available_height())
+            .show(ui, |ui| match current_tab {
+                SettingsTab::Imap => self.ui_settings_imap(ui),
+                SettingsTab::Llm => self.ui_settings_llm(ui),
+                SettingsTab::Detection => self.ui_settings_detection(ui),
+                SettingsTab::Schedule => self.ui_settings_schedule(ui),
+            });
+    }
+
+    fn ui_settings_imap(&mut self, ui: &mut egui::Ui) {
+        ui.heading("IMAP 信箱設定");
+        ui.add_space(4.0);
+        egui::Grid::new("imap_settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                field(ui, "伺服器", &mut self.config.imap.host);
+                ui.end_row();
+                ui.label("連接埠");
+                ui.add(egui::DragValue::new(&mut self.config.imap.port).range(1..=65535));
+                ui.end_row();
+                ui.label("協定");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.config.imap.protocol, "imaps".into(), "IMAPS");
+                    ui.radio_value(
+                        &mut self.config.imap.protocol,
+                        "starttls".into(),
+                        "STARTTLS",
+                    );
+                });
+                ui.end_row();
+                field(ui, "帳號", &mut self.config.imap.username);
+                ui.end_row();
+                ui.label("密碼 / App Password");
+                ui.add(egui::TextEdit::singleline(&mut self.config.imap.password).password(true));
+                ui.end_row();
+                ui.label("信箱清單");
+                ui.horizontal(|ui| {
+                    let is_fetching = self.mailbox_receiver.is_some();
+                    let btn_text = if is_fetching {
+                        "取得中…"
+                    } else {
+                        "從伺服器取得信箱清單"
+                    };
+                    if ui
+                        .add_enabled(!is_fetching, egui::Button::new(btn_text))
+                        .clicked()
+                    {
+                        self.fetch_mailboxes();
+                    }
+                    if !self.mailboxes.is_empty() {
+                        ui.label(format!("（已載入 {} 個信箱）", self.mailboxes.len()));
+                    }
+                });
+                ui.end_row();
+                mailbox_field(
+                    ui,
+                    "來源信箱",
+                    "source_mailbox_combo",
+                    &mut self.config.imap.source_mailbox,
+                    &self.mailboxes,
+                );
+                ui.end_row();
+                mailbox_field(
+                    ui,
+                    "釣魚信箱",
+                    "phishing_mailbox_combo",
+                    &mut self.config.imap.phishing_mailbox,
+                    &self.mailboxes,
+                );
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        ui.small("密碼會以明文儲存在 config.toml，請使用 App Password 並保護該檔案。");
+    }
+
+    fn ui_settings_llm(&mut self, ui: &mut egui::Ui) {
+        ui.heading("LLM 智慧判定設定");
+        ui.add_space(4.0);
+        egui::Grid::new("llm_settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("後端模式");
+                let mut current_backend = self.config.llm.backend.clone().unwrap_or_else(|| {
+                    if !self.config.llm.base_url.trim().is_empty() {
+                        "api".to_string()
+                    } else {
+                        "claude".to_string()
+                    }
+                });
+                egui::ComboBox::from_id_salt("llm_backend_select")
+                    .selected_text(match current_backend.as_str() {
+                        "claude" => "Claude Code CLI (claude)",
+                        "agy" => "Antigravity CLI (agy)",
+                        "codex" => "OpenAI Codex CLI (codex)",
+                        "command" => "自訂命令列 (command)",
+                        "jev" => "TypeSafe Jev API (jev)",
+                        _ => "OpenAI 相容 HTTP API (api)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut current_backend,
+                            "claude".into(),
+                            "Claude Code CLI (claude)",
+                        );
+                        ui.selectable_value(
+                            &mut current_backend,
+                            "agy".into(),
+                            "Antigravity CLI (agy)",
+                        );
+                        ui.selectable_value(
+                            &mut current_backend,
+                            "codex".into(),
+                            "OpenAI Codex CLI (codex)",
+                        );
+                        ui.selectable_value(
+                            &mut current_backend,
+                            "api".into(),
+                            "OpenAI 相容 HTTP API (api)",
+                        );
+                        ui.selectable_value(
+                            &mut current_backend,
+                            "jev".into(),
+                            "TypeSafe Jev API (jev)",
+                        );
+                        ui.selectable_value(
+                            &mut current_backend,
+                            "command".into(),
+                            "自訂命令列 (command)",
+                        );
+                    });
+                self.config.llm.backend = Some(current_backend.clone());
+                ui.end_row();
+
+                let is_api = current_backend == "api";
+                let is_cmd = current_backend == "command";
+                let is_jev = current_backend == "jev";
+
+                if is_cmd {
+                    field(ui, "自訂命令", &mut self.config.llm.command);
+                    ui.end_row();
+                }
+
+                if is_api || is_jev {
+                    field(ui, "伺服器網址", &mut self.config.llm.base_url);
+                    ui.end_row();
+                    ui.label("API 金鑰");
+                    ui.add(egui::TextEdit::singleline(&mut self.config.llm.api_key).password(true));
+                    ui.end_row();
+                }
+
+                if is_jev {
+                    ui.label("Jev 評分上限");
+                    ui.add(egui::DragValue::new(&mut self.config.llm.jev_max_score).range(1..=50));
+                    ui.end_row();
+                }
+
+                field(ui, "模型名稱", &mut self.config.llm.model);
+                ui.end_row();
+
+                ui.label("逾時（秒）");
+                ui.add(egui::DragValue::new(&mut self.config.llm.timeout_secs).range(10..=600));
+                ui.end_row();
+                ui.label("內文最大字數");
+                ui.add(egui::DragValue::new(&mut self.config.llm.max_chars).range(500..=50000));
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        match self.config.llm.effective_backend() {
+            Some(LlmBackend::Claude) => {
+                ui.small("✔ 使用本機 Claude Code CLI：直接使用已登入的 Claude 憑據，免填伺服器網址與金鑰；模型名稱留空則使用 CLI 預設模型。");
+            }
+            Some(LlmBackend::Agy) => {
+                ui.small("✔ 使用本機 Antigravity CLI (agy)：直接使用本機 agy 憑據，免填伺服器網址與金鑰；模型名稱留空則使用 CLI 預設模型。");
+            }
+            Some(LlmBackend::Codex) => {
+                ui.small("✔ 使用本機 OpenAI Codex CLI (codex)：沙箱唯讀執行；模型名稱留空則使用 CLI 預設模型。");
+            }
+            Some(LlmBackend::Command) => {
+                ui.small("✔ 使用自訂命令列：將透過 stdin 送入 Prompt 並解析標準輸出回傳之判定。");
+            }
+            Some(LlmBackend::Api) => {
+                ui.small("✔ 使用 OpenAI 相容 API：支援 Ollama / LM Studio 或雲端服務；地端免認證模型 API 金鑰可留空。");
+            }
+            Some(LlmBackend::Jev) => {
+                ui.small("✔ 使用 TypeSafe Jev API (System One)：採混合評分制，Jev 評定釣魚機率換算為 0~分數上限並與安全規則加總判定；API 金鑰為必填。");
+            }
+            None => {
+                ui.small("⚠ LLM 判定未啟用（若欲使用請選擇 CLI 後端或填入 API 伺服器網址）。未啟用時不會搬移任何郵件。");
+            }
+        }
+    }
+
+    fn ui_settings_detection(&mut self, ui: &mut egui::Ui) {
+        ui.heading("偵測規則設定");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("判定門檻");
+            ui.add(egui::DragValue::new(&mut self.config.detection.threshold).range(1..=100));
+            ui.add_space(12.0);
+            ui.label("Word 外部圖片分數");
+            ui.add(
+                egui::DragValue::new(&mut self.config.detection.external_word_image_score)
+                    .range(0..=100),
+            );
+        });
+        ui.add_space(8.0);
+        multiline(
+            ui,
+            "可疑寄件網域（每行一個）",
+            &mut self.config.detection.suspicious_sender_domains,
+        );
+        ui.add_space(6.0);
+        multiline(
+            ui,
+            "信任寄件網域（每行一個）",
+            &mut self.config.detection.trusted_sender_domains,
+        );
+        ui.add_space(6.0);
+        multiline(
+            ui,
+            "可疑關鍵字（每行一個）",
+            &mut self.config.detection.suspicious_keywords,
+        );
+    }
+
+    fn ui_settings_schedule(&mut self, ui: &mut egui::Ui) {
+        ui.heading("排程與系統匣設定");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("每隔（分鐘）");
+            ui.add(
+                egui::DragValue::new(&mut self.config.gui.check_interval_minutes).range(1..=1440),
+            );
+            ui.add_space(12.0);
+            ui.label(format!(
+                "下次檢查：{} 秒後",
+                self.next_check
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+            ));
+        });
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.config.gui.minimize_to_tray,
+            "關閉視窗時縮小至 Windows 系統匣",
+        );
+        ui.checkbox(
+            &mut self.config.gui.hide_taskbar_when_minimized,
+            "縮小至系統匣時隱藏工作列項目",
+        );
+        ui.checkbox(
+            &mut self.config.gui.start_minimized_to_tray,
+            "啟動時直接縮小至 Windows 系統匣（下次啟動生效）",
+        );
+        ui.checkbox(
+            &mut self.config.gui.confirm_before_move,
+            "搬移前先確認（可個別選取要隔離的郵件）",
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("中文字型（重啟後套用）");
+            ui.text_edit_singleline(&mut self.config.gui.font_family);
+        });
+        ui.add_space(8.0);
+        ui.small("系統匣選單提供顯示視窗、立即掃描與結束程式。密碼會以明文儲存在 config.toml，請使用 App Password 並保護該檔案。");
+    }
+}
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll(ctx);
+        if !self.allow_exit
+            && ctx.input(|input| input.viewport().close_requested())
+            && self.config.gui.minimize_to_tray
+            && self.tray.is_some()
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            if self.config.gui.hide_taskbar_when_minimized {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            }
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        match self.active_view {
+            ActiveView::Dashboard => self.ui_dashboard(ui),
+            ActiveView::Settings(tab) => self.ui_settings(ui, tab),
+        }
+
         // 搬移確認對話框：當有待隔離項目且 show_confirm_dialog 為 true 時繪製
         if self.show_confirm_dialog && !self.pending_queue.is_empty() {
             Self::show_move_confirmation(ui.ctx(), self);
@@ -1615,7 +1834,7 @@ fn multiline(ui: &mut egui::Ui, label: &str, items: &mut Vec<String>) {
     ui.label(label);
     let mut text = items.join("\n");
     if ui
-        .add(egui::TextEdit::multiline(&mut text).desired_rows(2))
+        .add(egui::TextEdit::multiline(&mut text).desired_rows(4))
         .changed()
     {
         *items = text
@@ -1651,6 +1870,18 @@ fn imap_mailbox_problem(config: &ImapConfig) -> Option<String> {
         Some("請先設定釣魚信箱（隔離目標）。".into())
     } else {
         None
+    }
+}
+
+/// 判斷啟動時的初始視圖與旗標（無設定或設定無效時導向設定畫面）
+fn determine_initial_view(config: &Config, tray_available: bool) -> (ActiveView, bool, bool) {
+    let config_invalid = imap_credentials_problem(&config.imap).is_some()
+        || imap_mailbox_problem(&config.imap).is_some();
+    if config_invalid {
+        (ActiveView::Settings(SettingsTab::Imap), false, false)
+    } else {
+        let hide_window = config.gui.start_minimized_to_tray && tray_available;
+        (ActiveView::Dashboard, hide_window, true)
     }
 }
 
@@ -1793,7 +2024,7 @@ struct LlmConfig {
     /// backend = "command" 時執行的自訂命令字串
     #[serde(default)]
     command: String,
-    /// Jev 混合評分模式下的分數換算上限（預設 5）
+    /// Jev 混合評分模式下的分數換算上限（預設 10）
     #[serde(default = "default_jev_max_score")]
     jev_max_score: u32,
     #[serde(default = "default_llm_timeout_secs")]
@@ -1803,7 +2034,7 @@ struct LlmConfig {
 }
 
 fn default_jev_max_score() -> u32 {
-    5
+    10
 }
 fn default_llm_timeout_secs() -> u64 {
     120
@@ -3717,6 +3948,40 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn initial_view_routes_to_settings_when_config_is_invalid() {
+        let mut config = Config::default();
+        // 預設 config 的 host/username/password 為空，屬於無效設定
+        let (view, hide_window, scan_pending) = determine_initial_view(&config, true);
+        assert_eq!(view, ActiveView::Settings(SettingsTab::Imap));
+        assert!(!hide_window, "無效設定時不得縮小隱藏視窗");
+        assert!(!scan_pending, "無效設定時不得排程啟動掃描");
+
+        // 填入憑據但無信箱名稱，仍為無效
+        config.imap.host = "imap.example.com".into();
+        config.imap.username = "user@example.com".into();
+        config.imap.password = "secret".into();
+        config.imap.source_mailbox = "".into();
+        let (view2, _, _) = determine_initial_view(&config, true);
+        assert_eq!(view2, ActiveView::Settings(SettingsTab::Imap));
+    }
+
+    #[test]
+    fn initial_view_routes_to_dashboard_when_config_is_valid() {
+        let mut config = Config::default();
+        config.imap.host = "imap.example.com".into();
+        config.imap.username = "user@example.com".into();
+        config.imap.password = "secret".into();
+        config.imap.source_mailbox = "INBOX".into();
+        config.imap.phishing_mailbox = "Phishing".into();
+        config.gui.start_minimized_to_tray = true;
+
+        let (view, hide_window, scan_pending) = determine_initial_view(&config, true);
+        assert_eq!(view, ActiveView::Dashboard);
+        assert!(hide_window);
+        assert!(scan_pending);
+    }
+
+    #[test]
     fn detects_external_word_image_relationship() {
         let xml = r#"<Relationships><Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://track.example/pixel.png" TargetMode="External" /></Relationships>"#;
         assert_eq!(
@@ -3985,12 +4250,22 @@ mod tests {
 
     fn test_detection_config() -> DetectionConfig {
         DetectionConfig {
-            threshold: 5,
+            threshold: 8,
             suspicious_sender_domains: Vec::new(),
             trusted_sender_domains: Vec::new(),
             suspicious_keywords: Vec::new(),
-            external_word_image_score: 5,
+            external_word_image_score: 6,
         }
+    }
+
+    #[test]
+    fn detection_config_defaults() {
+        let toml_str = r#"
+            suspicious_sender_domains = []
+        "#;
+        let cfg: DetectionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.threshold, 8);
+        assert_eq!(cfg.external_word_image_score, 6);
     }
 
     // 回歸：multipart/alternative 的內文在 subparts 裡，get_body() 回傳空。
@@ -4937,6 +5212,25 @@ mod tests {
         let low_final = base_score + low_points;
         assert_eq!(low_final, 2);
         assert!(low_final < 5);
+
+        // 驗證預設 jev_max_score = 10 的換算與門檻 8
+        let max_score_10 = default_jev_max_score();
+        assert_eq!(max_score_10, 10);
+        assert_eq!(calculate_jev_points(0.55, max_score_10), 0);
+        assert_eq!(calculate_jev_points(0.80, max_score_10), 5);
+        assert_eq!(calculate_jev_points(0.88, max_score_10), 7);
+        assert_eq!(calculate_jev_points(1.00, max_score_10), 10);
+
+        // 基礎規則評分 2 分 + Jev (0.88 -> 7分) = 9 分 (超過預設門檻 8)
+        let points_10 = calculate_jev_points(0.88, max_score_10);
+        let final_score_10 = base_score + points_10;
+        assert_eq!(final_score_10, 9);
+        assert!(final_score_10 >= default_threshold());
+
+        // 低機率 0.55 -> 0分，最終得分 2 分 (未達預設門檻 8)
+        let low_final_10 = base_score + calculate_jev_points(0.55, max_score_10);
+        assert_eq!(low_final_10, 2);
+        assert!(low_final_10 < default_threshold());
     }
 
     #[test]

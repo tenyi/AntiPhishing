@@ -10,13 +10,13 @@ phishing_mailbox = "Phishing"
 
 [detection]
 # 建議先執行 --dry-run，依結果調整門檻與清單。
-threshold = 5
+threshold = 8
 suspicious_sender_domains = ["evil.example"]
 # 信任寄件網域白名單：若未發生 SPF/DMARC 偽造失敗則直接安全豁免（略過不送檢、不搬移）；若安全驗證失敗則取消豁免並告警送檢。
 trusted_sender_domains = ["company.example", "hinet.net"]
 suspicious_keywords = ["verify", "urgent", "password", "login", "帳戶", "驗證", "緊急", "密碼"]
-# Word 附件以外部圖片追蹤開啟行為時加分；預設 5，會單獨達到預設門檻。
-external_word_image_score = 5
+# Word 附件以外部圖片追蹤開啟行為時加分；預設 6。
+external_word_image_score = 6
 
 # LLM 智慧判定設定。
 # 支援 OpenAI 相容 HTTP API，以及命令列呼叫 Claude Code CLI / OpenAI Codex CLI / Antigravity CLI / 自訂命令。
@@ -38,8 +38,8 @@ base_url = "http://127.0.0.1:11434/v1"
 model = "llama3.1"
 # 可選：API 金鑰（若使用地端免認證模型如 Ollama 可留空；若使用需認證模型或 Jev 必須填入）
 api_key = ""
-# 可選：當 backend = "jev" 時的分數換算上限（未滿 60% 不計分，60%~100% 線性換算），預設 5
-# jev_max_score = 5
+# 可選：當 backend = "jev" 時的分數換算上限（未滿 60% 不計分，60%~100% 線性換算），預設 10
+# jev_max_score = 10
 # 可選：當 backend = "command" 時執行的自訂命令字串（例如 "ollama run llama3.1"）
 # command = ""
 # 可選：單一請求或命令執行逾時（秒），預設 120

@@ -100,11 +100,11 @@ source_mailbox = "INBOX"
 phishing_mailbox = "Phishing"       # 隔離目標資料夾
 
 [detection]
-threshold = 5                       # 傳統評分搬移門檻（未設定 LLM 時回退使用）
+threshold = 8                       # 傳統評分搬移門檻（未設定 LLM 時回退使用）
 suspicious_sender_domains = ["evil.example"]
 trusted_sender_domains = ["company.example"]
 suspicious_keywords = ["verify", "urgent", "password", "login", "帳戶", "驗證", "緊急", "密碼"]
-external_word_image_score = 5
+external_word_image_score = 6
 
 # --- LLM 智慧判定設定 ---
 [llm]
@@ -120,7 +120,7 @@ api_key = ""
 # base_url = "https://api.typesafe.ai"  # 選填，預設 https://api.typesafe.ai
 # model = "jev-latest"                  # 選填，預設 jev-latest
 # api_key = "sk-..."                   # 必填
-# jev_max_score = 5                     # Jev 分數換算上限（預設 5；機率 <0.6 不計分，0.6~1.0 線性換算）
+# jev_max_score = 10                    # Jev 分數換算上限（預設 10；機率 <0.6 不計分，0.6~1.0 線性換算）
 
 # [共用設定]
 # 模型名稱。CLI 模式留空則自動使用該 CLI 預設模型；亦可明確指定（如 "claude-3-7-sonnet"、"o3-mini"）

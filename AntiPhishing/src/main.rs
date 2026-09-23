@@ -70,7 +70,8 @@ struct ImapConfig {
 
 #[derive(Deserialize)]
 struct DetectionConfig {
-    /// 傳統評分模式（未設定 LLM）的搬移門檻。
+    /// 傳統評分模式（未設定 LLM）的搬移門檻（預設 8）。
+    #[serde(default = "default_threshold")]
     threshold: u32,
     #[serde(default)]
     suspicious_sender_domains: Vec<String>,
@@ -78,13 +79,17 @@ struct DetectionConfig {
     trusted_sender_domains: Vec<String>,
     #[serde(default = "default_keywords")]
     suspicious_keywords: Vec<String>,
-    /// Word 附件含有外部圖片時加上的分數。
+    /// Word 附件含有外部圖片時加上的分數（預設 6）。
     #[serde(default = "default_external_word_image_score")]
     external_word_image_score: u32,
 }
 
+fn default_threshold() -> u32 {
+    8
+}
+
 fn default_external_word_image_score() -> u32 {
-    5
+    6
 }
 
 fn default_keywords() -> Vec<String> {
@@ -135,7 +140,7 @@ struct LlmConfig {
     /// backend = "command" 時執行的自訂命令字串
     #[serde(default)]
     command: String,
-    /// Jev 混合評分模式下的分數換算上限（預設 5）
+    /// Jev 混合評分模式下的分數換算上限（預設 10）
     #[serde(default = "default_jev_max_score")]
     jev_max_score: u32,
     #[serde(default = "default_llm_timeout_secs")]
@@ -145,7 +150,7 @@ struct LlmConfig {
 }
 
 fn default_jev_max_score() -> u32 {
-    5
+    10
 }
 fn default_llm_timeout_secs() -> u64 {
     120
@@ -1947,18 +1952,28 @@ mod tests {
             suspicious_sender_domains: vec!["evil.test".into()],
             trusted_sender_domains: vec!["company.test".into()],
             suspicious_keywords: vec!["verify".into(), "password".into()],
-            external_word_image_score: 5,
+            external_word_image_score: 6,
         }
     }
 
     fn bare_config() -> DetectionConfig {
         DetectionConfig {
-            threshold: 5,
+            threshold: 8,
             suspicious_sender_domains: Vec::new(),
             trusted_sender_domains: Vec::new(),
             suspicious_keywords: Vec::new(),
-            external_word_image_score: 5,
+            external_word_image_score: 6,
         }
+    }
+
+    #[test]
+    fn detection_config_defaults() {
+        let toml_str = r#"
+            suspicious_sender_domains = []
+        "#;
+        let cfg: DetectionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.threshold, 8);
+        assert_eq!(cfg.external_word_image_score, 6);
     }
 
     #[test]
@@ -1997,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn external_word_image_reaches_default_threshold() {
+    fn external_word_image_scores_configured_value() {
         let targets = vec!["https://track.example/pixel.png".into()];
         let (score, _) = phishing_score(
             "sender@example.test",
@@ -2008,7 +2023,7 @@ mod tests {
             &[],
             &config(),
         );
-        assert_eq!(score, 5);
+        assert_eq!(score, 6);
     }
 
     #[test]
@@ -2760,6 +2775,25 @@ mod tests {
         let low_final = base_score + low_points;
         assert_eq!(low_final, 2);
         assert!(low_final < 5);
+
+        // 驗證預設 jev_max_score = 10 的換算與門檻 8
+        let max_score_10 = default_jev_max_score();
+        assert_eq!(max_score_10, 10);
+        assert_eq!(calculate_jev_points(0.55, max_score_10), 0);
+        assert_eq!(calculate_jev_points(0.80, max_score_10), 5);
+        assert_eq!(calculate_jev_points(0.88, max_score_10), 7);
+        assert_eq!(calculate_jev_points(1.00, max_score_10), 10);
+
+        // 基礎規則評分 2 分 + Jev (0.88 -> 7分) = 9 分 (超過預設門檻 8)
+        let points_10 = calculate_jev_points(0.88, max_score_10);
+        let final_score_10 = base_score + points_10;
+        assert_eq!(final_score_10, 9);
+        assert!(final_score_10 >= default_threshold());
+
+        // 低機率 0.55 -> 0分，最終得分 2 分 (未達預設門檻 8)
+        let low_final_10 = base_score + calculate_jev_points(0.55, max_score_10);
+        assert_eq!(low_final_10, 2);
+        assert!(low_final_10 < default_threshold());
     }
 
     #[test]

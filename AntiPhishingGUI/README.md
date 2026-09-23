@@ -33,11 +33,11 @@ source_mailbox = "INBOX"
 phishing_mailbox = "Phishing"
 
 [detection]
-threshold = 5
+threshold = 8
 suspicious_sender_domains = ["evil.example"]
 trusted_sender_domains = []
 suspicious_keywords = ["verify", "urgent", "password", "login", "驗證", "緊急"]
-external_word_image_score = 5
+external_word_image_score = 6
 
 [gui]
 check_interval_minutes = 10
@@ -58,8 +58,8 @@ max_chars = 6000              # 郵件內文最大字元數
 設定說明：
 
 - `protocol = "imaps"` 通常使用 993 埠；STARTTLS 請改用 `protocol = "starttls"` 並填入伺服器要求的埠號。
-- `threshold` 是判定門檻。傳統評分模式下達到門檻的郵件會搬到 `phishing_mailbox`；一般 LLM 模式下評分僅供 log 參考；Jev 模式下採混合評分制，Jev 機率分數與規則分數加總達標才隔離。
-- `external_word_image_score` 用於 DOCX 外部圖片追蹤偵測；預設 5 分。
+- `threshold` 是判定門檻（預設 8）。傳統評分模式下達到門檻的郵件會搬到 `phishing_mailbox`；一般 LLM 模式下評分僅供 log 參考；Jev 模式下採混合評分制，Jev 機率分數與規則分數加總達標才隔離。
+- `external_word_image_score` 用於 DOCX 外部圖片追蹤偵測；預設 6 分。
 - `check_interval_minutes` 是排程掃描間隔，範圍為 1–1440 分鐘。
 - `log_retention_days` 是每日日誌檔的保留天數，超過即於啟動時刪除；預設 30，設為 0 表示永不清理。
 - GUI 啟動後會立即掃描前一日與今日郵件；啟動掃描完成後，排程每次只掃描今日郵件。
@@ -151,7 +151,7 @@ base_url = "https://api.typesafe.ai"
 # model 留空預設為 "jev-latest"
 model = "jev-latest"
 api_key = "sk-typesafe-..."              # 必填：TypeSafe API Key
-jev_max_score = 5                        # Jev 換算分數上限（預設 5；機率 <0.6 不計分，0.6~1.0 線性換算）
+jev_max_score = 10                       # Jev 換算分數上限（預設 10；機率 <0.6 不計分，0.6~1.0 線性換算）
 timeout_secs = 120
 max_chars = 6000
 ```
