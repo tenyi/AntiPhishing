@@ -1559,6 +1559,7 @@ fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
         "ARC-Authentication-Results",
         "Received-SPF",
     ];
+    let mut seen_received_spf = false;
     for name in check_headers {
         for val in mail.headers.get_all_values(name) {
             if matches!(
@@ -1571,7 +1572,7 @@ fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
                 }
             }
             let lower = val.to_lowercase();
-            // 解析 DMARC 狀態
+            // 解析 DMARC 狀態（最外層權威 MTA 結果優先）
             if status.dmarc.is_none() {
                 if lower.contains("dmarc=pass") {
                     status.dmarc = Some("pass".to_string());
@@ -1583,7 +1584,7 @@ fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
                     status.dmarc = Some("none".to_string());
                 }
             }
-            // 解析 DKIM 狀態
+            // 解析 DKIM 狀態（最外層權威 MTA 結果優先）
             if status.dkim.is_none() {
                 if lower.contains("dkim=pass") {
                     status.dkim = Some("pass".to_string());
@@ -1595,13 +1596,15 @@ fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
                     status.dkim = Some("none".to_string());
                 }
             }
-            // 解析 SPF 狀態
-            if status.spf.is_none() {
-                if name == "Received-SPF" {
-                    if lower.starts_with("pass") {
-                        status.spf = Some("pass".to_string());
-                    } else if lower.starts_with("fail") {
+            // 解析 SPF 狀態（最外層權威 MTA 結果優先）
+            if name == "Received-SPF" {
+                // 僅採納最外層（第一個）Received-SPF 標頭，並優先於轉寄節點之 ARC/上游結果
+                if !seen_received_spf {
+                    seen_received_spf = true;
+                    if lower.starts_with("fail") {
                         status.spf = Some("fail".to_string());
+                    } else if lower.starts_with("pass") {
+                        status.spf = Some("pass".to_string());
                     } else if lower.starts_with("softfail") {
                         status.spf = Some("softfail".to_string());
                     } else if lower.starts_with("neutral") {
@@ -1609,7 +1612,9 @@ fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
                     } else if lower.starts_with("none") {
                         status.spf = Some("none".to_string());
                     }
-                } else if lower.contains("spf=pass") {
+                }
+            } else if status.spf.is_none() {
+                if lower.contains("spf=pass") {
                     status.spf = Some("pass".to_string());
                 } else if lower.contains("spf=fail") {
                     status.spf = Some("fail".to_string());
@@ -1621,22 +1626,22 @@ fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
                     status.spf = Some("none".to_string());
                 }
             }
+        }
+    }
 
-            // 偽造警告判斷
-            if (lower.contains("dmarc=fail") || lower.contains("dmarc=reject"))
-                && !status.warnings.iter().any(|w: &String| w.contains("DMARC"))
-            {
-                status
-                    .warnings
-                    .push("DMARC 驗證失敗（寄件者網域遭偽造）".into());
-            }
-            let spf_failed =
-                lower.contains("spf=fail") || (name == "Received-SPF" && lower.starts_with("fail"));
-            if spf_failed && !status.warnings.iter().any(|w: &String| w.contains("SPF")) {
-                status
-                    .warnings
-                    .push("SPF 驗證失敗（發信伺服器未獲授權）".into());
-            }
+    // 依據最外層權威驗證狀態產生警告（避免轉發 hop 或信件下層殘留標頭造成警告與狀態矛盾）
+    if let Some(ref dmarc) = status.dmarc {
+        if dmarc == "fail" || dmarc == "reject" {
+            status
+                .warnings
+                .push("DMARC 驗證失敗（寄件者網域遭偽造）".into());
+        }
+    }
+    if let Some(ref spf) = status.spf {
+        if spf == "fail" {
+            status
+                .warnings
+                .push("SPF 驗證失敗（發信伺服器未獲授權）".into());
         }
     }
 
@@ -1675,16 +1680,70 @@ fn parse_auth_results_instance(value: &str) -> Option<u32> {
     None
 }
 
-/// 檢查寄件者是否命中信任清單（不區分大小寫）
-fn is_trusted_sender(from: &str, trusted_domains: &[String]) -> Option<String> {
+/// 從寄件者字串中提取電子郵件網域（小寫）
+fn extract_sender_domain(from: &str) -> Option<String> {
     let from_lower = from.to_lowercase();
+    RE_EMAIL_DOMAIN
+        .captures(&from_lower)
+        .map(|c| c[1].to_string())
+}
+
+/// 判斷郵件網域是否符合信任網域清單的項目（必須全等，或是其合法的子網域）
+fn is_domain_trusted(email_domain: &str, trusted_domain: &str) -> bool {
+    let t = trusted_domain.trim().trim_start_matches('@').to_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    email_domain == t || email_domain.ends_with(&format!(".{t}"))
+}
+
+/// 判斷寄件者顯示名稱是否命中品牌名稱
+///
+/// 規則：若品牌名稱全為英數（如 dhl, ups, momo），要求獨立詞邊界，避免 groups / backups 誤判為 ups；
+/// 中文品牌（如「蝦皮」）則直接進行子字串比對。
+fn matches_brand_name(display_name: &str, brand: &str) -> bool {
+    let is_ascii_brand = brand.chars().all(|c| c.is_ascii_alphanumeric());
+    if is_ascii_brand {
+        for (idx, _) in display_name.match_indices(brand) {
+            let before_ok = if idx == 0 {
+                true
+            } else {
+                !display_name[..idx]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+            };
+            let end_idx = idx + brand.len();
+            let after_ok = if end_idx >= display_name.len() {
+                true
+            } else {
+                !display_name[end_idx..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        false
+    } else {
+        display_name.contains(brand)
+    }
+}
+
+/// 檢查寄件者是否命中信任清單（不區分大小寫）
+///
+/// 規則：只比對實際電子郵件地址的網域，必須與信任網域完全相同，或是其合法的子網域（如 soc.hinet.net 比對 hinet.net），
+/// 避免 evil-hinet.net 或顯示名稱內含關鍵字造成白名單安全豁免被繞過。
+fn is_trusted_sender(from: &str, trusted_domains: &[String]) -> Option<String> {
+    let email_domain = extract_sender_domain(from)?;
     for d in trusted_domains {
         let trimmed = d.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let d_lower = trimmed.to_lowercase();
-        if from_lower.contains(&d_lower) {
+        if is_domain_trusted(&email_domain, trimmed) {
             return Some(trimmed.to_string());
         }
     }
@@ -1762,9 +1821,9 @@ fn phishing_score(
     // 品牌偽裝：From 顯示名稱含品牌（如 DHL、momo、蝦皮、Yahoo），但寄件網域非該品牌官方網域
     let email_domain = RE_EMAIL_DOMAIN.captures(&from).map(|c| c[1].to_string());
     let display_name = from.split('<').next().unwrap_or(from.as_str()).trim();
-    if let Some(domain) = email_domain {
+    if let Some(ref domain) = email_domain {
         for (brand, officials) in BRAND_OFFICIAL_DOMAINS {
-            if display_name.contains(brand)
+            if matches_brand_name(display_name, brand)
                 // 嚴格比對：官方網域本身或「.官方網域」結尾，避免 evil-dhl.com 偽裝
                 && !officials.iter().any(|official| {
                     domain == *official
@@ -1805,13 +1864,15 @@ fn phishing_score(
         score += 4;
         reasons.push(auth_warnings.join("；"));
     }
-    if config
-        .trusted_sender_domains
-        .iter()
-        .any(|d| from.contains(&d.to_lowercase()))
-    {
-        score = score.saturating_sub(3);
-        reasons.push("寄件網域在信任清單".into());
+    if let Some(ref domain) = email_domain {
+        if config
+            .trusted_sender_domains
+            .iter()
+            .any(|d| is_domain_trusted(domain, d))
+        {
+            score = score.saturating_sub(3);
+            reasons.push("寄件網域在信任清單".into());
+        }
     }
     (score, reasons)
 }
@@ -1846,11 +1907,6 @@ fn is_word_part(part: &mailparse::ParsedMail<'_>) -> bool {
                 || lower.ends_with(".rtf")
         })
         .unwrap_or(false)
-}
-
-#[allow(dead_code)]
-fn is_docx_part(part: &mailparse::ParsedMail<'_>) -> bool {
-    is_word_part(part)
 }
 
 fn external_word_image_targets_from_word(bytes: &[u8]) -> Vec<String> {
@@ -1899,11 +1955,6 @@ fn external_word_image_targets_from_word(bytes: &[u8]) -> Vec<String> {
     }
 
     Vec::new()
-}
-
-#[allow(dead_code)]
-fn external_word_image_targets_from_docx(bytes: &[u8]) -> Vec<String> {
-    external_word_image_targets_from_word(bytes)
 }
 
 fn external_image_targets_from_relationships(xml: &str) -> Vec<String> {
@@ -2798,18 +2849,110 @@ mod tests {
 
     #[test]
     fn test_is_trusted_sender_matching() {
-        let trusted = vec!["soc.hinet.net".to_string(), "internal.corp".to_string()];
+        let trusted = vec![
+            "soc.hinet.net".to_string(),
+            "internal.corp".to_string(),
+            "hinet.net".to_string(),
+        ];
+        // 完全匹配
         assert_eq!(
             is_trusted_sender("Hinet SOC 病毒回報 <soc-report@soc.hinet.net>", &trusted),
             Some("soc.hinet.net".to_string())
         );
+        // 大小寫不敏感與子網域匹配
         assert_eq!(
             is_trusted_sender("Service <notice@HiNet.Net>", &["hinet.net".to_string()]),
             Some("hinet.net".to_string())
         );
         assert_eq!(
+            is_trusted_sender("Alert <notify@sub.hinet.net>", &["hinet.net".to_string()]),
+            Some("hinet.net".to_string())
+        );
+        // 設定帶有 @ 前綴之信任網域
+        assert_eq!(
+            is_trusted_sender("Service <admin@corp.com>", &["@corp.com".to_string()]),
+            Some("@corp.com".to_string())
+        );
+        // 外部不相干網域
+        assert_eq!(
             is_trusted_sender("Attacker <evil@phishing.com>", &trusted),
             None
+        );
+        // 攻擊場景 1：包含信任網域字串之相似網域（不得命中！）
+        assert_eq!(
+            is_trusted_sender("Attacker <evil@evil-hinet.net>", &trusted),
+            None
+        );
+        assert_eq!(
+            is_trusted_sender("Attacker <evil@hinet.net.attacker.com>", &trusted),
+            None
+        );
+        // 攻擊場景 2：顯示名稱內含信任網域名稱（不得命中！）
+        assert_eq!(
+            is_trusted_sender("\"hinet.net\" <attacker@phishing-server.com>", &trusted),
+            None
+        );
+        assert_eq!(
+            is_trusted_sender("Hinet Support (hinet.net) <fake@badguy.org>", &trusted),
+            None
+        );
+    }
+
+    #[test]
+    fn test_brand_spoofing_word_boundary() {
+        let config = bare_config();
+
+        // 正常郵件：Google Groups（包含 ups 子字串），發信網域 google.com 不應被誤判為 UPS 品牌偽裝
+        let (score_groups, reasons_groups) = phishing_score(
+            "Google Groups <groups-noreply@google.com>",
+            "Weekly Digest",
+            "Here is your update",
+            &[],
+            &[],
+            &[],
+            &config,
+        );
+        assert!(
+            !reasons_groups.iter().any(|r| r.contains("品牌偽裝")),
+            "Google Groups 不應被誤判為 UPS 品牌偽裝，得分理由：{reasons_groups:?}"
+        );
+        assert_eq!(score_groups, 0);
+
+        // 真正偽造 UPS：顯示名稱獨立出現 UPS，但網域為 attacker.com -> 應觸發品牌偽裝
+        let (score_ups, reasons_ups) = phishing_score(
+            "UPS Express Tracking <tracking@attacker.com>",
+            "Your package is arriving",
+            "Click here to track",
+            &[],
+            &[],
+            &[],
+            &config,
+        );
+        assert!(
+            reasons_ups
+                .iter()
+                .any(|r| r.contains("品牌偽裝：顯示名稱含 ups")),
+            "UPS 顯示名稱偽裝應被偵測，實際得分理由：{reasons_ups:?}"
+        );
+        assert!(score_ups >= 3);
+    }
+
+    #[test]
+    fn test_check_auth_status_outer_pass_not_polluted_by_inner_fail() {
+        // 第一層（最外層 MTA）判定 dmarc=pass，第二層（轉寄節點）殘留 dmarc=fail
+        let raw = concat!(
+            "From: friend@example.com\r\n",
+            "Authentication-Results: mx.mycompany.com; dkim=pass; spf=pass; dmarc=pass\r\n",
+            "Authentication-Results: forwarder.com; dmarc=fail\r\n\r\n",
+            "Hello, this is a forwarded email.\r\n"
+        );
+        let mail = mailparse::parse_mail(raw.as_bytes()).unwrap();
+        let status = check_auth_status(&mail);
+        assert_eq!(status.dmarc.as_deref(), Some("pass"));
+        assert!(
+            status.warnings.is_empty(),
+            "外層 pass 時不應被後續轉發節點的 fail 污染產生警告，實際 warnings: {:?}",
+            status.warnings
         );
     }
 
