@@ -166,12 +166,60 @@ fn load_app_icon() -> Result<(Vec<u8>, u32, u32)> {
     Ok((img.into_raw(), width, height))
 }
 
-/// 設定檔完整路徑：與執行檔同目錄（避免捷徑／排程器啟動時 CWD 不同而找不到設定）。
+/// 判斷應用程式的資料儲存目錄：
+/// 1. 若當前執行檔同目錄下已存在 config.toml（如可攜模式、開發偵錯），優先以執行檔所在目錄為基準。
+/// 2. 在 macOS 環境且處於 .app bundle 內部時，改用標準使用者目錄：
+///    ~/Library/Application Support/AntiPhishing/
+/// 3. 其他情況回退至執行檔所在目錄。
+fn app_base_dir() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            // 若執行檔旁邊已經有 config.toml，直接使用該目錄（優先支援本機開發或可攜模式）
+            let local_config = exe_dir.join(CONFIG_FILE_NAME);
+            if local_config.is_file() {
+                return exe_dir.to_path_buf();
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                // 若位於 macOS App Bundle 內部（.../Contents/MacOS）
+                let path_str = exe_path.to_string_lossy();
+                if path_str.contains(".app/Contents/MacOS") {
+                    if let Ok(home) = std::env::var("HOME") {
+                        let app_support =
+                            PathBuf::from(home).join("Library/Application Support/AntiPhishing");
+                        let _ = fs::create_dir_all(&app_support);
+                        return app_support;
+                    }
+                }
+            }
+
+            return exe_dir.to_path_buf();
+        }
+    }
+    PathBuf::from(".")
+}
+
+/// 設定檔完整路徑：支援本機開發模式與 macOS App Bundle（儲存於 Application Support）。
 fn config_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join(CONFIG_FILE_NAME)))
-        .unwrap_or_else(|| PathBuf::from(CONFIG_FILE_NAME))
+    let base = app_base_dir();
+    let config = base.join(CONFIG_FILE_NAME);
+
+    #[cfg(target_os = "macos")]
+    if !config.exists() {
+        // 若在 macOS .app 中且 ~/Library/Application Support/AntiPhishing/config.toml 尚不存在，
+        // 嘗試自 App Bundle 內的 Resources 複製 config.example.toml 作為起始範本
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(bundle_dir) = exe_path.parent().and_then(|p| p.parent()) {
+                let template = bundle_dir.join("Resources").join("config.example.toml");
+                if template.is_file() {
+                    let _ = fs::copy(&template, &config);
+                }
+            }
+        }
+    }
+
+    config
 }
 
 // ===== 掃描進度檔（scan_state.toml）：跨重啟記住檢查斷點，避免重複檢查信件 =====
@@ -207,12 +255,9 @@ struct LastScanState {
     pending_moves: Vec<PendingMoveItem>,
 }
 
-/// 進度檔完整路徑：與執行檔同目錄。
+/// 進度檔完整路徑：存於應用程式資料目錄下。
 fn scan_state_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join("scan_state.toml")))
-        .unwrap_or_else(|| PathBuf::from("scan_state.toml"))
+    app_base_dir().join("scan_state.toml")
 }
 
 /// 讀取掃描進度檔；檔案不存在＝Ok(None)，解析失敗＝Err（呼叫端轉為警告並全量重掃）。
@@ -241,12 +286,11 @@ struct LogEntry {
     line: String,
 }
 
-/// 日誌目錄：執行檔所在目錄下的 logs/（.gitignore 已涵蓋 *.log 與 logs/）。
+/// 日誌目錄：存於應用程式資料目錄下的 logs/（.gitignore 已涵蓋 *.log 與 logs/）。
 fn log_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join("logs")))
-        .unwrap_or_else(|| PathBuf::from("logs"))
+    let dir = app_base_dir().join("logs");
+    let _ = fs::create_dir_all(&dir);
+    dir
 }
 
 /// 每日日誌檔名：`YYYY-MM-DD.log`。
@@ -1734,15 +1778,15 @@ impl App {
         ui.add_space(6.0);
         ui.checkbox(
             &mut self.config.gui.minimize_to_tray,
-            "關閉視窗時縮小至 Windows 系統匣",
+            "關閉視窗時縮小至系統匣／選單列",
         );
         ui.checkbox(
             &mut self.config.gui.hide_taskbar_when_minimized,
-            "縮小至系統匣時隱藏工作列項目",
+            "縮小至系統匣／選單列時隱藏工作列／Dock 項目",
         );
         ui.checkbox(
             &mut self.config.gui.start_minimized_to_tray,
-            "啟動時直接縮小至 Windows 系統匣（下次啟動生效）",
+            "啟動時直接縮小至系統匣／選單列（下次啟動生效）",
         );
         ui.checkbox(
             &mut self.config.gui.confirm_before_move,
@@ -1924,30 +1968,243 @@ fn apply_configured_font(ctx: &egui::Context, requested: &str) -> String {
     format!("已套用字型「{font_name}」。")
 }
 
+/// 將路徑開頭的 `~` 展開為使用者的家目錄路徑
+fn expand_tilde(path_str: &str) -> PathBuf {
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path_str)
+}
+
+#[cfg(target_os = "macos")]
+/// 於 macOS 系統搜尋蘋方字型（PingFang.ttc）
+fn find_macos_pingfang() -> Option<PathBuf> {
+    let direct = Path::new("/System/Library/Fonts/PingFang.ttc");
+    if direct.is_file() {
+        return Some(direct.to_path_buf());
+    }
+    // 現代 macOS 將 PingFang 存放於 AssetsV2 目錄中
+    let assets_dir = Path::new("/System/Library/AssetsV2");
+    if let Ok(entries) = fs::read_dir(assets_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_string_lossy()
+                .starts_with("com_apple_MobileAsset_Font")
+            {
+                if let Ok(sub_entries) = fs::read_dir(entry.path()) {
+                    for sub in sub_entries.flatten() {
+                        let pingfang = sub.path().join("AssetData").join("PingFang.ttc");
+                        if pingfang.is_file() {
+                            return Some(pingfang);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_font(requested: &str) -> Option<(String, Vec<u8>)> {
     let requested = requested.trim();
-    let mut candidates = if Path::new(requested).is_file() {
-        vec![(requested.to_owned(), requested.to_owned())]
-    } else if requested.eq_ignore_ascii_case("noto sans tc") {
-        vec![(
-            "Noto Sans TC".into(),
-            r"C:\Windows\Fonts\NotoSansTC-VF.ttf".into(),
-        )]
-    } else if requested.eq_ignore_ascii_case("microsoft jhenghei") || requested == "微軟正黑體"
-    {
-        vec![(
-            "Microsoft JhengHei".into(),
-            r"C:\Windows\Fonts\msjh.ttc".into(),
-        )]
+    let expanded = expand_tilde(requested);
+    let mut candidates: Vec<(String, PathBuf)> = if expanded.is_file() {
+        vec![(requested.to_owned(), expanded)]
     } else {
         Vec::new()
     };
-    // 指定字型不存在時，退回系統內建的繁體中文字型，避免中文顯示為方框
-    candidates.push((
-        "Microsoft JhengHei".into(),
-        r"C:\Windows\Fonts\msjh.ttc".into(),
-    ));
-    candidates.push(("DFKai-SB".into(), r"C:\Windows\Fonts\kaiu.ttf".into()));
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home_path = Path::new(&home);
+
+    if requested.eq_ignore_ascii_case("noto sans tc") || requested == "思源黑體" {
+        candidates.push((
+            "Noto Sans TC".into(),
+            home_path.join("Library/Fonts/NotoSansTC-Regular.otf"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            home_path.join("Library/Fonts/NotoSansTC-VF.ttf"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            PathBuf::from("/Library/Fonts/NotoSansTC-Regular.otf"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            PathBuf::from("/Library/Fonts/NotoSansTC-VF.ttf"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            PathBuf::from(r"C:\Windows\Fonts\NotoSansTC-VF.ttf"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ));
+    } else if requested.eq_ignore_ascii_case("pingfang")
+        || requested.eq_ignore_ascii_case("pingfang tc")
+        || requested == "蘋方"
+        || requested == "苹方"
+    {
+        #[cfg(target_os = "macos")]
+        if let Some(pf) = find_macos_pingfang() {
+            candidates.push(("PingFang".into(), pf));
+        }
+        candidates.push((
+            "PingFang".into(),
+            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+        ));
+    } else if requested.eq_ignore_ascii_case("microsoft jhenghei") || requested == "微軟正黑體"
+    {
+        candidates.push((
+            "Microsoft JhengHei".into(),
+            PathBuf::from(r"C:\Windows\Fonts\msjh.ttc"),
+        ));
+        candidates.push((
+            "Microsoft JhengHei".into(),
+            home_path.join("Library/Fonts/msjh.ttc"),
+        ));
+        candidates.push((
+            "Microsoft JhengHei".into(),
+            PathBuf::from("/Library/Fonts/msjh.ttc"),
+        ));
+    } else if requested.eq_ignore_ascii_case("stheiti")
+        || requested.eq_ignore_ascii_case("heiti")
+        || requested == "黑體"
+        || requested == "華文黑體"
+    {
+        candidates.push((
+            "STHeiti".into(),
+            PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
+        ));
+        candidates.push((
+            "STHeiti".into(),
+            PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
+        ));
+    } else if requested.eq_ignore_ascii_case("songti")
+        || requested == "宋體"
+        || requested == "華文宋體"
+    {
+        candidates.push((
+            "Songti".into(),
+            PathBuf::from("/System/Library/Fonts/Supplemental/Songti.ttc"),
+        ));
+    } else if requested.eq_ignore_ascii_case("hiragino sans gb") || requested == "冬青黑體" {
+        candidates.push((
+            "Hiragino Sans GB".into(),
+            PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        ));
+    } else if requested.eq_ignore_ascii_case("arial unicode")
+        || requested.eq_ignore_ascii_case("arial unicode ms")
+    {
+        candidates.push((
+            "Arial Unicode".into(),
+            PathBuf::from("/Library/Fonts/Arial Unicode.ttf"),
+        ));
+        candidates.push((
+            "Arial Unicode".into(),
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        ));
+        candidates.push((
+            "Arial Unicode".into(),
+            PathBuf::from(r"C:\Windows\Fonts\ARIALUNI.TTF"),
+        ));
+    } else if requested.eq_ignore_ascii_case("dfkai-sb")
+        || requested.eq_ignore_ascii_case("kaiu")
+        || requested == "標楷體"
+    {
+        candidates.push((
+            "DFKai-SB".into(),
+            PathBuf::from(r"C:\Windows\Fonts\kaiu.ttf"),
+        ));
+        candidates.push(("DFKai-SB".into(), home_path.join("Library/Fonts/kaiu.ttf")));
+    }
+
+    // 指定字型不存在時，依作業系統環境退回系統內建的繁體中文字型，避免中文顯示為方框
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push((
+            "Noto Sans TC".into(),
+            home_path.join("Library/Fonts/NotoSansTC-Regular.otf"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            PathBuf::from("/Library/Fonts/NotoSansTC-Regular.otf"),
+        ));
+        if let Some(pf) = find_macos_pingfang() {
+            candidates.push(("PingFang".into(), pf));
+        }
+        candidates.push((
+            "PingFang".into(),
+            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+        ));
+        candidates.push((
+            "STHeiti".into(),
+            PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
+        ));
+        candidates.push((
+            "STHeiti".into(),
+            PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
+        ));
+        candidates.push((
+            "Hiragino Sans GB".into(),
+            PathBuf::from("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        ));
+        candidates.push((
+            "Songti".into(),
+            PathBuf::from("/System/Library/Fonts/Supplemental/Songti.ttc"),
+        ));
+        candidates.push((
+            "Arial Unicode".into(),
+            PathBuf::from("/Library/Fonts/Arial Unicode.ttf"),
+        ));
+        candidates.push((
+            "Microsoft JhengHei".into(),
+            home_path.join("Library/Fonts/msjh.ttc"),
+        ));
+        candidates.push(("DFKai-SB".into(), home_path.join("Library/Fonts/kaiu.ttf")));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        candidates.push((
+            "Noto Sans TC".into(),
+            PathBuf::from(r"C:\Windows\Fonts\NotoSansTC-VF.ttf"),
+        ));
+        candidates.push((
+            "Microsoft JhengHei".into(),
+            PathBuf::from(r"C:\Windows\Fonts\msjh.ttc"),
+        ));
+        candidates.push((
+            "DFKai-SB".into(),
+            PathBuf::from(r"C:\Windows\Fonts\kaiu.ttf"),
+        ));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        candidates.push((
+            "Noto Sans CJK".into(),
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ));
+        candidates.push((
+            "Noto Sans CJK".into(),
+            PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansTC-Regular.otf"),
+        ));
+        candidates.push((
+            "Noto Sans TC".into(),
+            home_path.join(".local/share/fonts/NotoSansTC-Regular.otf"),
+        ));
+    }
+
     candidates
         .into_iter()
         .find_map(|(name, path)| fs::read(&path).ok().map(|bytes| (name, bytes)))
@@ -5271,5 +5528,82 @@ mod tests {
         assert!(summary.contains("DKIM: pass"));
         assert!(summary.contains("DMARC: pass"));
         assert!(summary.contains("TLS 傳輸加密: TLSv1.3"));
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let expanded = expand_tilde("~/Library/Fonts/test.ttf");
+            assert_eq!(
+                expanded,
+                PathBuf::from(&home).join("Library/Fonts/test.ttf")
+            );
+        }
+        let regular = expand_tilde("/Library/Fonts/test.ttf");
+        assert_eq!(regular, PathBuf::from("/Library/Fonts/test.ttf"));
+    }
+
+    #[test]
+    fn test_find_font_cross_platform() {
+        // 預設字型 "Noto Sans TC" 應能在具備中文字型的系統上成功找到（或自動退回系統繁中字型）
+        let font_opt = find_font(&default_font_family());
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(
+                font_opt.is_some(),
+                "在桌面系統上應能找到預設字型或退回系統繁中字型"
+            );
+            let (name, bytes) = font_opt.unwrap();
+            assert!(!name.is_empty());
+            assert!(!bytes.is_empty());
+        }
+
+        // 不存在的字型應退回到系統內建繁中字型，絕不應返回 None（避免豆腐塊）
+        let fallback_opt = find_font("CompletelyNonExistentFont9999");
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(
+                fallback_opt.is_some(),
+                "不存在的字型名稱應自動退回系統繁體中文字型"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_configured_font_and_cjk_rendering() {
+        let ctx = egui::Context::default();
+        let status = apply_configured_font(&ctx, &default_font_family());
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(
+                status.contains("已套用字型"),
+                "預期套用成功，但得到：{status}"
+            );
+
+            let mut label_width = 0.0;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let resp = ui.label("繁體中文防釣魚軟體測試");
+                    label_width = resp.rect.width();
+                });
+            });
+            assert!(
+                label_width > 0.0,
+                "中文字元應能正常測量與渲染，寬度需大於 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_app_base_dir_and_paths() {
+        let base = app_base_dir();
+        assert!(!base.as_os_str().is_empty());
+        let config = config_path();
+        assert!(config.ends_with(CONFIG_FILE_NAME));
+        let scan_state = scan_state_path();
+        assert!(scan_state.ends_with("scan_state.toml"));
+        let logs = log_dir();
+        assert!(logs.ends_with("logs"));
     }
 }

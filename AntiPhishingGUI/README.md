@@ -192,6 +192,24 @@ cargo build --release
 
 可直接執行的檔案是 `target\release\anti-phishing-gui.exe`。執行檔旁需要有 `config.toml`；若從其他工作目錄啟動，請先切換到執行檔所在目錄，或使用絕對路徑設定工作目錄。
 
+### macOS 原生應用程式（.app）一鍵製作與免 CLI 使用
+
+若要在 macOS 上以原生桌面 App 方式使用（免開啟終端機）：
+
+1. 於 `AntiPhishingGUI/` 目錄執行一鍵打包腳本：
+   ```bash
+   ./bundle_macos_app.sh
+   ```
+2. 腳本會自動完成編譯、組裝高畫質 App 圖示（`.icns`）、產生 `Info.plist` 與本機 ad-hoc 代碼簽名，並在當前目錄產生：
+   ```text
+   AntiPhishing.app
+   ```
+3. **免碰 CLI 使用**：
+   - 直接**雙擊 `AntiPhishing.app`** 或將其拖曳至系統「**應用程式 (Applications)**」資料夾。
+   - 首次開啟時，GUI 會自動打開「**設定**」介面引導您輸入 IMAP 帳號與密碼，按下「儲存設定」即可。
+   - 設定檔與掃描狀態將自動保存在 macOS 標準路徑：`~/Library/Application Support/AntiPhishing/config.toml`，升級替換 `.app` 亦不會遺失設定與日誌。
+
+
 ## 測試
 
 ```powershell

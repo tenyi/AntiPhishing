@@ -1,0 +1,28 @@
+# Rust 建置產物
+target/
+**/target/
+
+# 應用程式設定與執行期狀態檔（包含帳號密碼，嚴禁提交）
+config.toml
+**/config.toml
+scan_state.toml
+**/scan_state.toml
+*-instance-lock
+**/*-instance-lock
+
+# 執行日誌
+logs/
+**/logs/
+*.log
+**/*.log
+
+# macOS 系統檔與應用程式套件
+.DS_Store
+*.app/
+**/*.app/
+*.dmg
+**/*.dmg
+MiniMax.md
+**/MiniMax.md
+
+
