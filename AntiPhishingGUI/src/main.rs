@@ -2665,8 +2665,9 @@ static RE_MULTIPLE_NEWLINES: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\n{3,}").expect("固定正規表示式"));
 static RE_ANY_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"https?://").expect("固定正規表示式"));
+/// 連結主機名稱段含 @（如 https://paypal.com@evil.example/），路徑與參數中的 @ 不算
 static RE_LINK_WITH_AT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"https?://[^\s]*@").expect("固定正規表示式"));
+    LazyLock::new(|| Regex::new(r"https?://[^\s/?#]*@").expect("固定正規表示式"));
 static RE_QR_IMAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"img[^>]*alt=["'][^"']*qr"#).expect("固定正規表示式"));
 static RE_THINKING_TAGS: LazyLock<Regex> = LazyLock::new(|| {
@@ -6078,6 +6079,20 @@ mod tests {
         let bad = format!("Authentication-Results: i=1; spf=fail; dmarc=fail\r\n{ok}");
         let ev = evaluate_mail(bad.as_bytes(), &config, &None, &mut failures).unwrap();
         assert_ne!(ev.basis, "信任寄件者豁免");
+    }
+
+    #[test]
+    fn link_with_at_only_flags_userinfo_obfuscation() {
+        // 真正的混淆手法：@ 在主機名稱段，瀏覽器實際連到 evil.example
+        assert!(RE_LINK_WITH_AT.is_match("https://paypal.com@evil.example/login"));
+        assert!(RE_LINK_WITH_AT.is_match("http://user:pw@evil.example"));
+        // 垃圾信閘道明細的連結：@ 只出現在路徑或參數中，不是偽裝網域
+        assert!(
+            !RE_LINK_WITH_AT
+                .is_match("https://mxs.mailcloud.com.tw/mg-cgi/mail_read?MAILBOX=@.spam&MSG=X")
+        );
+        assert!(!RE_LINK_WITH_AT.is_match("https://a.example/u/a@b.example"));
+        assert!(!RE_LINK_WITH_AT.is_match("https://a.example#x@y"));
     }
 
     #[test]
