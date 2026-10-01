@@ -119,8 +119,12 @@ api_key = ""
 # backend = "jev"
 # base_url = "https://api.typesafe.ai"  # 選填，預設 https://api.typesafe.ai
 # model = "jev-latest"                  # 選填，預設 jev-latest
-# api_key = "sk-..."                   # 必填
+# api_key = "sk-..."                   # 雲端 Jev 必填；地端 Nimble 可留空
 # jev_max_score = 10                    # Jev 分數換算上限（預設 10；機率 <0.6 不計分，0.6~1.0 線性換算）
+# [地端 Ollama Nimble（相容 Jev；ollama pull nimble）]
+# backend = "jev"
+# base_url = "http://127.0.0.1:11434"  # 必填；host、.../v1 皆可
+# model = "nimble"                    # 以 nimble 開頭即免 api_key
 
 # [共用設定]
 # 模型名稱。CLI 模式留空則自動使用該 CLI 預設模型；亦可明確指定（如 "claude-3-7-sonnet"、"o3-mini"）

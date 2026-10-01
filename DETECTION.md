@@ -141,7 +141,7 @@ flowchart TD
 ### 5.2 TypeSafe Jev (System One) 混合評分制
 在 `backend = "jev"` 模式下，AntiPhishing 不採取「100% 聽從單一模型」的二分法，而是採用**混合評分制度（Composite Scoring）**：
 
-1. **Jev 機率判定**：
+1. **Jev 機率判定**（可接 TypeSafe 雲端，或 `model = "nimble"` 時接地端 Ollama Nimble；兩者介面與換算門檻相同，Nimble 不需 api_key）：
    - 透過 TypeSafe Jev 的 `noul` primitive，詢問 `is_phishing` 機率 \( p \in [0.0, 1.0] \)。
 2. **換算分數公式**：
    - 當 \( p < 0.6 \)（未滿 60%）：不計分，\(\text{Jev 分數} = 0\)。
@@ -156,6 +156,27 @@ flowchart TD
 ### 5.3 資安通報與隔離明細排除標準
 在 System Prompt 與 Jev criteria 中明確注入了排除條件（Signal 5）：
 > 若郵件主旨或內文為企業資安通報、垃圾信隔離明細、防毒/SOC分析回報（如 Hinet SOC、防垃圾信通知等），且其安全驗證（SPF/DKIM/DMARC）通過或無偽造警示，即使內文引用被攔截之惡意網址或樣本，亦屬於正常資安服務通知，**不得判定為釣魚郵件（is_phishing 必須為 false）**。
+
+### 5.4 Nimble 與雲端 Jev 的差異與程式作法
+兩者共用同一個 `POST /v1/systemone`、同一個 `noul` 請求／回應格式與同一套 60% 門檻換算，差異只在**送出的問題內容**與**金鑰檢查**：
+
+| 項目 | 雲端 Jev（`model` 留空或 `jev-*`） | 地端 Nimble（`model` 以 `nimble` 開頭） |
+| :--- | :--- | :--- |
+| 金鑰 | 必填 `api_key` | 不檢查（Ollama 忽略 Bearer），但必填 `base_url` |
+| 問題內容 | `instructions` + `criteria`（含 5.3 的排除條件） | 僅 `instructions`，**不送 `criteria`** |
+| 排除規則位置 | 寫在 `criteria` | 寫在 `instructions` |
+
+**為何分開**：實測 Nimble（Qwen3.5-9B 微調）對 `criteria` 的遵循度不如雲端 Jev，會把 MailCloud 垃圾信隔離明細誤判為釣魚（97%）。且該類通知信常沒有 `Authentication-Results` 標頭，若排除規則要求「驗證通過」就無法生效。
+
+**程式作法**（CLI 與 GUI 相同）：
+- `is_nimble_model(model)`：`model` 去空白、轉小寫後以 `nimble` 開頭即為 Nimble。
+- `jev_question(model)`：Nimble 回傳 `NIMBLE_PHISHING_INSTRUCTIONS`（僅 `instructions`）；其他情況回傳原本的 `instructions` + `criteria`，雲端 Jev 請求內容不變。
+- Nimble 指示語（B3 方案）判斷「這封郵件本身」是否為釣魚，並同時含正反條件：
+  1. 閘道／稽核系統自動產生的垃圾信隔離明細，且連結網域與寄件網域一致 → 視為正常（否）。
+  2. 偽造隔離／稽核通知而要求輸入帳密、網域不一致或可疑、或驗證失敗 → 仍為釣魚（是）。
+  3. 以 IT／郵件／帳號安全名義宣稱「信箱發生錯誤、需驗證」並催促點擊，但寄件網域與收件者單位無關 → 釣魚（是），即使 SPF/DKIM/DMARC 通過（通過只代表寄件網域未被偽造，如被盜用的合法網站寄出的釣魚信）。
+- 實測（`10.10.15.151`）：真實隔離明細 0.962 → 0.069；DHL 釣魚 0.990 → 0.991；偽造隔離通知 0.954 → 0.843；一般會議信 0.006。樣本數少，可能過擬合，請以更多信件持續驗證。
+- 限制：郵件 HTML 轉純文字後連結網域可能遺失，網域一致性判斷未必每次可用。
 
 ---
 

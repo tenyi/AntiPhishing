@@ -78,7 +78,7 @@ max_chars = 6000              # 郵件內文最大字元數
 
 | 後端 (`backend`) | 依賴工具 | 必要欄位 | 可選欄位 | 特性說明 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`jev`** | TypeSafe Jev API | `backend = "jev"`, `api_key` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，依比例換算為 0~jev_max_score 分數（未滿 60% 不計分，60%~100% 線性換算）並與規則分數加總判定（混合評分制）。 |
+| **`jev`** | TypeSafe Jev API | `backend = "jev"`；雲端需 `api_key`，地端 Nimble 需 `model = "nimble"` + `base_url` | `base_url`, `model`, `jev_max_score`, `timeout_secs`, `max_chars` | 呼叫 TypeSafe System One API 取得 0.0~1.0 機率，依比例換算為 0~jev_max_score 分數（未滿 60% 不計分，60%~100% 線性換算）並與規則分數加總判定（混合評分制）。 |
 | **`claude`** | Claude Code (`claude`) | `backend = "claude"` | `model`, `timeout_secs`, `max_chars` | 自動以 `-p --tools "" --output-format text` 執行，**直接使用本機已登入的 Claude 憑據**，免開本機 API Server、免設定 API Key。 |
 | **`agy`** | Antigravity CLI (`agy`) | `backend = "agy"` | `model`, `timeout_secs`, `max_chars` | 自動以 `--output-format text --disable-slash-commands` 執行，**直接使用本機已登入的 agy 憑據**，停用斜線指令。 |
 | **`codex`** | OpenAI Codex CLI (`codex`) | `backend = "codex"` | `model`, `timeout_secs`, `max_chars` | 自動以 `exec --skip-git-repo-check --ephemeral --color never -s read-only -` 執行，沙箱唯讀不儲存 session。 |
@@ -154,6 +154,17 @@ api_key = "sk-typesafe-..."              # 必填：TypeSafe API Key
 jev_max_score = 10                       # Jev 換算分數上限（預設 10；機率 <0.6 不計分，0.6~1.0 線性換算）
 timeout_secs = 120
 max_chars = 6000
+```
+
+#### 7. 使用地端 Ollama Nimble (`backend = "jev"`，`model = "nimble"`)
+Nimble 相容 Jev 的 System One 介面，先執行 `ollama pull nimble`。`model` 以 `nimble` 開頭即視為地端 Nimble：不檢查 `api_key`，但必須填 `base_url`；`model` 留空則為雲端 Jev（需 `api_key`）。門檻與評分換算與 Jev 相同；差異是 Nimble 只送 `instructions`（不送 `criteria`，並內建垃圾信隔離明細排除條件），細節見根目錄 `DETECTION.md` §5.4：
+```toml
+[llm]
+backend = "jev"
+base_url = "http://127.0.0.1:11434"      # 填 host、.../v1、.../v1/systemone 皆可
+model = "nimble"
+jev_max_score = 10
+timeout_secs = 120                       # 首次載入 9B 模型較慢，必要時調高
 ```
 
 > **注意**：

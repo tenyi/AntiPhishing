@@ -1659,7 +1659,7 @@ impl App {
                         "agy" => "Antigravity CLI (agy)",
                         "codex" => "OpenAI Codex CLI (codex)",
                         "command" => "自訂命令列 (command)",
-                        "jev" => "TypeSafe Jev API (jev)",
+                        "jev" => "TypeSafe Jev / Ollama Nimble (jev)",
                         _ => "OpenAI 相容 HTTP API (api)",
                     })
                     .show_ui(ui, |ui| {
@@ -1686,7 +1686,7 @@ impl App {
                         ui.selectable_value(
                             &mut current_backend,
                             "jev".into(),
-                            "TypeSafe Jev API (jev)",
+                            "TypeSafe Jev / Ollama Nimble (jev)",
                         );
                         ui.selectable_value(
                             &mut current_backend,
@@ -1748,7 +1748,7 @@ impl App {
                 ui.small("✔ 使用 OpenAI 相容 API：支援 Ollama / LM Studio 或雲端服務；地端免認證模型 API 金鑰可留空。");
             }
             Some(LlmBackend::Jev) => {
-                ui.small("✔ 使用 TypeSafe Jev API (System One)：採混合評分制，Jev 評定釣魚機率換算為 0~分數上限並與安全規則加總判定；API 金鑰為必填。");
+                ui.small("✔ 使用 TypeSafe Jev API (System One)：採混合評分制，Jev 評定釣魚機率換算為 0~分數上限並與安全規則加總判定；雲端 Jev 需 API 金鑰，地端 Ollama Nimble 請將模型名稱填 nimble、網址填 http://127.0.0.1:11434，金鑰可留空。");
             }
             None => {
                 ui.small("⚠ LLM 判定未啟用（若欲使用請選擇 CLI 後端或填入 API 伺服器網址）。未啟用時不會搬移任何郵件。");
@@ -2388,7 +2388,12 @@ fn llm_config(config: &Config) -> Option<LlmConfig> {
             // CLI 模式已指定 backend 即為有效，model 為可選
         }
         LlmBackend::Jev => {
-            if config.llm.api_key.trim().is_empty() {
+            if is_nimble_model(&config.llm.model) {
+                // 地端 Nimble：不檢查金鑰，但必須指定 base_url（避免誤送雲端）
+                if config.llm.base_url.trim().is_empty() {
+                    return None;
+                }
+            } else if config.llm.api_key.trim().is_empty() {
                 return None;
             }
         }
@@ -2848,12 +2853,49 @@ fn parse_jev_probability(val: &serde_json::Value) -> Result<f64> {
     if let Some(noul) = answer.get("noul").and_then(|n| n.as_f64()) {
         return Ok(noul.clamp(0.0, 1.0));
     }
-    if let Some(score) = answer.get("score").and_then(|s| s.as_f64()) {
-        return Ok(score.clamp(0.0, 1.0));
-    }
     bail!("Jev 回應 answers.is_phishing 缺少有效的 noul 機率數值：{val}")
 }
 
+/// 判斷 model 是否為地端 Nimble（nimble 或 nimble:latest 等，不分大小寫）。
+fn is_nimble_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("nimble")
+}
+
+/// 組出 System One 端點：base_url 寫 host、.../v1 或 .../v1/systemone 皆可；空值用官方雲端。
+fn jev_endpoint(base_url: &str) -> String {
+    let mut base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        base = "https://api.typesafe.ai";
+    }
+    // 依序去掉結尾的 /v1/systemone 與 /v1，避免重複拼接
+    base = base.strip_suffix("/v1/systemone").unwrap_or(base);
+    base = base.trim_end_matches('/');
+    base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/v1/systemone")
+}
+
+/// Nimble 專用問句（實測 B3）：Nimble 不太參考 criteria，排除條件必須寫進 instructions，
+/// 否則郵件稽核系統產生的「垃圾信隔離明細」會被誤判為釣魚；偽裝成通知的釣魚仍須判為是。
+const NIMBLE_PHISHING_INSTRUCTIONS: &str = "判斷「這封郵件本身」是否為寄給收件者的釣魚、詐騙或惡意推銷信。釣魚信的典型特徵：以系統管理員、IT、郵件服務或帳號安全的名義，宣稱收件者信箱「發生錯誤」「容量已滿」「將被停用」「需要驗證」，並催促點擊按鈕或連結（如「立即驗證」），而寄件網域與收件者所屬單位或該服務無關（例如政府、學校或陌生網站的網域）。此類信件即使 SPF/DKIM/DMARC 通過（通過只代表寄件網域沒被偽造，不代表內容可信），仍是釣魚，答案為是。例外：若這封信是郵件稽核／閘道系統自動產生的垃圾信隔離明細或攔截通報（內文只是列出被攔截的信件、過濾原因與處理選項，如「SPF 驗證失敗」「RBL」只是描述被攔截的那些信），且其中連結的網域與寄件者網域一致，它本身是正常的系統通知，答案為否；但若這類通知要求輸入帳號密碼、連結網域與寄件者不符或寄件網域可疑，則仍是釣魚。";
+
+/// 組出 is_phishing 問句：Nimble 用 instructions 內含排除條件的版本，雲端 Jev 維持原寫法。
+fn jev_question(model: &str) -> serde_json::Value {
+    if is_nimble_model(model) {
+        serde_json::json!({
+            "type": "noul",
+            "instructions": NIMBLE_PHISHING_INSTRUCTIONS
+        })
+    } else {
+        serde_json::json!({
+            "type": "noul",
+            "instructions": "判斷此郵件是否為釣魚、詐欺、詐騙郵件，或未經請求的惡意行銷廣告、垃圾推銷、仿冒知名品牌之垃圾廣告郵件？",
+            "criteria": {
+                "true": "符合釣魚、詐欺、要求帳密/款項、偽裝機構品牌、異常附件追蹤或惡意促銷垃圾信",
+                "false": "正常商務或私人溝通往來郵件；或安全驗證通過且來源正常的資安通報、垃圾信隔離明細、防毒/SOC回報郵件"
+            }
+        })
+    }
+}
 /// 依 Jev 釣魚機率換算為分數：
 /// - 0.6 (60%) 以下不計分 (0分)
 /// - 0.6 ~ 1.0 依比例線性換算為 0 ~ max_score
@@ -2877,17 +2919,12 @@ fn llm_judge_jev(
     auth_summary: &str,
     auth_warnings: &[String],
 ) -> Result<f64> {
-    let base_url = if config.base_url.trim().is_empty() {
-        "https://api.typesafe.ai"
-    } else {
-        config.base_url.trim().trim_end_matches('/')
-    };
     let model = if config.model.trim().is_empty() {
         "jev-latest"
     } else {
         config.model.trim()
     };
-    let url = format!("{base_url}/v1/systemone");
+    let url = jev_endpoint(&config.base_url);
 
     let user_content = llm_user_prompt(
         from,
@@ -2904,14 +2941,7 @@ fn llm_judge_jev(
         "state": user_content,
         "model": model,
         "questions": {
-            "is_phishing": {
-                "type": "noul",
-                "instructions": "判斷此郵件是否為釣魚、詐欺、詐騙郵件，或未經請求的惡意行銷廣告、垃圾推銷、仿冒知名品牌之垃圾廣告郵件？",
-                "criteria": {
-                    "true": "符合釣魚、詐欺、要求帳密/款項、偽裝機構品牌、異常附件追蹤或惡意促銷垃圾信",
-                    "false": "正常商務或私人溝通往來郵件；或安全驗證通過且來源正常的資安通報、垃圾信隔離明細、防毒/SOC回報郵件"
-                }
-            }
+            "is_phishing": jev_question(model)
         }
     });
 
@@ -2950,8 +2980,13 @@ fn llm_judge_jev(
             .body_mut()
             .read_to_string()
             .unwrap_or_else(|_| "(無法讀取回應內文)".into());
+        let hint = if status.as_u16() == 404 {
+            "（若為 Ollama，請確認已執行 ollama pull nimble 且版本支援 /v1/systemone）"
+        } else {
+            ""
+        };
         bail!(
-            "Jev 伺服器回傳錯誤 (HTTP {})：{}",
+            "Jev 伺服器回傳錯誤 (HTTP {})：{}{hint}",
             status.as_u16(),
             err_body
         );
@@ -5470,10 +5505,100 @@ mod tests {
                 }
             }
         });
-        let score_prob = parse_jev_probability(&json_score).expect("應支援 score 備援");
-        assert!((score_prob - 0.72).abs() < 1e-6);
+        // score 為層級加權索引而非機率，不可當作備援
+        assert!(parse_jev_probability(&json_score).is_err());
     }
 
+    #[test]
+    fn jev_endpoint_normalization() {
+        let expect = "http://127.0.0.1:11434/v1/systemone";
+        for base in &[
+            "http://127.0.0.1:11434",
+            "http://127.0.0.1:11434/",
+            "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1/",
+            "http://127.0.0.1:11434/v1/systemone",
+        ] {
+            assert_eq!(jev_endpoint(base), expect, "base_url = {base}");
+        }
+        assert_eq!(jev_endpoint(""), "https://api.typesafe.ai/v1/systemone");
+        assert_eq!(
+            jev_endpoint("https://api.typesafe.ai/"),
+            "https://api.typesafe.ai/v1/systemone"
+        );
+    }
+
+    #[test]
+    fn nimble_model_detection_and_config() {
+        assert!(is_nimble_model("nimble"));
+        assert!(is_nimble_model(" Nimble:latest "));
+        assert!(!is_nimble_model(""));
+        assert!(!is_nimble_model("jev-latest"));
+
+        let make = |llm: &str| -> Config {
+            toml::from_str(&format!(
+                r#"
+                [imap]
+                host = "imap.example.com"
+                port = 993
+                protocol = "imaps"
+                username = "u"
+                password = "p"
+                source_mailbox = "INBOX"
+                phishing_mailbox = "Spam"
+                [detection]
+                threshold = 5
+                [gui]
+                [llm]
+                backend = "jev"
+                {llm}
+                "#
+            ))
+            .unwrap()
+        };
+        // Nimble + base_url：免金鑰即有效
+        assert!(
+            llm_config(&make(
+                r#"model = "nimble"
+                base_url = "http://127.0.0.1:11434""#
+            ))
+            .is_some()
+        );
+        // Nimble 缺 base_url：無效（不得退回雲端）
+        assert!(llm_config(&make(r#"model = "nimble""#)).is_none());
+        // model 留空（Jev）仍須金鑰
+        assert!(llm_config(&make(r#"base_url = "http://127.0.0.1:11434""#)).is_none());
+    }
+
+    #[test]
+    fn parse_jev_probability_nimble_response() {
+        let resp = serde_json::json!({
+            "model": "nimble",
+            "answers": { "is_phishing": { "type": "noul", "noul": 0.997 } },
+            "usage": { "prompt_tokens": 10 }
+        });
+        assert!((parse_jev_probability(&resp).unwrap() - 0.997).abs() < 1e-9);
+        assert!(parse_jev_probability(&serde_json::json!({"answers": {}})).is_err());
+    }
+
+    #[test]
+    fn jev_question_differs_by_model() {
+        // Nimble：排除條件在 instructions，且不送 criteria
+        let nimble = jev_question("nimble");
+        assert!(nimble.get("criteria").is_none());
+        assert!(
+            nimble["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("垃圾信隔離明細")
+        );
+        // 雲端 Jev（含 model 留空）：維持原本帶 criteria 的寫法
+        for model in ["", "jev-latest"] {
+            let jev = jev_question(model);
+            assert!(jev.get("criteria").is_some(), "model = {model:?}");
+            assert_eq!(jev["type"], "noul");
+        }
+    }
     #[test]
     fn jev_composite_scoring_calculation() {
         let max_score = 5u32;
