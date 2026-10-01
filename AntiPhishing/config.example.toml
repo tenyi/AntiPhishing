@@ -14,6 +14,8 @@ threshold = 8
 suspicious_sender_domains = ["evil.example"]
 # 信任寄件網域白名單：若未發生 SPF/DMARC 偽造失敗則直接安全豁免（略過不送檢、不搬移）；若安全驗證失敗則取消豁免並告警送檢。
 trusted_sender_domains = ["company.example", "hinet.net"]
+# 信任來源 IP：只比對最上層 Received 標頭的來源 IP（完全相符），命中且驗證無失敗即豁免。只填內部郵件伺服器；切勿填郵件閘道（如 MailCloud）IP，否則所有外部信都會被放行。
+trusted_relay_ips = []
 suspicious_keywords = ["verify", "urgent", "password", "login", "帳戶", "驗證", "緊急", "密碼"]
 # Word 附件以外部圖片追蹤開啟行為時加分；預設 6。
 external_word_image_score = 6

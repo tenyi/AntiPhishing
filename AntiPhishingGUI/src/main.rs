@@ -70,6 +70,9 @@ struct DetectionConfig {
     suspicious_sender_domains: Vec<String>,
     #[serde(default)]
     trusted_sender_domains: Vec<String>,
+    /// 信任來源 IP：最上層 Received 標頭的來源 IP 完全相符即視為信任
+    #[serde(default)]
+    trusted_relay_ips: Vec<String>,
     #[serde(default = "default_keywords")]
     suspicious_keywords: Vec<String>,
     #[serde(default = "default_external_word_image_score")]
@@ -140,6 +143,7 @@ impl Default for Config {
                 threshold: 8,
                 suspicious_sender_domains: Vec::new(),
                 trusted_sender_domains: Vec::new(),
+                trusted_relay_ips: Vec::new(),
                 suspicious_keywords: default_keywords(),
                 external_word_image_score: 6,
             },
@@ -1919,6 +1923,12 @@ impl App {
         ui.add_space(6.0);
         multiline(
             ui,
+            "信任來源 IP（最上層 Received，每行一個）",
+            &mut self.config.detection.trusted_relay_ips,
+        );
+        ui.add_space(6.0);
+        multiline(
+            ui,
             "可疑關鍵字（每行一個）",
             &mut self.config.detection.suspicious_keywords,
         );
@@ -3380,9 +3390,7 @@ fn scan_mail(
             let auth_summary = auth_status.summary();
 
             // 白名單直接安全豁免檢查：若寄件來源符合 trusted_sender_domains，且安全驗證無失敗警告，直接豁免跳過
-            if let Some(matched) =
-                is_trusted_sender(&from, &config.detection.trusted_sender_domains)
-            {
+            if let Some(matched) = trusted_source(&mail, &from, &config.detection) {
                 if auth_warnings.is_empty() {
                     max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                     last_checked = Some((*date, uid, subject.clone()));
@@ -4181,6 +4189,47 @@ fn is_trusted_sender(from: &str, trusted_domains: &[String]) -> Option<String> {
         .map(|d| d.trim().to_string())
 }
 
+/// 取最上層 Received 標頭的來源 IP（此行由我方收信伺服器加上，寄件端無法竄改）
+///
+/// 優先取 from 段落中方括號內的 IP（伺服器實際看到的連線位址）；
+/// 沒有方括號時才取 from 後的第一個詞，且必須是合法 IP。
+/// from 後的名稱可能是寄件端 HELO 自報值，有方括號時一律不採用，避免偽造。
+fn top_received_ip(mail: &mailparse::ParsedMail<'_>) -> Option<std::net::IpAddr> {
+    let val = mail.headers.get_first_value("Received")?;
+    // 標頭可能折行，先將所有空白正規化為單一空格
+    let norm = val.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = norm.to_ascii_lowercase();
+    let rest = lower.strip_prefix("from ")?;
+    // 只看 from 段落（" by " 之後是收信伺服器自己的資訊）
+    let from_part = rest.split(" by ").next().unwrap_or(rest);
+    if let Some(start) = from_part.find('[') {
+        let inner = &from_part[start + 1..];
+        let end = inner.find(']')?;
+        // IPv6 可能寫成 [IPv6:2001:db8::1]
+        return inner[..end].trim_start_matches("ipv6:").parse().ok();
+    }
+    from_part.split_whitespace().next()?.parse().ok()
+}
+
+/// 檢查信件是否來自信任來源：先比對寄件網域，再比對最上層 Received 來源 IP
+///
+/// 回傳命中說明（供 log 顯示）；IP 只做完全比對，設定值無法解析為 IP 者忽略。
+fn trusted_source(
+    mail: &mailparse::ParsedMail<'_>,
+    from: &str,
+    detection: &DetectionConfig,
+) -> Option<String> {
+    if let Some(domain) = is_trusted_sender(from, &detection.trusted_sender_domains) {
+        return Some(domain);
+    }
+    let ip = top_received_ip(mail)?;
+    detection
+        .trusted_relay_ips
+        .iter()
+        .any(|s| s.trim().parse::<std::net::IpAddr>().ok() == Some(ip))
+        .then(|| format!("來源 IP {ip}"))
+}
+
 /// 收集所有附件檔名清單（供評分與 LLM 提示參考）
 fn extract_attachment_filenames(mail: &mailparse::ParsedMail<'_>) -> Vec<String> {
     let mut names = Vec::new();
@@ -4510,7 +4559,7 @@ fn evaluate_mail(
     };
 
     // 信任寄件者且驗證無失敗：與 IMAP 模式相同直接豁免（仍列出結果以便看出原因）
-    if let Some(matched) = is_trusted_sender(&from, &config.detection.trusted_sender_domains)
+    if let Some(matched) = trusted_source(&mail, &from, &config.detection)
         && auth_warnings.is_empty()
     {
         ev.llm_text = format!("未送檢（寄件來源在信任清單：{matched}）");
@@ -4970,6 +5019,7 @@ mod tests {
             threshold: 8,
             suspicious_sender_domains: Vec::new(),
             trusted_sender_domains: Vec::new(),
+            trusted_relay_ips: Vec::new(),
             suspicious_keywords: Vec::new(),
             external_word_image_score: 6,
         }
@@ -5983,6 +6033,53 @@ mod tests {
             assert_eq!(jev["type"], "noul");
         }
     }
+    #[test]
+    fn top_received_ip_only_trusts_server_observed_address() {
+        let ip = |raw: &str| top_received_ip(&mailparse::parse_mail(raw.as_bytes()).unwrap());
+        // 上級單位閘道格式：from 後直接是 IP
+        assert_eq!(
+            ip("Received: from 203.69.82.82\r\nReceived: By OpenMail Mailer\r\n\r\nb"),
+            Some("203.69.82.82".parse().unwrap())
+        );
+        // 有方括號時以伺服器實際看到的連線 IP 為準，HELO 自報的 IP 不可信
+        assert_eq!(
+            ip(
+                "Received: from 192.168.10.254 (evil.example [198.51.100.9])\r\n by mx.local; Thu\r\n\r\nb"
+            ),
+            Some("198.51.100.9".parse().unwrap())
+        );
+        // 只看最上層：下層的 Received 可由寄件端偽造
+        assert_eq!(
+            ip(
+                "Received: from mx.local ([10.0.0.1]) by a\r\nReceived: from 192.168.10.254\r\n\r\nb"
+            ),
+            Some("10.0.0.1".parse().unwrap())
+        );
+        // by 段落是收信端自身資訊，不得當作來源
+        assert_eq!(
+            ip("Received: from host.example by 192.168.10.254\r\n\r\nb"),
+            None
+        );
+        assert_eq!(ip("Subject: x\r\n\r\nb"), None);
+    }
+
+    #[test]
+    fn trusted_relay_ip_exempts_mail_unless_auth_fails() {
+        let config = eml_test_config("trusted_relay_ips = [\"192.168.10.254\"]");
+        let mut failures = 0;
+        let ok = "Received: from 192.168.10.254\r\nFrom: a@inside.test\r\nSubject: s\r\n\r\nverify password http://a http://b\r\n";
+        let ev = evaluate_mail(ok.as_bytes(), &config, &None, &mut failures).unwrap();
+        assert_eq!(ev.basis, "信任寄件者豁免");
+        // 不在清單內的 IP 照常評分
+        let other = ok.replace("192.168.10.254", "192.168.10.253");
+        let ev = evaluate_mail(other.as_bytes(), &config, &None, &mut failures).unwrap();
+        assert_ne!(ev.basis, "信任寄件者豁免");
+        // 驗證失敗時不豁免，與信任網域規則一致
+        let bad = format!("Authentication-Results: i=1; spf=fail; dmarc=fail\r\n{ok}");
+        let ev = evaluate_mail(bad.as_bytes(), &config, &None, &mut failures).unwrap();
+        assert_ne!(ev.basis, "信任寄件者豁免");
+    }
+
     #[test]
     fn jev_min_prob_is_configurable() {
         // 起算機率 0：0~100% 全程線性給分

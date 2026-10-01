@@ -140,6 +140,7 @@ timeout_secs = 120                       # 首次載入 9B 模型較慢，必要
 ### 判定流程與搬移確認
 
 - **白名單直接安全豁免**：寄件來源命中 `trusted_sender_domains` 且未發生 SPF/DMARC 偽造失敗者，直接豁免略過（不耗費 token、不送 LLM/Jev、不搬移）；若安全驗證失敗則取消白名單豁免並告警送檢。
+- **信任來源 IP**：`trusted_relay_ips` 比對最上層 `Received` 標頭的來源 IP（有方括號取方括號內的連線 IP，否則取 `from` 後的 IP），命中且驗證無失敗即同樣豁免。只填內部郵件伺服器；**勿填郵件閘道 IP**，外部信都經閘道進來，填了等於全部放行。
 - **安全驗證與傳輸加密資訊傳遞**：每封信件自動解析最外層受信邊界之 SPF、DKIM、DMARC 狀態與 TLS 加密，注入至 LLM 與 Jev Prompt，並指示模型對來源正常的資安通報或垃圾信隔離明細不予誤判。
 - **一般 LLM 模式（api / claude / agy / codex / command）**：每封信的內文連同寄件者、主旨送 LLM 判定；LLM 判定為「釣魚、詐欺、惡意行銷廣告或垃圾推銷」者列為待搬移（啟發式規則評分僅供 log 參考）。
 - **Jev 模式（jev，混合評分制）**：每封信送 TypeSafe Jev API 判定得到釣魚機率 \(p \in [0.0, 1.0]\)，未滿起算機率 `jev_min_prob`（預設 60%）不計分，\(\text{jev\_min\_prob} \sim 1.0\) 依比例換算為 \(0 \sim \text{jev\_max\_score}\) 分並與規則分數加總；總分達到 `threshold`（預設 8 分）者列為待搬移。這讓 Jev 做為其中一種分數共同評估，避免單一模型 100% 獨斷。
