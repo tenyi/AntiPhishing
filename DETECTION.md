@@ -144,7 +144,7 @@ flowchart TD
 1. **Jev 機率判定**（可接 TypeSafe 雲端，或 `model = "nimble"` 時接地端 Ollama Nimble；兩者介面與換算門檻相同，Nimble 不需 api_key）：
    - 透過 TypeSafe Jev 的 `noul` primitive，詢問 `is_phishing` 機率 \( p \in [0.0, 1.0] \)。
 2. **換算分數公式**：
-   - 當 \( p < 0.6 \)（未滿 60%）：不計分，\(\text{Jev 分數} = 0\)。
+   - 當 \( p < \text{jev\_min\_prob} \)（預設 0.6，即未滿 60%）：不計分，\(\text{Jev 分數} = 0\)。
    - 當 \( p \ge 0.6 \)：將 \( 0.6 \sim 1.0 \) 線性映射至 \( 0 \sim \text{jev\_max\_score} \)（預設 `jev_max_score = 10`）：
    $$\text{ratio} = \min\left(1.0, \frac{p - 0.6}{0.4}\right)$$
    $$\text{Jev 分數} = \text{round}(\text{ratio} \times \text{jev\_max\_score})$$
@@ -158,7 +158,7 @@ flowchart TD
 > 若郵件主旨或內文為企業資安通報、垃圾信隔離明細、防毒/SOC分析回報（如 Hinet SOC、防垃圾信通知等），且其安全驗證（SPF/DKIM/DMARC）通過或無偽造警示，即使內文引用被攔截之惡意網址或樣本，亦屬於正常資安服務通知，**不得判定為釣魚郵件（is_phishing 必須為 false）**。
 
 ### 5.4 Nimble 與雲端 Jev 的差異與程式作法
-兩者共用同一個 `POST /v1/systemone`、同一個 `noul` 請求／回應格式與同一套 60% 門檻換算，差異只在**送出的問題內容**與**金鑰檢查**：
+兩者共用同一個 `POST /v1/systemone`、同一個 `noul` 請求／回應格式與同一套起算機率（`jev_min_prob`，預設 60%）換算，差異只在**送出的問題內容**與**金鑰檢查**：
 
 | 項目 | 雲端 Jev（`model` 留空或 `jev-*`） | 地端 Nimble（`model` 以 `nimble` 開頭） |
 | :--- | :--- | :--- |

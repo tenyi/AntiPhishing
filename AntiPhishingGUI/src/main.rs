@@ -1846,6 +1846,13 @@ impl App {
                     ui.label("Jev 評分上限");
                     ui.add(egui::DragValue::new(&mut self.config.llm.jev_max_score).range(1..=50));
                     ui.end_row();
+                    ui.label("Jev 起算機率");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.llm.jev_min_prob)
+                            .range(0.0..=0.99)
+                            .speed(0.01),
+                    );
+                    ui.end_row();
                 }
 
                 field(ui, "模型名稱", &mut self.config.llm.model);
@@ -2442,6 +2449,9 @@ struct LlmConfig {
     /// Jev 混合評分模式下的分數換算上限（預設 10）
     #[serde(default = "default_jev_max_score")]
     jev_max_score: u32,
+    /// Jev 起算機率（預設 0.6；低於此值不計分，起算值～1.0 線性換算為 0～jev_max_score）
+    #[serde(default = "default_jev_min_prob")]
+    jev_min_prob: f64,
     #[serde(default = "default_llm_timeout_secs")]
     timeout_secs: u64,
     #[serde(default = "default_llm_max_chars")]
@@ -2450,6 +2460,9 @@ struct LlmConfig {
 
 fn default_jev_max_score() -> u32 {
     10
+}
+fn default_jev_min_prob() -> f64 {
+    0.6
 }
 fn default_llm_timeout_secs() -> u64 {
     120
@@ -2467,6 +2480,7 @@ impl Default for LlmConfig {
             api_key: String::new(),
             command: String::new(),
             jev_max_score: default_jev_max_score(),
+            jev_min_prob: default_jev_min_prob(),
             timeout_secs: default_llm_timeout_secs(),
             max_chars: default_llm_max_chars(),
         }
@@ -3025,13 +3039,15 @@ fn jev_question(model: &str) -> serde_json::Value {
     }
 }
 /// 依 Jev 釣魚機率換算為分數：
-/// - 0.6 (60%) 以下不計分 (0分)
-/// - 0.6 ~ 1.0 依比例線性換算為 0 ~ max_score
-pub fn calculate_jev_points(prob: f64, max_score: u32) -> u32 {
-    if prob < 0.6 {
+/// - 低於 min_prob（預設 0.6）不計分 (0分)
+/// - min_prob ~ 1.0 依比例線性換算為 0 ~ max_score
+/// - min_prob 限制在 0.0 ~ 0.99，避免除以 0；設為 0 即 0~100% 全程給分
+pub fn calculate_jev_points(prob: f64, max_score: u32, min_prob: f64) -> u32 {
+    let min_prob = min_prob.clamp(0.0, 0.99);
+    if prob < min_prob {
         0
     } else {
-        let ratio = ((prob - 0.6) / 0.4).clamp(0.0, 1.0);
+        let ratio = ((prob - min_prob) / (1.0 - min_prob)).clamp(0.0, 1.0);
         (ratio * max_score as f64).round() as u32
     }
 }
@@ -3426,8 +3442,11 @@ fn scan_mail(
                                 &auth_warnings,
                             ) {
                                 Ok(prob) => {
-                                    let jev_points =
-                                        calculate_jev_points(prob, llm_config.jev_max_score);
+                                    let jev_points = calculate_jev_points(
+                                        prob,
+                                        llm_config.jev_max_score,
+                                        llm_config.jev_min_prob,
+                                    );
                                     let final_score = score + jev_points;
                                     let mut combined_reasons = reasons.clone();
                                     combined_reasons.push(format!(
@@ -4534,7 +4553,8 @@ fn evaluate_mail(
             &auth_warnings,
         ) {
             Ok(prob) => {
-                let points = calculate_jev_points(prob, llm_config.jev_max_score);
+                let points =
+                    calculate_jev_points(prob, llm_config.jev_max_score, llm_config.jev_min_prob);
                 ev.llm_text = format!("Jev 釣魚機率 {:.1}%（+{points} 分）", prob * 100.0);
                 ev.final_score = score + points;
                 ev.flagged = ev.final_score >= threshold;
@@ -5964,37 +5984,52 @@ mod tests {
         }
     }
     #[test]
+    fn jev_min_prob_is_configurable() {
+        // 起算機率 0：0~100% 全程線性給分
+        assert_eq!(calculate_jev_points(0.0, 10, 0.0), 0);
+        assert_eq!(calculate_jev_points(0.5, 10, 0.0), 5);
+        assert_eq!(calculate_jev_points(1.0, 10, 0.0), 10);
+        // 起算機率 0.4：0.58 計 (0.58-0.4)/0.6*10 = 3 分，0.39 不計分
+        assert_eq!(calculate_jev_points(0.58, 10, 0.4), 3);
+        assert_eq!(calculate_jev_points(0.39, 10, 0.4), 0);
+        // 異常值被限制，不得除以 0 或產生超過上限的分數
+        assert_eq!(calculate_jev_points(1.0, 10, 1.0), 10);
+        assert_eq!(calculate_jev_points(1.0, 10, -1.0), 10);
+        // 設定檔未填時預設 0.6，與舊行為一致
+        assert_eq!(default_jev_min_prob(), 0.6);
+    }
+    #[test]
     fn jev_composite_scoring_calculation() {
         let max_score = 5u32;
 
         // < 0.6 不計分
-        assert_eq!(calculate_jev_points(0.15, max_score), 0);
-        assert_eq!(calculate_jev_points(0.55, max_score), 0);
-        assert_eq!(calculate_jev_points(0.599, max_score), 0);
+        assert_eq!(calculate_jev_points(0.15, max_score, 0.6), 0);
+        assert_eq!(calculate_jev_points(0.55, max_score, 0.6), 0);
+        assert_eq!(calculate_jev_points(0.599, max_score, 0.6), 0);
 
         // 0.6 ~ 1.0 依比例線性換算：((prob - 0.6) / 0.4) * 5
         // 0.60: 0.0 * 5 = 0
-        assert_eq!(calculate_jev_points(0.60, max_score), 0);
+        assert_eq!(calculate_jev_points(0.60, max_score, 0.6), 0);
         // 0.70: 0.25 * 5 = 1.25 -> 1
-        assert_eq!(calculate_jev_points(0.70, max_score), 1);
+        assert_eq!(calculate_jev_points(0.70, max_score, 0.6), 1);
         // 0.80: 0.50 * 5 = 2.50 -> 3
-        assert_eq!(calculate_jev_points(0.80, max_score), 3);
+        assert_eq!(calculate_jev_points(0.80, max_score, 0.6), 3);
         // 0.88: 0.70 * 5 = 3.50 -> 4
-        assert_eq!(calculate_jev_points(0.88, max_score), 4);
+        assert_eq!(calculate_jev_points(0.88, max_score, 0.6), 4);
         // 0.90: 0.75 * 5 = 3.75 -> 4
-        assert_eq!(calculate_jev_points(0.90, max_score), 4);
+        assert_eq!(calculate_jev_points(0.90, max_score, 0.6), 4);
         // 1.00: 1.00 * 5 = 5.00 -> 5
-        assert_eq!(calculate_jev_points(1.00, max_score), 5);
+        assert_eq!(calculate_jev_points(1.00, max_score, 0.6), 5);
 
         // 基礎規則評分 2 分 + Jev (0.88 -> 4分) = 6 分 (超過 threshold 5)
         let base_score = 2u32;
-        let points = calculate_jev_points(0.88, max_score);
+        let points = calculate_jev_points(0.88, max_score, 0.6);
         let final_score = base_score + points;
         assert_eq!(final_score, 6);
         assert!(final_score >= 5);
 
         // 低機率 0.55 -> 0分，最終得分 2 分 (未達 threshold 5)
-        let low_points = calculate_jev_points(0.55, max_score);
+        let low_points = calculate_jev_points(0.55, max_score, 0.6);
         assert_eq!(low_points, 0);
         let low_final = base_score + low_points;
         assert_eq!(low_final, 2);
@@ -6003,19 +6038,19 @@ mod tests {
         // 驗證預設 jev_max_score = 10 的換算與門檻 8
         let max_score_10 = default_jev_max_score();
         assert_eq!(max_score_10, 10);
-        assert_eq!(calculate_jev_points(0.55, max_score_10), 0);
-        assert_eq!(calculate_jev_points(0.80, max_score_10), 5);
-        assert_eq!(calculate_jev_points(0.88, max_score_10), 7);
-        assert_eq!(calculate_jev_points(1.00, max_score_10), 10);
+        assert_eq!(calculate_jev_points(0.55, max_score_10, 0.6), 0);
+        assert_eq!(calculate_jev_points(0.80, max_score_10, 0.6), 5);
+        assert_eq!(calculate_jev_points(0.88, max_score_10, 0.6), 7);
+        assert_eq!(calculate_jev_points(1.00, max_score_10, 0.6), 10);
 
         // 基礎規則評分 2 分 + Jev (0.88 -> 7分) = 9 分 (超過預設門檻 8)
-        let points_10 = calculate_jev_points(0.88, max_score_10);
+        let points_10 = calculate_jev_points(0.88, max_score_10, 0.6);
         let final_score_10 = base_score + points_10;
         assert_eq!(final_score_10, 9);
         assert!(final_score_10 >= default_threshold());
 
         // 低機率 0.55 -> 0分，最終得分 2 分 (未達預設門檻 8)
-        let low_final_10 = base_score + calculate_jev_points(0.55, max_score_10);
+        let low_final_10 = base_score + calculate_jev_points(0.55, max_score_10, 0.6);
         assert_eq!(low_final_10, 2);
         assert!(low_final_10 < default_threshold());
     }
