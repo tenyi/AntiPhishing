@@ -573,6 +573,12 @@ struct App {
     last_mail: Option<(u32, String, NaiveDate)>,
     /// 偵測到疑似郵件彈出確認時的多幀焦點強制重試計數
     focus_restore_ticks: u8,
+    /// 本機 .eml 路徑輸入框（檔案或資料夾）
+    eml_path_text: String,
+    /// .eml 判定進行中的 receiver（唯讀判定，不碰待搬移佇列與掃描狀態）
+    eml_receiver: Option<Receiver<std::result::Result<Vec<EmlRow>, String>>>,
+    /// 最近一次 .eml 判定結果（僅存記憶體，不寫日誌）
+    eml_results: Vec<EmlRow>,
 }
 
 struct Tray {
@@ -669,6 +675,9 @@ impl App {
                 )
             }),
             focus_restore_ticks: 0,
+            eml_path_text: String::new(),
+            eml_receiver: None,
+            eml_results: Vec::new(),
         }
     }
 
@@ -903,10 +912,63 @@ impl App {
         });
     }
 
+    /// 啟動背景 .eml 判定（唯讀：不連 IMAP、不搬移、不更新掃描狀態）
+    fn start_eml(&mut self, inputs: Vec<PathBuf>) {
+        if self.eml_receiver.is_some() || self.receiver.is_some() {
+            self.status = "已有掃描或 .eml 判定進行中，請稍候。".into();
+            return;
+        }
+        let config = self.config.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.eml_receiver = Some(receiver);
+        self.status = "本機 .eml 判定中…".into();
+        thread::spawn(move || {
+            // catch_unwind：worker panic 時仍回傳結果，避免 UI 端 receiver 永久卡住
+            let result =
+                match catch_unwind(AssertUnwindSafe(|| evaluate_eml_batch(&inputs, &config))) {
+                    Ok(Ok(rows)) => Ok(rows),
+                    Ok(Err(error)) => Err(format!("{error:#}")),
+                    Err(_) => Err("判定執行緒異常中止".to_string()),
+                };
+            let _ = sender.send(result);
+        });
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         if self.hide_window_on_startup {
             self.hide_window_on_startup = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
+        // 拖放 .eml（檔案或資料夾）到視窗即判定
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.active_view = ActiveView::Dashboard;
+            self.start_eml(dropped);
+        }
+        match self.eml_receiver.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(Ok(rows))) => {
+                self.eml_receiver = None;
+                self.status = format!("已判定 {} 個 .eml（唯讀，未搬移任何郵件）。", rows.len());
+                self.eml_results = rows;
+            }
+            Some(Ok(Err(error))) => {
+                self.eml_receiver = None;
+                self.status = format!(".eml 判定失敗：{error}");
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.eml_receiver = None;
+                self.status = ".eml 判定執行緒意外結束。".into();
+            }
+            Some(Err(TryRecvError::Empty)) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            None => {}
         }
         if self.focus_restore_ticks > 0 {
             self.focus_restore_ticks -= 1;
@@ -1461,6 +1523,72 @@ impl App {
                     .as_secs()
             ));
         });
+
+        // 本機 .eml 判定（唯讀；可拖放檔案或資料夾到視窗）
+        ui.separator();
+        ui.horizontal(|ui| {
+            let busy = self.eml_receiver.is_some() || self.receiver.is_some();
+            ui.label("本機 .eml（可拖放到視窗）");
+            ui.text_edit_singleline(&mut self.eml_path_text);
+            let can_run = !busy && !self.eml_path_text.trim().is_empty();
+            if ui
+                .add_enabled(can_run, egui::Button::new("判定 .eml"))
+                .clicked()
+            {
+                let path = PathBuf::from(self.eml_path_text.trim().trim_matches('"'));
+                self.start_eml(vec![path]);
+            }
+            if self.eml_receiver.is_some() {
+                ui.spinner();
+            }
+        });
+        if !self.eml_results.is_empty() {
+            let threshold = self.config.detection.threshold;
+            let mut clear = false;
+            egui::CollapsingHeader::new(format!(
+                "本機 .eml 判定結果（{} 封，唯讀）",
+                self.eml_results.len()
+            ))
+            .default_open(true)
+            .show(ui, |ui| {
+                if ui.small_button("清除結果").clicked() {
+                    clear = true;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("eml_scroll_area")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (name, result) in &self.eml_results {
+                            match result {
+                                Ok(ev) => {
+                                    let mark = if ev.flagged { "⚠" } else { "✔" };
+                                    egui::CollapsingHeader::new(format!(
+                                        "{mark} {}｜總分 {}｜{}",
+                                        ev.subject.trim(),
+                                        ev.final_score,
+                                        name
+                                    ))
+                                    .id_salt(name)
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(format_evaluation(
+                                                name, ev, threshold,
+                                            ))
+                                            .selectable(true),
+                                        );
+                                    });
+                                }
+                                Err(error) => {
+                                    ui.label(format!("✖ {name}：{error}"));
+                                }
+                            }
+                        }
+                    });
+            });
+            if clear {
+                self.eml_results.clear();
+            }
+        }
 
         // 執行紀錄（佔據滿版剩餘垂直空間）
         ui.separator();
@@ -4275,6 +4403,242 @@ fn external_image_targets_from_relationships(xml: &str) -> Vec<String> {
     targets
 }
 
+/// .eml 單檔大小上限（防止誤給超大檔）
+const MAX_EML_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 單封郵件的判定結果（.eml 模式，唯讀）
+struct MailEvaluation {
+    from: String,
+    subject: String,
+    auth_summary: String,
+    auth_warnings: Vec<String>,
+    rule_score: u32,
+    rule_reasons: Vec<String>,
+    /// LLM／Jev 判定說明（未設定、熔斷或失敗時為對應說明）
+    llm_text: String,
+    final_score: u32,
+    flagged: bool,
+    /// 判定依據（混合評分／LLM／規則／信任寄件者豁免）
+    basis: &'static str,
+}
+
+/// 去掉 UTF-8 BOM 與 mbox 格式開頭的 `From ` 行（不是 `From:` 標頭）
+fn normalize_eml_bytes(raw: &[u8]) -> &[u8] {
+    let raw = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw);
+    if raw.starts_with(b"From ")
+        && let Some(pos) = raw.iter().position(|&b| b == b'\n')
+    {
+        return &raw[pos + 1..];
+    }
+    raw
+}
+
+/// 展開 .eml 路徑：檔案直接收，資料夾只取第一層 *.eml（依檔名排序，不遞迴）
+fn collect_eml_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for input in inputs {
+        if input.is_dir() {
+            let mut found: Vec<PathBuf> = fs::read_dir(input)
+                .with_context(|| format!("無法讀取資料夾：{}", input.display()))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
+                })
+                .collect();
+            found.sort();
+            paths.extend(found);
+        } else if input.is_file() {
+            paths.push(input.clone());
+        } else {
+            bail!("找不到檔案或資料夾：{}", input.display());
+        }
+    }
+    Ok(paths)
+}
+
+/// 判定單封 .eml 內容（唯讀，不碰 IMAP）。
+/// `failures` 為 LLM 連續失敗計數，≥3 時熔斷改採規則評分（整批共用，與 IMAP 模式一致）。
+fn evaluate_mail(
+    bytes: &[u8],
+    config: &Config,
+    llm: &Option<LlmConfig>,
+    failures: &mut u32,
+) -> Result<MailEvaluation> {
+    let mail = parse_mail(normalize_eml_bytes(bytes)).context("無法解析郵件內容")?;
+    let from = mail.headers.get_first_value("From").unwrap_or_default();
+    let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
+    let (body, score_body) = extract_body_text(&mail);
+    let attachments = extract_attachment_filenames(&mail);
+    let targets = external_word_image_targets(&mail);
+    let auth_status = check_auth_status(&mail);
+    let auth_warnings = auth_status.warnings.clone();
+    let auth_summary = auth_status.summary();
+    let threshold = config.detection.threshold;
+
+    let mut ev = MailEvaluation {
+        from: from.clone(),
+        subject: subject.clone(),
+        auth_summary: auth_summary.clone(),
+        auth_warnings: auth_warnings.clone(),
+        rule_score: 0,
+        rule_reasons: Vec::new(),
+        llm_text: String::new(),
+        final_score: 0,
+        flagged: false,
+        basis: "傳統規則",
+    };
+
+    // 信任寄件者且驗證無失敗：與 IMAP 模式相同直接豁免（仍列出結果以便看出原因）
+    if let Some(matched) = is_trusted_sender(&from, &config.detection.trusted_sender_domains)
+        && auth_warnings.is_empty()
+    {
+        ev.llm_text = format!("未送檢（寄件來源在信任清單：{matched}）");
+        ev.basis = "信任寄件者豁免";
+        return Ok(ev);
+    }
+
+    let (score, reasons) = phishing_score(
+        &from,
+        &subject,
+        &score_body,
+        &attachments,
+        &targets,
+        &auth_warnings,
+        &config.detection,
+    );
+    ev.rule_score = score;
+    ev.rule_reasons = reasons;
+    ev.final_score = score;
+    ev.flagged = score >= threshold;
+
+    let Some(llm_config) = llm else {
+        ev.llm_text = "未設定 LLM".into();
+        return Ok(ev);
+    };
+    if *failures >= 3 {
+        ev.llm_text = "LLM 連續失敗熔斷，採規則評分".into();
+        ev.basis = "規則（LLM 熔斷）";
+        return Ok(ev);
+    }
+    if llm_config.effective_backend() == Some(LlmBackend::Jev) {
+        match llm_judge_jev(
+            llm_config,
+            &from,
+            &subject,
+            &body,
+            &attachments,
+            &targets,
+            &auth_summary,
+            &auth_warnings,
+        ) {
+            Ok(prob) => {
+                let points = calculate_jev_points(prob, llm_config.jev_max_score);
+                ev.llm_text = format!("Jev 釣魚機率 {:.1}%（+{points} 分）", prob * 100.0);
+                ev.final_score = score + points;
+                ev.flagged = ev.final_score >= threshold;
+                ev.basis = "混合評分（規則＋Jev）";
+            }
+            Err(error) => {
+                *failures += 1;
+                ev.llm_text = format!("Jev 判定失敗：{error:#}");
+                ev.basis = "規則（Jev 失敗）";
+            }
+        }
+    } else {
+        match llm_judge(
+            llm_config,
+            &from,
+            &subject,
+            &body,
+            &attachments,
+            &targets,
+            &auth_summary,
+            &auth_warnings,
+        ) {
+            Ok(verdict) => {
+                ev.llm_text = format!(
+                    "LLM 判定{}：{}",
+                    if verdict.is_phishing { "是" } else { "否" },
+                    verdict.reason
+                );
+                ev.flagged = verdict.is_phishing;
+                ev.basis = "LLM";
+            }
+            Err(error) => {
+                *failures += 1;
+                ev.llm_text = format!("LLM 判定失敗：{error:#}");
+                ev.basis = "規則（LLM 失敗）";
+            }
+        }
+    }
+    Ok(ev)
+}
+
+/// 讀檔並判定單一 .eml（含大小檢查）
+fn evaluate_eml_file(
+    path: &std::path::Path,
+    config: &Config,
+    llm: &Option<LlmConfig>,
+    failures: &mut u32,
+) -> Result<MailEvaluation> {
+    let size = fs::metadata(path)?.len();
+    if size > MAX_EML_BYTES {
+        bail!("檔案過大（{size} bytes），略過");
+    }
+    evaluate_mail(&fs::read(path)?, config, llm, failures)
+}
+
+/// 輸出單封判定結果（純文字）
+fn format_evaluation(name: &str, ev: &MailEvaluation, threshold: u32) -> String {
+    let auth = if ev.auth_summary.is_empty() {
+        "無驗證標頭".to_string()
+    } else {
+        ev.auth_summary.clone()
+    };
+    let warn = if ev.auth_warnings.is_empty() {
+        String::new()
+    } else {
+        format!("（警示：{}）", ev.auth_warnings.join("；"))
+    };
+    let reasons = if ev.rule_reasons.is_empty() {
+        "無".to_string()
+    } else {
+        ev.rule_reasons.join("；")
+    };
+    let verdict = if ev.flagged {
+        "疑似釣魚／垃圾信"
+    } else {
+        "正常"
+    };
+    format!(
+        "── {name}\n寄件者：{}\n主旨：{}\n驗證：{auth}{warn}\n規則分：{}（{reasons}）\nLLM：{}\n總分：{} / 門檻 {threshold} → 判定：{verdict}（依據：{}）",
+        ev.from, ev.subject, ev.rule_score, ev.llm_text, ev.final_score, ev.basis
+    )
+}
+
+/// .eml 批次判定結果列（檔名＋判定結果或錯誤訊息）
+type EmlRow = (String, std::result::Result<MailEvaluation, String>);
+
+/// 批次判定 .eml（唯讀；整批共用 LLM 熔斷計數）
+fn evaluate_eml_batch(inputs: &[PathBuf], config: &Config) -> Result<Vec<EmlRow>> {
+    let paths = collect_eml_paths(inputs)?;
+    if paths.is_empty() {
+        bail!("指定的路徑中沒有 .eml 檔");
+    }
+    let llm = llm_config(config);
+    let mut failures: u32 = 0;
+    Ok(paths
+        .iter()
+        .map(|path| {
+            let result =
+                evaluate_eml_file(path, config, &llm, &mut failures).map_err(|e| format!("{e:#}"));
+            (path.display().to_string(), result)
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5973,5 +6337,115 @@ mod tests {
         assert!(scan_state.ends_with("scan_state.toml"));
         let logs = log_dir();
         assert!(logs.ends_with("logs"));
+    }
+
+    /// 建立 .eml 測試用設定（GUI 的 Config 需要 imap／gui 區段，內容與 .eml 判定無關）
+    fn eml_test_config(extra_detection: &str) -> Config {
+        toml::from_str(&format!(
+            "[imap]\nhost = \"\"\nport = 993\nprotocol = \"imaps\"\nusername = \"\"\npassword = \"\"\nsource_mailbox = \"INBOX\"\nphishing_mailbox = \"Phish\"\n[gui]\n[detection]\n{extra_detection}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn evaluate_eml_batch_is_read_only_and_reports_per_file_errors() {
+        let dir = std::env::temp_dir().join(format!("ap_gui_eml_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("a.eml"),
+            "From: a@example.org\r\nSubject: hi\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        let rows = evaluate_eml_batch(std::slice::from_ref(&dir), &eml_test_config("")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.is_ok());
+        // 空資料夾要明確報錯而不是靜默回傳空結果
+        let empty = dir.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(evaluate_eml_batch(&[empty], &eml_test_config("")).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_eml_bytes_strips_bom_and_mbox_line() {
+        assert_eq!(
+            normalize_eml_bytes(b"\xEF\xBB\xBFSubject: a"),
+            b"Subject: a"
+        );
+        assert_eq!(
+            normalize_eml_bytes(b"From me@x.com Mon Jan 1\nSubject: a"),
+            b"Subject: a"
+        );
+        // From: 標頭不可被誤刪
+        assert_eq!(normalize_eml_bytes(b"From: a@x.com\n"), b"From: a@x.com\n");
+    }
+
+    #[test]
+    fn collect_eml_paths_filters_sorts_and_rejects_missing() {
+        let dir = std::env::temp_dir().join(format!("ap_eml_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.eml"), "x").unwrap();
+        fs::write(dir.join("a.EML"), "x").unwrap();
+        fs::write(dir.join("c.txt"), "x").unwrap();
+        let paths = collect_eml_paths(std::slice::from_ref(&dir)).unwrap();
+        let names: Vec<_> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.EML", "b.eml"]);
+        assert!(collect_eml_paths(&[dir.join("missing.eml")]).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_mail_reports_auth_and_rule_score_without_llm() {
+        let config = eml_test_config("");
+        let mut failures = 0;
+        let benign = "From: a@example.org\r\nSubject: hello\r\n\r\nsee you tomorrow\r\n";
+        let ev = evaluate_mail(benign.as_bytes(), &config, &None, &mut failures).unwrap();
+        // 沒有驗證標頭時摘要為空（輸出端顯示「無驗證標頭」，不可誤當作 pass）
+        assert!(ev.auth_summary.is_empty());
+        assert!(!ev.flagged);
+
+        let forged = concat!(
+            "ARC-Authentication-Results: i=1; dmarc=fail\r\n",
+            "From: DHL Express <x@evil.example>\r\n",
+            "Subject: urgent verify password\r\n\r\n",
+            "login now http://a.example/x http://b.example/y\r\n"
+        );
+        let ev = evaluate_mail(forged.as_bytes(), &config, &None, &mut failures).unwrap();
+        assert!(!ev.auth_warnings.is_empty());
+        assert!(ev.rule_score > 0);
+        assert_eq!(ev.basis, "傳統規則");
+    }
+
+    #[test]
+    fn evaluate_mail_exempts_trusted_sender_but_not_when_auth_fails() {
+        let config = eml_test_config("trusted_sender_domains = [\"example.com\"]");
+        let mut failures = 0;
+        let ok = "Authentication-Results: i=1; spf=pass; dmarc=pass\r\nFrom: a@example.com\r\nSubject: s\r\n\r\nb\r\n";
+        let ev = evaluate_mail(ok.as_bytes(), &config, &None, &mut failures).unwrap();
+        assert_eq!(ev.basis, "信任寄件者豁免");
+        assert!(!ev.flagged);
+
+        let forged = "Authentication-Results: i=1; dmarc=fail\r\nFrom: a@example.com\r\nSubject: s\r\n\r\nb\r\n";
+        let ev = evaluate_mail(forged.as_bytes(), &config, &None, &mut failures).unwrap();
+        // 驗證失敗取消豁免，必須照一般流程評分
+        assert_ne!(ev.basis, "信任寄件者豁免");
+    }
+
+    #[test]
+    fn evaluate_mail_breaker_skips_llm_after_three_failures() {
+        let config = eml_test_config("");
+        let llm =
+            Some(toml::from_str::<LlmConfig>("backend = \"command\"\ncommand = \"x\"").unwrap());
+        let mut failures = 3;
+        let mail = "From: a@example.org\r\nSubject: hi\r\n\r\nbody\r\n";
+        let ev = evaluate_mail(mail.as_bytes(), &config, &llm, &mut failures).unwrap();
+        // 熔斷時不得呼叫 LLM（否則會執行 command），直接採規則分
+        assert_eq!(ev.basis, "規則（LLM 熔斷）");
+        assert_eq!(failures, 3);
     }
 }

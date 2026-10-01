@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "anti-phishing-gui"
-version = "2.2.2"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "chrono",

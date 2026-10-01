@@ -19,6 +19,20 @@ cargo run -- --date 2026-08-04 --date 2026-08-05   # 可重複 --date 掃描多�
 cargo run -- --date 2026-08-05 -y         # 跳過互動確認，直接搬移全部判定郵件
 ```
 
+### 判定本機 .eml 檔（唯讀）
+
+不連 IMAP、不搬移，直接讀 `.eml` 檔（或資料夾內第一層的 `*.eml`）並輸出寄件者、驗證摘要、規則分、LLM／Jev 機率、總分與判定。適合調整 prompt、門檻或驗證信件樣本。`config.toml` 只需 `[detection]` 與 `[llm]`，可省略 `[imap]`；不可與 `--date`、`--dry-run`、`-y` 併用。
+
+```powershell
+cargo run -- --eml .\spam01.eml --eml .\spam02.eml   # 可重複指定
+cargo run -- --eml D:\samples                        # 資料夾：只取第一層 *.eml，依檔名排序
+```
+
+- 驗證結果（SPF／DKIM／DMARC）取自檔案內最上層標頭，未經重新驗證；沒有驗證標頭時顯示「無驗證標頭」。
+- 信任清單命中且驗證無失敗者不送檢，仍會列出並標示「信任寄件者豁免」。
+- 不拆開附件中的 `message/rfc822`，只判定該信本身。單檔上限 64MB。
+- 任一檔可解析即結束碼 0；全部失敗才回非 0。
+
 - 掃描進度顯示在 stderr，判定結果輸出至 stdout，方便管線處理（如 `| tee scan.log`）。
 - 搬移方式為先複製到 `phishing_mailbox`，再以 UID EXPUNGE 只清除本輪已搬移的信件；目標信箱不存在時會自動建立。
 - 搬移前會重新比對 UIDVALIDITY，避免信箱重建後誤搬。
