@@ -618,6 +618,8 @@ struct App {
     mailboxes: Vec<String>,
     /// 背景取得信箱清單的 receiver
     mailbox_receiver: Option<Receiver<Result<Vec<String>>>>,
+    /// 取得信箱清單失敗時的錯誤訊息（供設定介面即時顯示）
+    mailbox_fetch_error: Option<String>,
     /// 上次檢查到的最後一封郵件（UIDVALIDITY、最大 UID）；排程掃描藉此跳過無新郵件的一輪
     last_seen: Option<(u32, u32)>,
     /// 上次完成掃描的時間（含無新郵件的空掃），顯示於狀態列下方；跨重啟由進度檔回復
@@ -719,6 +721,7 @@ impl App {
             hide_window_on_startup,
             mailboxes: Vec::new(),
             mailbox_receiver: None,
+            mailbox_fetch_error: None,
             last_seen,
             last_check: scan_state.as_ref().map(|state| state.checked_at),
             last_mail: scan_state.map(|state| {
@@ -747,7 +750,9 @@ impl App {
         if self.mailbox_receiver.is_some() {
             return;
         }
+        self.mailbox_fetch_error = None;
         if let Some(problem) = imap_credentials_problem(&self.config.imap) {
+            self.mailbox_fetch_error = Some(problem.clone());
             self.status = problem;
             return;
         }
@@ -1200,16 +1205,24 @@ impl App {
                 Ok(Ok(mailboxes)) => {
                     let count = mailboxes.len();
                     self.mailboxes = mailboxes;
+                    self.mailbox_fetch_error = None;
                     self.status = format!("已成功取得 {count} 個信箱。");
                     self.mailbox_receiver = None;
+                    ctx.request_repaint();
                 }
                 Ok(Err(err)) => {
-                    self.status = format!("取得信箱清單失敗：{err:#}");
+                    let err_msg = format!("取得信箱清單失敗：{err:#}");
+                    self.mailbox_fetch_error = Some(err_msg.clone());
+                    self.status = err_msg;
                     self.mailbox_receiver = None;
+                    ctx.request_repaint();
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.status = "取得信箱清單失敗：背景執行緒異常結束。".into();
+                    let err_msg = "取得信箱清單失敗：背景執行緒異常結束。".to_string();
+                    self.mailbox_fetch_error = Some(err_msg.clone());
+                    self.status = err_msg;
                     self.mailbox_receiver = None;
+                    ctx.request_repaint();
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -1255,12 +1268,17 @@ impl App {
                 }
             }
         }
-        // 掃描或搬移中提高重繪頻率，讓進度行即時更新；閒置維持每秒一次
-        ctx.request_repaint_after(if self.receiver.is_some() || self.move_receiver.is_some() {
-            Duration::from_millis(300)
-        } else {
-            Duration::from_secs(1)
-        });
+        // 掃描、搬移或抓取信箱清單中提高重繪頻率，讓進度即時更新；閒置維持每秒一次
+        ctx.request_repaint_after(
+            if self.receiver.is_some()
+                || self.move_receiver.is_some()
+                || self.mailbox_receiver.is_some()
+            {
+                Duration::from_millis(300)
+            } else {
+                Duration::from_secs(1)
+            },
+        );
     }
 
     /// 搬移確認對話框
@@ -1775,21 +1793,42 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.config.imap.password).password(true));
                 ui.end_row();
                 ui.label("信箱清單");
-                ui.horizontal(|ui| {
-                    let is_fetching = self.mailbox_receiver.is_some();
-                    let btn_text = if is_fetching {
-                        "取得中…"
-                    } else {
-                        "從伺服器取得信箱清單"
-                    };
-                    if ui
-                        .add_enabled(!is_fetching, egui::Button::new(btn_text))
-                        .clicked()
-                    {
-                        self.fetch_mailboxes();
-                    }
-                    if !self.mailboxes.is_empty() {
-                        ui.label(format!("（已載入 {} 個信箱）", self.mailboxes.len()));
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let is_fetching = self.mailbox_receiver.is_some();
+                        let btn_text = if is_fetching {
+                            "取得中…"
+                        } else {
+                            "從伺服器取得信箱清單"
+                        };
+                        if ui
+                            .add_enabled(!is_fetching, egui::Button::new(btn_text))
+                            .clicked()
+                        {
+                            self.fetch_mailboxes();
+                        }
+                        if is_fetching {
+                            ui.spinner();
+                        } else if self.mailbox_fetch_error.is_none() && !self.mailboxes.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "✔ 已載入 {} 個信箱",
+                                    self.mailboxes.len()
+                                ))
+                                .color(egui::Color32::from_rgb(80, 220, 100)),
+                            );
+                        }
+                    });
+                    if let Some(err) = &self.mailbox_fetch_error {
+                        ui.add_space(2.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("❌ {err}"))
+                                    .color(egui::Color32::from_rgb(240, 80, 80))
+                                    .strong(),
+                            )
+                            .wrap(),
+                        );
                     }
                 });
                 ui.end_row();
@@ -6638,5 +6677,59 @@ mod tests {
         // 熔斷時不得呼叫 LLM（否則會執行 command），直接採規則分
         assert_eq!(ev.basis, "規則（LLM 熔斷）");
         assert_eq!(failures, 3);
+    }
+
+    #[test]
+    fn test_imap_credentials_problem_and_mailbox_fetch_error_formatting() {
+        let mut config = ImapConfig {
+            host: String::new(),
+            port: 993,
+            protocol: "imaps".into(),
+            username: "user".into(),
+            password: "pwd".into(),
+            source_mailbox: "INBOX".into(),
+            phishing_mailbox: "Phishing".into(),
+        };
+
+        // 伺服器為空
+        assert_eq!(
+            imap_credentials_problem(&config).as_deref(),
+            Some("請先填寫 IMAP 伺服器。")
+        );
+
+        // 帳號為空
+        config.host = "imap.example.com".into();
+        config.username = "  ".into();
+        assert_eq!(
+            imap_credentials_problem(&config).as_deref(),
+            Some("請先填寫 IMAP 帳號。")
+        );
+
+        // 密碼為空
+        config.username = "user".into();
+        config.password = "".into();
+        assert_eq!(
+            imap_credentials_problem(&config).as_deref(),
+            Some("請先填寫 IMAP 密碼。")
+        );
+
+        // 完整設定
+        config.password = "secret".into();
+        assert_eq!(imap_credentials_problem(&config), None);
+
+        // 驗證錯誤格式化保留原因鏈
+        let dns_err: Result<Vec<String>> = Err(anyhow::anyhow!("No such host is known")
+            .context("無法解析 IMAP 伺服器位址：mail.invalid"));
+        let err_msg = format!("取得信箱清單失敗：{:#}", dns_err.unwrap_err());
+        assert!(err_msg.contains("無法解析 IMAP 伺服器位址"));
+        assert!(err_msg.contains("No such host is known"));
+
+        let auth_err: Result<Vec<String>> = Err(anyhow::anyhow!(
+            "[AUTHENTICATIONFAILED] Invalid credentials"
+        )
+        .context("IMAP 登入失敗"));
+        let err_msg = format!("取得信箱清單失敗：{:#}", auth_err.unwrap_err());
+        assert!(err_msg.contains("IMAP 登入失敗"));
+        assert!(err_msg.contains("[AUTHENTICATIONFAILED]"));
     }
 }
