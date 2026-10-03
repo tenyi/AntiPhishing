@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, Datelike, Local, Months, NaiveDate, Weekday};
 use eframe::egui::{self, ViewportCommand};
 use imap::Session;
 use mailparse::{MailHeaderMap, parse_mail};
@@ -328,6 +328,52 @@ fn log_dir() -> PathBuf {
 }
 
 /// 每日日誌檔名：`YYYY-MM-DD.log`。
+/// 日期選擇按鈕：點擊後彈出小月曆，點選日期即套用並關閉
+fn date_picker(ui: &mut egui::Ui, date: &mut NaiveDate, month: &mut NaiveDate) {
+    let response = ui.button(format!("📅 {date}"));
+    if response.clicked() {
+        *month = date.with_day(1).unwrap_or(*date);
+    }
+    egui::Popup::from_toggle_button_response(&response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.horizontal(|ui| {
+                if ui.button("◀").on_hover_text("上個月").clicked() {
+                    *month = month.checked_sub_months(Months::new(1)).unwrap_or(*month);
+                }
+                ui.label(format!("{} 年 {} 月", month.year(), month.month()));
+                if ui.button("▶").on_hover_text("下個月").clicked() {
+                    *month = month.checked_add_months(Months::new(1)).unwrap_or(*month);
+                }
+            });
+            egui::Grid::new("date_picker_grid").show(ui, |ui| {
+                for name in ["日", "一", "二", "三", "四", "五", "六"] {
+                    ui.label(name);
+                }
+                ui.end_row();
+                for _ in 0..month.weekday().num_days_from_sunday() {
+                    ui.label("");
+                }
+                for day in month.iter_days().take_while(|d| d.month() == month.month()) {
+                    if ui
+                        .selectable_label(day == *date, day.day().to_string())
+                        .clicked()
+                    {
+                        *date = day;
+                        ui.close();
+                    }
+                    if day.weekday() == Weekday::Sat {
+                        ui.end_row();
+                    }
+                }
+            });
+            if ui.button("今天").clicked() {
+                *date = Local::now().date_naive();
+                ui.close();
+            }
+        });
+}
+
 fn log_file_name(date: NaiveDate) -> String {
     format!("{date}.log")
 }
@@ -550,7 +596,10 @@ struct App {
     logs: Vec<LogEntry>,
     /// 日誌檔寫入失敗時只提示一次的旗標
     log_error_reported: bool,
-    date_text: String,
+    /// 手動掃描指定的日期
+    scan_date: NaiveDate,
+    /// 日曆彈窗目前顯示的月份（該月 1 日）
+    calendar_month: NaiveDate,
     next_check: Instant,
     receiver: Option<Receiver<ScanEvent>>,
     /// 待確認隔離的郵件清單（Queue/List，可跨重啟保留）
@@ -657,7 +706,8 @@ impl App {
             scan_progress: String::new(),
             logs,
             log_error_reported: false,
-            date_text: Local::now().date_naive().to_string(),
+            scan_date: Local::now().date_naive(),
+            calendar_month: Local::now().date_naive(),
             receiver: None,
             pending_queue,
             show_confirm_dialog,
@@ -838,13 +888,7 @@ impl App {
     }
 
     fn start_scan(&mut self, scheduled: bool) {
-        let date = match NaiveDate::parse_from_str(&self.date_text, "%Y-%m-%d") {
-            Ok(value) => value,
-            Err(_) => {
-                self.status = "日期格式須為 YYYY-MM-DD。".into();
-                return;
-            }
-        };
+        let date = self.scan_date;
         // 手動指定日期掃描時不帶 last_seen（執行全量檢查不套用 UID 過濾），排程掃描才帶 last_seen
         let last_seen = if scheduled { self.last_seen } else { None };
         // 自動納入前一日以消除伺服器 UTC 時差落差（例如臺灣 UTC+8 凌晨信件會落在伺服器前一日）
@@ -1173,7 +1217,7 @@ impl App {
         if self.receiver.is_none() && self.move_receiver.is_none() && self.startup_scan_pending {
             self.startup_scan_pending = false;
             let today = Local::now().date_naive();
-            self.date_text = today.to_string();
+            self.scan_date = today;
             let dates = scan_dates_since_last(today, self.last_scanned_date());
             self.start_scan_dates(dates, self.last_seen, false);
         } else if self.receiver.is_none()
@@ -1181,7 +1225,7 @@ impl App {
             && Instant::now() >= self.next_check
         {
             let today = Local::now().date_naive();
-            self.date_text = today.to_string();
+            self.scan_date = today;
             // 排程定時掃描自上次掃描日期一路涵蓋至今日（防跨日與連假遺漏），並傳入 last_seen 斷點續掃
             let dates = scan_dates_since_last(today, self.last_scanned_date());
             self.start_scan_dates(dates, self.last_seen, true);
@@ -1201,7 +1245,7 @@ impl App {
                 }
                 if event.id == scan_id && self.receiver.is_none() && self.move_receiver.is_none() {
                     let today = Local::now().date_naive();
-                    self.date_text = today.to_string();
+                    self.scan_date = today;
                     let dates = scan_dates_since_last(today, self.last_scanned_date());
                     self.start_scan_dates(dates, self.last_seen, false);
                 }
@@ -1517,7 +1561,7 @@ impl App {
                 );
             }
             ui.label("日期");
-            ui.text_edit_singleline(&mut self.date_text);
+            date_picker(ui, &mut self.scan_date, &mut self.calendar_month);
 
             ui.add_space(12.0);
             ui.label(format!(
