@@ -22,7 +22,7 @@ Release 執行檔：`.\target\release\anti-phishing-gui.exe`。執行檔旁需�
 
 ## 架構
 
-所有邏輯集中在單一檔案 `src/main.rs`（含 GUI、IMAP、評分、測試）：
+判定核心（設定結構、評分、LLM 判定、IMAP 操作、DOCX 偵測、.eml 評估）在共用 crate `../AntiPhishingCore`（以 `use antiphishing_core::*` 引入，核心的測試在該 crate）；本專案 `src/main.rs` 只放 GUI、掃描主迴圈 `scan_mail`、搬移確認、排程、日誌與進度持久化，`src/theme.rs` 放外觀。以下條目中的 `llm_judge`、`phishing_score` 等函式實作位於核心：
 
 - **設定**：`Config`（imap / detection / gui 三段）載入自專案目錄 `config.toml`，載入失敗時用 `Config::default()` 並顯示警告；GUI「儲存設定」寫回 `config.toml`（`toml::to_string_pretty`）。
 - **掃描流程** `scan_mail`：`connect`（imaps 或 starttls）→ `select` 來源信箱 → `uid_search("ON <date>")` → `uid_fetch RFC822` → `parse_mail` → `llm_judge`（判定為 `is_phishing` 者）暫存進待隔離清單；若開啟確認（預設），掃描一氣呵成跑完並加入 `pending_queue`，立即登出斷開 IMAP 連線；若未開啟確認，則於本輪中直接自動搬移。掃描結束後斷點正常推進，背景定時排程絕不因等待確認而卡死。
@@ -32,7 +32,8 @@ Release 執行檔：`.\target\release\anti-phishing-gui.exe`。執行檔旁需�
 - **DOCX 偵測**：附件 `ZipArchive` 掃 `word/*.rels`，只取 `Type` 以 `/image` 結尾、`TargetMode=External`、`http(s)://` 開頭的 Relationship。刻意不連網下載、不啟動 Office。
 - **排程**：無獨立排程執行緒；`eframe::App::logic` 每幀 poll，`Instant >= next_check` 時觸發掃描（`request_repaint_after(1s)` 保持喚醒）。啟動、排程定時掃描與手動指定日期皆掃「前一日＋指定日」（防伺服器 UTC 跨日時區落差）；排程掃描配合 `last_seen` 斷點續掃，手動點擊「立即掃描指定日期」則強制傳入 `last_seen = None` 進行全量檢查。`receiver.is_some()` 護欄同時擋住 pending 確認期間的二次掃描（包含系統匣「立即掃描」）。
 - **日誌與進度持久化**：所有執行紀錄經 `App::push_log` 統一處理——附加寫入執行檔目錄下 `logs/YYYY-MM-DD.log`（每行 `[YYYY-MM-DD HH:MM:SS]` 前綴；無新郵件之空掃不寫日誌），並入列 `logs: Vec<LogEntry>`（寫入時 `prune_logs` 只留當日條目）。每輪 Done 後以 `persist_scan_state` 將斷點（UIDVALIDITY＋最大已判定 UID）與最後判定郵件資訊寫到 `scan_state.toml`；`App::new` 載入該檔回復 `last_seen`／`last_check`／`last_mail`，使重啟後首輪即靠 `filter_new_uids` 跳過舊信。載入失敗＝警告＋全量重掃（安全側）；寫檔失敗只提示一次不影響掃描；啟動時另清理超過 `[gui] log_retention_days` 天（`LOG_RETENTION_DAYS` 預設 30；0＝永不清理，`cleanup_retention_days` 轉換）的舊日誌並回填今日尾端 200 行（`BACKFILL_LOG_LINES`，自動過濾空掃歷史）到 UI。
-- **UI 布局**：`App::ui` 在單一 `CentralPanel` 內將設定區以 `ScrollArea::vertical().max_height(available * 2/3)` 包住，剩餘 1/3 為「執行紀錄」`ScrollArea`（恆顯示，空時顯示「尚無執行紀錄」），確保預設 760×720 視窗下 log 區不必拖大視窗即可見。
+- **UI 布局**：主畫面為三張卡片（`theme::card`）：「狀態」（掃描進度只在此顯示一次）、「掃描」（日期、立即掃描、.eml 判定）、「執行紀錄」（填滿剩餘高度，恆顯示，空時顯示「尚無執行紀錄」）；有待確認郵件時頂部顯示 danger 色橫條。設定頁以分頁按鈕切換，內容包在卡片內。
+- **外觀主題**：`[gui] theme`（`system`／`light`／`dark`，預設 `system`）；`theme::install_style` 於 `App::new` 安裝間距、字級、圓角與兩套底色，`theme::apply_theme` 套用偏好；主畫面頂列按鈕與「排程與系統匣」分頁的下拉選單可即時切換，按「儲存設定」才寫入。顏色一律取自 `theme::palette`（依深淺色），不要寫死 `Color32::from_rgb`。
 - **系統匣**：關閉視窗預設轉為縮小至系統匣（`CancelClose` + `Visible(false)` 或 `Minimized(true)`，視 `hide_taskbar_when_minimized`）；真正退出僅經系統匣「結束」（先設 `allow_exit` 再 `Close`）。`single-instance` 在 `main` 入口防重複啟動。
 - **字型**：`font_family` 支援字型檔路徑或固定映射（Noto Sans TC → `NotoSansTC-VF.ttf`、微軟正黑體 → `msjh.ttc`），啟動時注入 egui，改後需重啟。
 

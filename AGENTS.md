@@ -4,15 +4,15 @@
 
 ## 專案結構
 
-- 兩個**獨立的 Cargo 套件**，不是 workspace（無根 `Cargo.toml`，各自有 `Cargo.lock`）：
-  - `AntiPhishing/`：CLI 版（`anti-phishing`），一次性掃描指定日期郵件。
-  - `AntiPhishingGUI/`：GUI 版（`anti-phishing-gui`），eframe 桌面常駐 + 系統匣排程。
-- 所有邏輯集中在各自的單一檔案 `src/main.rs`（含測試），刻意不拆模組。
-- 兩版共用核心概念：IMAP 掃描（`scan_mail`）、LLM 判定（`llm_judge`）、DOCX 外部圖片偵測、搬移確認。**修改共用邏輯時兩版都要同步修改並各自驗證**——只改一邊是最常見的錯誤。
+- 三個**獨立的 Cargo 套件**，不是 workspace（無根 `Cargo.toml`，各自有 `Cargo.lock`）：
+  - `AntiPhishingCore/`：共用判定核心（`antiphishing-core`）：設定結構、郵件解析與評分、LLM 判定、IMAP 操作、DOCX 外部圖片偵測、.eml 評估，以及對應單元測試（`src/tests.rs`）。
+  - `AntiPhishing/`：CLI 版（`anti-phishing`），一次性掃描指定日期郵件，邏輯在 `src/main.rs`。
+  - `AntiPhishingGUI/`：GUI 版（`anti-phishing-gui`），eframe 桌面常駐 + 系統匣排程，邏輯在 `src/main.rs`，外觀在 `src/theme.rs`。
+- 兩個前端以 path 依賴引用核心。**共用邏輯只改核心**；掃描主迴圈（CLI 的 `main`、GUI 的 `scan_mail`）與搬移確認仍各自在前端，兩邊要對照修改並各自驗證。
 
 ## 指令與驗證
 
-所有 cargo 指令必須在**對應子專案目錄**內執行：
+所有 cargo 指令必須在**對應子專案目錄**（含 `AntiPhishingCore/`）內執行：
 
 ```powershell
 cargo check          # 同步更新該子專案的 Cargo.lock

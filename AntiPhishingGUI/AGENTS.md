@@ -40,10 +40,12 @@ cargo build --release
 AntiPhishingGUI/
 ├── Cargo.toml            # 專案相依與中繼資料 (Rust 2024 edition)
 ├── build.rs              # Windows 資源編譯 (圖示/資訊)
+├── ../AntiPhishingCore/  # 共用判定核心 crate (path 依賴)
 ├── config.example.toml   # 設定檔範本
 ├── config.toml           # 執行期設定檔 (包含 IMAP 帳密、偵測門檻、GUI 選項)
 └── src/
-    └── main.rs           # 包含所有主程式邏輯、GUI 介面、IMAP 檢查、郵件評分與測試
+    ├── main.rs           # GUI 介面、掃描主迴圈、搬移確認、排程與日誌（郵件評分／LLM／IMAP 在核心 crate）
+    └── theme.rs          # 外觀：深淺色主題、語意色、卡片容器
 ```
 
 ---

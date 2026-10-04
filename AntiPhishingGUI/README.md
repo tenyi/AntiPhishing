@@ -46,6 +46,7 @@ hide_taskbar_when_minimized = true
 start_minimized_to_tray = false
 log_retention_days = 30       # 每日日誌保留天數；0 表示永不清理
 font_family = "Noto Sans TC"  # 也可填「微軟正黑體」或字型檔完整路徑
+theme = "system"              # 外觀主題：system（跟隨系統）、light、dark
 
 # LLM 智慧判定設定（支援 Claude Code / Agy / Codex CLI、Jev API 與 OpenAI API）
 [llm]
@@ -66,6 +67,7 @@ max_chars = 6000              # 郵件內文最大字元數
 - `minimize_to_tray` 開啟後，關閉視窗會留在 Windows 系統匣。
 - `hide_taskbar_when_minimized` 開啟後，縮小至系統匣時隱藏工作列項目。
 - `start_minimized_to_tray` 開啟後，下次啟動時不顯示主視窗，直接留在 Windows 系統匣。
+- `theme` 是外觀主題，可填 `system`（跟隨系統，預設）、`light`、`dark`；也可在主畫面右上角按鈕或「排程與系統匣」分頁即時切換。
 - `font_family` 可填 `Noto Sans TC`、`微軟正黑體`、`Microsoft JhengHei`，或 `.ttf/.ttc/.otf` 字型檔完整路徑；變更後需重新啟動程式。
 
 ---

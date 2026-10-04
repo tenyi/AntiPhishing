@@ -1,28 +1,20 @@
 [package]
-name = "anti-phishing-gui"
-version = "2.7.0"
+name = "antiphishing-core"
+version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-antiphishing-core = { path = "../AntiPhishingCore" }
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["clock", "serde"] }
-eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 imap = "3.0.0-alpha.15"
 mailparse = "0.16.1"
-image = "0.25.10"
 native-tls = "0.2.18"
 quick-xml = "0.41.0"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
-toml = "1.1.4"
-tray-icon = "0.24.2"
-single-instance = "0.3"
-notify-rust = "4"
 zip = "9.0.0-pre.2"
 
-[build-dependencies]
-winres = "0.1"
-
+[dev-dependencies]
+toml = "1.1.4"

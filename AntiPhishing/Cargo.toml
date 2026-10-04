@@ -1,9 +1,10 @@
 [package]
 name = "anti-phishing"
-version = "2.5.1"
+version = "2.6.0"
 edition = "2024"
 
 [dependencies]
+antiphishing-core = { path = "../AntiPhishingCore" }
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6", features = ["derive"] }

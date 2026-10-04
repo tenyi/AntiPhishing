@@ -29,6 +29,8 @@ confirm_before_move = true
 log_retention_days = 30
 # 可選：Noto Sans TC、微軟正黑體、Microsoft JhengHei，或本機 .ttf/.ttc/.otf 完整路徑。
 font_family = "Noto Sans TC"
+# 可選：外觀主題 system（跟隨系統）、light、dark，預設 system
+theme = "system"
 
 # LLM 智慧判定設定。
 # 支援 OpenAI 相容 HTTP API，以及命令列呼叫 Claude Code CLI / OpenAI Codex CLI / Antigravity CLI / 自訂命令。
