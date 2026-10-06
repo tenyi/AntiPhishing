@@ -860,11 +860,22 @@ fn jev_endpoint_normalization() {
 }
 
 #[test]
-fn nimble_model_detection_and_config() {
+fn nimble_and_clef_model_detection_and_config() {
     assert!(is_nimble_model("nimble"));
     assert!(is_nimble_model(" Nimble:latest "));
     assert!(!is_nimble_model(""));
     assert!(!is_nimble_model("jev-latest"));
+
+    assert!(is_clef_model("clef"));
+    assert!(is_clef_model("clef-flash"));
+    assert!(is_clef_model(" Clef-Flash:latest "));
+    assert!(!is_clef_model("nimble"));
+
+    assert!(is_local_systemone_model("nimble"));
+    assert!(is_local_systemone_model("clef"));
+    assert!(is_local_systemone_model("clef-flash"));
+    assert!(is_local_systemone_model("clef-flash:latest"));
+    assert!(!is_local_systemone_model("jev-latest"));
 
     let make = |llm: &str| -> TestConfig {
         toml::from_str(&format!(
@@ -898,10 +909,71 @@ fn nimble_model_detection_and_config() {
         )
         .is_some()
     );
+    // Clef-flash + base_url：免金鑰即有效
+    assert!(
+        llm_config(
+            &make(
+                r#"model = "clef-flash"
+            base_url = "http://127.0.0.1:11434""#
+            )
+            .llm
+        )
+        .is_some()
+    );
+    // Clef + base_url：免金鑰即有效
+    assert!(
+        llm_config(
+            &make(
+                r#"model = "clef"
+            base_url = "http://127.0.0.1:11434""#
+            )
+            .llm
+        )
+        .is_some()
+    );
+    // backend 設為 clef-flash，自動識別為 Jev 後端且免金鑰即有效
+    let config_backend_clef: TestConfig = toml::from_str(
+        r#"
+        [imap]
+        host = "imap.example.com"
+        port = 993
+        protocol = "imaps"
+        username = "u"
+        password = "p"
+        source_mailbox = "INBOX"
+        phishing_mailbox = "Spam"
+        [detection]
+        threshold = 5
+        [gui]
+        [llm]
+        backend = "clef-flash"
+        model = "clef-flash"
+        base_url = "http://127.0.0.1:11434"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        config_backend_clef.llm.effective_backend(),
+        Some(LlmBackend::Jev)
+    );
+    assert!(llm_config(&config_backend_clef.llm).is_some());
+
+    // Clef-flash 缺 base_url：無效（不得退回雲端）
+    assert!(llm_config(&make(r#"model = "clef-flash""#).llm).is_none());
     // Nimble 缺 base_url：無效（不得退回雲端）
     assert!(llm_config(&make(r#"model = "nimble""#).llm).is_none());
     // model 留空（Jev）仍須金鑰
     assert!(llm_config(&make(r#"base_url = "http://127.0.0.1:11434""#).llm).is_none());
+
+    // Clef-flash 問句也包含排除條件且不含 criteria
+    let clef_q = jev_question("clef-flash");
+    assert!(clef_q.get("criteria").is_none());
+    assert!(
+        clef_q["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("垃圾信隔離明細")
+    );
 }
 
 #[test]

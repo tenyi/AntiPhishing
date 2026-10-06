@@ -370,9 +370,20 @@ pub fn parse_jev_probability(val: &serde_json::Value) -> Result<f64> {
     bail!("Jev 回應 answers.is_phishing 缺少有效的 noul 機率數值：{val}")
 }
 
+/// 判斷 model 是否為地端 System One 模型（nimble、clef、clef-flash 等，不分大小寫）。
+pub fn is_local_systemone_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("nimble") || m.starts_with("clef")
+}
+
 /// 判斷 model 是否為地端 Nimble（nimble 或 nimble:latest 等，不分大小寫）。
 pub fn is_nimble_model(model: &str) -> bool {
     model.trim().to_ascii_lowercase().starts_with("nimble")
+}
+
+/// 判斷 model 是否為地端 Clef / Clef-Flash（不分大小寫）。
+pub fn is_clef_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("clef")
 }
 
 /// 組出 System One 端點：base_url 寫 host、.../v1 或 .../v1/systemone 皆可；空值用官方雲端。
@@ -388,13 +399,13 @@ pub fn jev_endpoint(base_url: &str) -> String {
     format!("{base}/v1/systemone")
 }
 
-/// Nimble 專用問句（實測 B3）：Nimble 不太參考 criteria，排除條件必須寫進 instructions，
-/// 否則郵件稽核系統產生的「垃圾信隔離明細」會被誤判為釣魚；偽裝成通知的釣魚仍須判為是。
+/// 地端 System One（Nimble / Clef / Clef-Flash）專用問句（實測）：此類模型不太參考 criteria，
+/// 排除條件必須寫進 instructions，否則郵件稽核系統產生的「垃圾信隔離明細」會被誤判為釣魚；偽裝成通知的釣魚仍須判為是。
 pub const NIMBLE_PHISHING_INSTRUCTIONS: &str = "判斷「這封郵件本身」是否為寄給收件者的釣魚、詐騙或惡意推銷信。釣魚信的典型特徵：以系統管理員、IT、郵件服務或帳號安全的名義，宣稱收件者信箱「發生錯誤」「容量已滿」「將被停用」「需要驗證」，並催促點擊按鈕或連結（如「立即驗證」），而寄件網域與收件者所屬單位或該服務無關（例如政府、學校或陌生網站的網域）。此類信件即使 SPF/DKIM/DMARC 通過（通過只代表寄件網域沒被偽造，不代表內容可信），仍是釣魚，答案為是。例外：若這封信是郵件稽核／閘道系統自動產生的垃圾信隔離明細或攔截通報（內文只是列出被攔截的信件、過濾原因與處理選項，如「SPF 驗證失敗」「RBL」只是描述被攔截的那些信），且其中連結的網域與寄件者網域一致，它本身是正常的系統通知，答案為否；但若這類通知要求輸入帳號密碼、連結網域與寄件者不符或寄件網域可疑，則仍是釣魚。";
 
-/// 組出 is_phishing 問句：Nimble 用 instructions 內含排除條件的版本，雲端 Jev 維持原寫法。
+/// 組出 is_phishing 問句：地端 System One（Nimble / Clef / Clef-Flash）用 instructions 內含排除條件的版本，雲端 Jev 維持原寫法。
 pub fn jev_question(model: &str) -> serde_json::Value {
-    if is_nimble_model(model) {
+    if is_local_systemone_model(model) {
         serde_json::json!({
             "type": "noul",
             "instructions": NIMBLE_PHISHING_INSTRUCTIONS
@@ -498,7 +509,7 @@ pub fn llm_judge_jev(
             .read_to_string()
             .unwrap_or_else(|_| "(無法讀取回應內文)".into());
         let hint = if status.as_u16() == 404 {
-            "（若為 Ollama，請確認已執行 ollama pull nimble 且版本支援 /v1/systemone）"
+            "（若為 Ollama，請確認已執行 ollama pull nimble 或 ollama pull clef-flash，且版本支援 /v1/systemone）"
         } else {
             ""
         };

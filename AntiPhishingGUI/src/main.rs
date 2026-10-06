@@ -1843,7 +1843,7 @@ impl App {
                         "agy" => "Antigravity CLI (agy)",
                         "codex" => "OpenAI Codex CLI (codex)",
                         "command" => "自訂命令列 (command)",
-                        "jev" => "TypeSafe Jev / Ollama Nimble (jev)",
+                        "jev" => "TypeSafe Jev / Ollama Nimble / Clef (jev)",
                         _ => "OpenAI 相容 HTTP API (api)",
                     })
                     .show_ui(ui, |ui| {
@@ -1870,7 +1870,7 @@ impl App {
                         ui.selectable_value(
                             &mut current_backend,
                             "jev".into(),
-                            "TypeSafe Jev / Ollama Nimble (jev)",
+                            "TypeSafe Jev / Ollama Nimble / Clef (jev)",
                         );
                         ui.selectable_value(
                             &mut current_backend,
@@ -1939,7 +1939,7 @@ impl App {
                 ui.small("✔ 使用 OpenAI 相容 API：支援 Ollama / LM Studio 或雲端服務；地端免認證模型 API 金鑰可留空。");
             }
             Some(LlmBackend::Jev) => {
-                ui.small("✔ 使用 TypeSafe Jev API (System One)：採混合評分制，Jev 評定釣魚機率換算為 0~分數上限並與安全規則加總判定；雲端 Jev 需 API 金鑰，地端 Ollama Nimble 請將模型名稱填 nimble、網址填 http://127.0.0.1:11434，金鑰可留空。");
+                ui.small("✔ 使用 TypeSafe Jev API (System One)：採混合評分制，Jev 評定釣魚機率換算為 0~分數上限並與安全規則加總判定；雲端 Jev 需 API 金鑰，地端 Ollama 模型（nimble、clef、clef-flash）請填對應模型名稱與伺服器網址（如 http://127.0.0.1:11434），金鑰可留空。");
             }
             None => {
                 ui.small("⚠ LLM 判定未啟用（若欲使用請選擇 CLI 後端或填入 API 伺服器網址）。未啟用時不會搬移任何郵件。");

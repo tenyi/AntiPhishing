@@ -49,13 +49,13 @@ theme = "system"
 # backend = "api"
 base_url = "http://127.0.0.1:11434/v1"
 model = "llama3.1"
-# 可選：API 金鑰（若使用地端免認證模型如 Ollama 可留空；若使用需認證模型或雲端 Jev 必須填入；model 為 nimble 的地端 Nimble 免填）
+# 可選：API 金鑰（若使用地端免認證模型如 Ollama 可留空；若使用需認證模型或雲端 Jev 必須填入；model 為 nimble、clef、clef-flash 等地端模型免填）
 api_key = ""
 # 可選：當 backend = "jev" 時的分數換算上限（未滿 60% 不計分，60%~100% 線性換算），預設 10
 # jev_max_score = 10
 # 可選：Jev 起算機率（低於此值不計分，起算值~1.0 線性換算為 0~jev_max_score 分），預設 0.6；設 0 即 0~100% 全程給分
 # jev_min_prob = 0
-# 地端 Ollama Nimble（相容 Jev，ollama pull nimble）：backend = "jev"、model = "nimble"、base_url = "http://127.0.0.1:11434"（必填，.../v1 亦可），免 api_key，門檻與 Jev 相同
+# 地端 Ollama System One（相容 Jev，如 nimble、clef、clef-flash）：backend = "jev"、model = "clef-flash"、base_url = "http://127.0.0.1:11434"（必填，.../v1 亦可），免 api_key，門檻與 Jev 相同
 # 可選：當 backend = "command" 時執行的自訂命令字串（例如 "ollama run llama3.1"）
 # command = ""
 # 可選：單一請求或命令執行逾時（秒），預設 120

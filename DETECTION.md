@@ -157,26 +157,39 @@ flowchart TD
 在 System Prompt 與 Jev criteria 中明確注入了排除條件（Signal 5）：
 > 若郵件主旨或內文為企業資安通報、垃圾信隔離明細、防毒/SOC分析回報（如 Hinet SOC、防垃圾信通知等），且其安全驗證（SPF/DKIM/DMARC）通過或無偽造警示，即使內文引用被攔截之惡意網址或樣本，亦屬於正常資安服務通知，**不得判定為釣魚郵件（is_phishing 必須為 false）**。
 
-### 5.4 Nimble 與雲端 Jev 的差異與程式作法
+### 5.4 地端 System One（Nimble / Clef / Clef-Flash）與雲端 Jev 的差異與程式作法
 兩者共用同一個 `POST /v1/systemone`、同一個 `noul` 請求／回應格式與同一套起算機率（`jev_min_prob`，預設 60%）換算，差異只在**送出的問題內容**與**金鑰檢查**：
 
-| 項目 | 雲端 Jev（`model` 留空或 `jev-*`） | 地端 Nimble（`model` 以 `nimble` 開頭） |
+| 項目 | 雲端 Jev（`model` 留空或 `jev-*`） | 地端 System One（`model` 以 `nimble` 或 `clef` 開頭，如 `nimble`、`clef`、`clef-flash`） |
 | :--- | :--- | :--- |
 | 金鑰 | 必填 `api_key` | 不檢查（Ollama 忽略 Bearer），但必填 `base_url` |
 | 問題內容 | `instructions` + `criteria`（含 5.3 的排除條件） | 僅 `instructions`，**不送 `criteria`** |
 | 排除規則位置 | 寫在 `criteria` | 寫在 `instructions` |
 
-**為何分開**：實測 Nimble（Qwen3.5-9B 微調）對 `criteria` 的遵循度不如雲端 Jev，會把 MailCloud 垃圾信隔離明細誤判為釣魚（97%）。且該類通知信常沒有 `Authentication-Results` 標頭，若排除規則要求「驗證通過」就無法生效。
+**為何分開**：實測地端模型（Qwen3.5-9B 微調的 Nimble，以及 Clef-Flash）對 `criteria` 的遵循度皆不如雲端 Jev，送 criteria 會把 MailCloud 垃圾信隔離明細（`notspam.eml`）誤判為釣魚（Nimble 達 97%、Clef-Flash 達 66.7%）。且該類通知信常沒有 `Authentication-Results` 標頭，若排除規則要求「驗證通過」就無法生效。
 
 **程式作法**（CLI 與 GUI 相同）：
-- `is_nimble_model(model)`：`model` 去空白、轉小寫後以 `nimble` 開頭即為 Nimble。
-- `jev_question(model)`：Nimble 回傳 `NIMBLE_PHISHING_INSTRUCTIONS`（僅 `instructions`）；其他情況回傳原本的 `instructions` + `criteria`，雲端 Jev 請求內容不變。
-- Nimble 指示語（B3 方案）判斷「這封郵件本身」是否為釣魚，並同時含正反條件：
+- `is_local_systemone_model(model)`：`model` 去空白、轉小寫後以 `nimble` 或 `clef` 開頭即為地端 System One 模型。
+- `jev_question(model)`：地端 System One 回傳專用指示（僅 `instructions`，內含隔離明細排除條件）；其他情況回傳原本的 `instructions` + `criteria`，雲端 Jev 請求內容不變。
+- 專用指示語判斷「這封郵件本身」是否為釣魚，並同時含正反條件：
   1. 閘道／稽核系統自動產生的垃圾信隔離明細，且連結網域與寄件網域一致 → 視為正常（否）。
   2. 偽造隔離／稽核通知而要求輸入帳密、網域不一致或可疑、或驗證失敗 → 仍為釣魚（是）。
   3. 以 IT／郵件／帳號安全名義宣稱「信箱發生錯誤、需驗證」並催促點擊，但寄件網域與收件者單位無關 → 釣魚（是），即使 SPF/DKIM/DMARC 通過（通過只代表寄件網域未被偽造，如被盜用的合法網站寄出的釣魚信）。
-- 實測（`10.10.15.151`）：真實隔離明細 0.962 → 0.069；DHL 釣魚 0.990 → 0.991；偽造隔離通知 0.954 → 0.843；一般會議信 0.006。樣本數少，可能過擬合，請以更多信件持續驗證。
-- 限制：郵件 HTML 轉純文字後連結網域可能遺失，網域一致性判斷未必每次可用。
+
+**Clef-Flash 實測表現（`10.10.15.151`，4 封代表性郵件）**：
+- `notspam.eml`（MailCloud 隔離明細）：專用指示評定釣魚機率 **12.15%**（放行；若送 criteria 則高達 66.67% 誤判）。
+- `spam01.eml`（冒充聯強國際推銷）：評定機率 **87.4%**（Nimble 僅 12.3% 漏抓）。
+- `spam02.eml`（印尼網域冒充 Sinotech 電子郵件驗證）：評定機率 **94.1%**（Nimble 為 57.5%）。
+- `spam03.eml`（日本網域冒充 Sinotech® 8 封新郵件）：評定機率 **93.8%**（Nimble 僅 9.3% 漏抓）。
+實測證明：**Clef-Flash 的行為模式與 Nimble 相同（必須依賴 instructions 排除通知誤判），但釣魚檢測靈敏度與準確度大幅超越 Nimble。**
+
+**參數設定建議**：
+在規則門檻 `threshold = 10` 下，釣魚信規則分可能為 0~2 分。若使用預設 `jev_max_score = 10, jev_min_prob = 0.6`，規則分 0 的釣魚信（如 spam03）可能僅換算得 8 分而漏抓。建議調整為：
+- `jev_max_score = 12`，`jev_min_prob = 0.5`（50% 起算）：
+  - 隔離明細（12.2% < 50%）：Jev 分數 0 分（絕對不誤判）。
+  - spam01/02/03：換算 8~11 分，加計規則分後總分 10~12 分（精準達標隔離）。
+- 或使用 `jev_max_score = 12`，`jev_min_prob = 0`（0% 起算）：
+  - 隔離明細換算得 1 分，仍遠低於門檻 10；三封釣魚信總分皆達 11~12 分全數隔離。
 
 ---
 

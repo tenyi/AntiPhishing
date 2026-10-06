@@ -67,7 +67,7 @@ impl LlmBackend {
             "codex" | "codex-cli" => Some(Self::Codex),
             "agy" | "agy-cli" | "antigravity" => Some(Self::Agy),
             "command" | "cmd" | "custom" => Some(Self::Command),
-            "jev" | "typesafe" | "systemone" => Some(Self::Jev),
+            "jev" | "typesafe" | "systemone" | "nimble" | "clef" | "clef-flash" => Some(Self::Jev),
             _ => None,
         }
     }
@@ -168,8 +168,8 @@ pub fn llm_config(llm: &LlmConfig) -> Option<LlmConfig> {
             // CLI 模式已指定 backend 即為有效，model 為可選
         }
         LlmBackend::Jev => {
-            if is_nimble_model(&llm.model) {
-                // 地端 Nimble：不檢查金鑰，但必須指定 base_url（避免誤送雲端）
+            if is_local_systemone_model(&llm.model) {
+                // 地端 System One（Nimble / Clef / Clef-Flash）：不檢查金鑰，但必須指定 base_url（避免誤送雲端）
                 if llm.base_url.trim().is_empty() {
                     return None;
                 }

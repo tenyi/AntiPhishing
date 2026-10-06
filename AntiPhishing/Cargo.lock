@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "anti-phishing"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "antiphishing-core",
  "anyhow",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "antiphishing-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
