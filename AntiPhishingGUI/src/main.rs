@@ -412,8 +412,11 @@ impl eframe::App for AlreadyRunningApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        ui.heading("AntiPhishing 已在執行中");
-        ui.label("請從系統匣開啟現有的視窗；本提示視窗將自動關閉。");
+        // 同主視窗：以 CentralPanel 畫出主題底色與內距
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.heading("AntiPhishing 已在執行中");
+            ui.label("請從系統匣開啟現有的視窗；本提示視窗將自動關閉。");
+        });
     }
 }
 
@@ -1695,7 +1698,7 @@ impl App {
         ui.horizontal(|ui| {
             let tabs = [
                 (SettingsTab::Imap, "📧 IMAP 信箱"),
-                (SettingsTab::Llm, "🤖 LLM 智慧判定"),
+                (SettingsTab::Llm, "🕵 LLM 智慧判定"),
                 (SettingsTab::Detection, "🛡 偵測規則"),
                 (SettingsTab::Schedule, "⏱ 排程與系統匣"),
             ];
@@ -2063,10 +2066,12 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        match self.active_view {
+        // 必須包在 CentralPanel 內：它負責塗上主題的 panel_fill 底色並留內距；
+        // 少了它，背景會是視窗清除色（黑色），淺色主題就變成黑底白卡片且內容貼齊視窗邊緣
+        egui::CentralPanel::default().show(ui, |ui| match self.active_view {
             ActiveView::Dashboard => self.ui_dashboard(ui),
             ActiveView::Settings(tab) => self.ui_settings(ui, tab),
-        }
+        });
 
         // 搬移確認對話框：當有待隔離項目且 show_confirm_dialog 為 true 時繪製
         if self.show_confirm_dialog && !self.pending_queue.is_empty() {
@@ -2263,6 +2268,8 @@ fn find_font(requested: &str) -> Option<(String, Vec<u8>)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let home_path = Path::new(&home);
 
+    // 刻意不收可變字型（NotoSansTC-VF.ttf）：egui 無法指定字重軸，只會用字型檔的預設字重，
+    // 而思源黑體 VF 的預設字重偏細，淺色主題下幾乎看不清；只認靜態 Regular 字重檔
     if requested.eq_ignore_ascii_case("noto sans tc") || requested == "思源黑體" {
         candidates.push((
             "Noto Sans TC".into(),
@@ -2270,19 +2277,11 @@ fn find_font(requested: &str) -> Option<(String, Vec<u8>)> {
         ));
         candidates.push((
             "Noto Sans TC".into(),
-            home_path.join("Library/Fonts/NotoSansTC-VF.ttf"),
-        ));
-        candidates.push((
-            "Noto Sans TC".into(),
             PathBuf::from("/Library/Fonts/NotoSansTC-Regular.otf"),
         ));
         candidates.push((
             "Noto Sans TC".into(),
-            PathBuf::from("/Library/Fonts/NotoSansTC-VF.ttf"),
-        ));
-        candidates.push((
-            "Noto Sans TC".into(),
-            PathBuf::from(r"C:\Windows\Fonts\NotoSansTC-VF.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\NotoSansTC-Regular.otf"),
         ));
         candidates.push((
             "Noto Sans TC".into(),
@@ -2414,9 +2413,10 @@ fn find_font(requested: &str) -> Option<(String, Vec<u8>)> {
 
     #[cfg(target_os = "windows")]
     {
+        // 退回順序：靜態思源黑體 Regular → 微軟正黑體（Windows 內建，字重正常）
         candidates.push((
             "Noto Sans TC".into(),
-            PathBuf::from(r"C:\Windows\Fonts\NotoSansTC-VF.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\NotoSansTC-Regular.otf"),
         ));
         candidates.push((
             "Microsoft JhengHei".into(),
@@ -3510,6 +3510,27 @@ mod tests {
                 fallback_opt.is_some(),
                 "不存在的字型名稱應自動退回系統繁體中文字型"
             );
+        }
+    }
+
+    #[test]
+    fn theme_text_has_enough_contrast_in_both_modes() {
+        // 業務意圖：淺色主題文字要夠深、深色主題文字要夠亮，避免「淺色系看不清」再發生
+        let ctx = egui::Context::default();
+        theme::install_style(&ctx);
+        let light = ctx.style_of(egui::Theme::Light);
+        let dark = ctx.style_of(egui::Theme::Dark);
+        for color in [
+            light.visuals.widgets.noninteractive.fg_stroke.color,
+            light.visuals.widgets.inactive.fg_stroke.color,
+        ] {
+            assert!(color.r() <= 60, "淺色主題文字過淺：{color:?}");
+        }
+        for color in [
+            dark.visuals.widgets.noninteractive.fg_stroke.color,
+            dark.visuals.widgets.inactive.fg_stroke.color,
+        ] {
+            assert!(color.r() >= 200, "深色主題文字過暗：{color:?}");
         }
     }
 

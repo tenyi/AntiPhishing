@@ -89,6 +89,9 @@ pub fn install_style(ctx: &egui::Context) {
         v.faint_bg_color = Color32::from_rgb(34, 37, 44);
         v.extreme_bg_color = Color32::from_rgb(18, 19, 23);
         v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(58, 62, 72);
+        // 一般文字（label）與按鈕文字提亮，egui 預設的灰階對比不足
+        v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(225);
+        v.widgets.inactive.fg_stroke.color = Color32::from_gray(230);
     });
     ctx.style_mut_of(Theme::Light, |style| {
         let v = &mut style.visuals;
@@ -97,6 +100,9 @@ pub fn install_style(ctx: &egui::Context) {
         v.faint_bg_color = Color32::WHITE;
         v.extreme_bg_color = Color32::from_rgb(250, 251, 252);
         v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(218, 222, 229);
+        // 一般文字（label）與按鈕文字加深：egui 淺色預設文字偏灰，白底上看不清楚
+        v.widgets.noninteractive.fg_stroke.color = Color32::from_gray(30);
+        v.widgets.inactive.fg_stroke.color = Color32::from_gray(25);
     });
 }
 

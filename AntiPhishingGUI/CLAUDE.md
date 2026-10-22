@@ -35,7 +35,7 @@ Release 執行檔：`.\target\release\anti-phishing-gui.exe`。執行檔旁需�
 - **UI 布局**：主畫面為三張卡片（`theme::card`）：「狀態」（掃描進度只在此顯示一次）、「掃描」（日期、立即掃描、.eml 判定）、「執行紀錄」（填滿剩餘高度，恆顯示，空時顯示「尚無執行紀錄」）；有待確認郵件時頂部顯示 danger 色橫條。設定頁以分頁按鈕切換，內容包在卡片內。
 - **外觀主題**：`[gui] theme`（`system`／`light`／`dark`，預設 `system`）；`theme::install_style` 於 `App::new` 安裝間距、字級、圓角與兩套底色，`theme::apply_theme` 套用偏好；主畫面頂列按鈕與「排程與系統匣」分頁的下拉選單可即時切換，按「儲存設定」才寫入。顏色一律取自 `theme::palette`（依深淺色），不要寫死 `Color32::from_rgb`。
 - **系統匣**：關閉視窗預設轉為縮小至系統匣（`CancelClose` + `Visible(false)` 或 `Minimized(true)`，視 `hide_taskbar_when_minimized`）；真正退出僅經系統匣「結束」（先設 `allow_exit` 再 `Close`）。`single-instance` 在 `main` 入口防重複啟動。
-- **字型**：`font_family` 支援字型檔路徑或固定映射（Noto Sans TC → `NotoSansTC-VF.ttf`、微軟正黑體 → `msjh.ttc`），啟動時注入 egui，改後需重啟。
+- **字型**：`font_family` 支援字型檔路徑或固定映射（Noto Sans TC → `NotoSansTC-Regular.otf`（刻意不用可變字型 VF：egui 無法指定字重，預設字重過細），Windows 找不到時退回微軟正黑體、微軟正黑體 → `msjh.ttc`），啟動時注入 egui，改後需重啟。
 
 ## 開發守則
 
