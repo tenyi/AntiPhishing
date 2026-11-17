@@ -29,3 +29,7 @@ MiniMax.md
 
 # 根目錄的 .eml 測試樣本（可能含收件人資訊，嚴禁提交）
 /*.eml
+
+# 瀏覽器除錯設定檔（含 Cookie 與瀏覽紀錄等個資，嚴禁提交）
+chrome-debug-profile/
+**/chrome-debug-profile/

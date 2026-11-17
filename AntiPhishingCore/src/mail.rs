@@ -78,9 +78,17 @@ pub static RE_MULTIPLE_NEWLINES: LazyLock<Regex> =
 pub static RE_ANY_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"https?://").expect("固定正規表示式"));
 
-/// 連結主機名稱段含 @（如 https://paypal.com@evil.example/），路徑與參數中的 @ 不算
+/// 連結主機名稱段含 @（如 https://paypal.com@evil.example/），路徑與參數中的 @ 不算。
+/// 主機段排除引號與角括號，避免 `<a href="https://a.com">user@a.com` 跨過標籤誤判。
 pub static RE_LINK_WITH_AT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"https?://[^\s/?#]*@").expect("固定正規表示式"));
+    LazyLock::new(|| Regex::new(r#"https?://[^\s/?#"'<>]*@"#).expect("固定正規表示式"));
+
+/// 評分前移除的「非連結網址」：DOCTYPE 宣告與 xmlns 命名空間屬性（如 w3.org、
+/// schemas.microsoft.com），這些幾乎出現在每封 HTML 信中，不應計入「含多個連結」。
+pub static RE_NON_LINK_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<!doctype[^>]*>|\bxmlns(?::[\w-]+)?\s*=\s*(?:"[^"]*"|'[^']*')"#)
+        .expect("固定正規表示式")
+});
 
 pub static RE_QR_IMAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"img[^>]*alt=["'][^"']*qr"#).expect("固定正規表示式"));
@@ -119,17 +127,20 @@ pub fn html_to_text(html: &str) -> String {
     RE_MULTIPLE_NEWLINES.replace_all(&text, "\n\n").into_owned()
 }
 
-/// 組裝送 LLM 的內文：text/plain + text/html（轉純文字）。
+/// 組裝送 LLM 的內文：text/html（轉純文字）在前、text/plain 在後。
+///
+/// 收件軟體實際顯示的是 HTML 版本；若 plain 在前，攻擊者可塞一大段正常 text/plain
+/// 把 HTML 中的惡意內容擠出 `max_chars` 截斷範圍，讓 LLM 看不到。故 HTML 一律優先。
 pub fn extract_body_text(mail: &mailparse::ParsedMail<'_>) -> (String, String) {
     let mut plain = String::new();
     let mut html = String::new();
     collect_text_parts(mail, &mut plain, &mut html);
-    // 評分用原始 HTML（保留 <img alt> 等標籤特徵）
-    let score_body = format!("{plain}\n{html}");
+    // 評分用原始 HTML（保留 <img alt> 等標籤特徵；噪音於 phishing_score 內清除）
+    let score_body = format!("{html}\n{plain}");
     let llm_body = if html.is_empty() {
         plain
     } else {
-        format!("{plain}\n{}", html_to_text(&html))
+        format!("{}\n{plain}", html_to_text(&html))
     };
     (llm_body, score_body)
 }
@@ -186,6 +197,28 @@ impl EmailAuthStatus {
         }
         parts.join("；")
     }
+
+    /// 是否有受信 MTA 明確判定 DMARC 通過（From 網域對齊驗證）。
+    /// 信任網域豁免必須以此為前提：「沒有失敗」不等於「通過」，
+    /// 沒有任何驗證標頭或 dmarc=none 的偽造信也會沒有警示。
+    pub fn dmarc_pass(&self) -> bool {
+        self.dmarc.as_deref() == Some("pass")
+    }
+}
+
+/// 取出驗證結果標頭的 authserv-id（收信伺服器識別），已轉小寫的標頭值。
+///
+/// 格式：`[i=N;] authserv-id [版本]; method=result ...`。第一個非 `i=` 片段若含 `=`，
+/// 表示省略了 authserv-id（如 `i=1; dmarc=fail`），回傳 None。
+pub fn auth_results_server_id(lower: &str) -> Option<&str> {
+    let token = lower
+        .split(';')
+        .map(str::trim)
+        .find(|t| !t.starts_with("i="))?;
+    if token.is_empty() || token.contains('=') {
+        return None;
+    }
+    token.split_whitespace().next()
 }
 
 /// 檢查並解析郵件驗證標頭（SPF / DKIM / DMARC / TLS）與偽造警示
@@ -196,9 +229,14 @@ impl EmailAuthStatus {
 /// - `Authentication-Results` / `ARC-Authentication-Results`：只信任 `i=1`（最外層
 ///   受信邊界）；沒有 `i=` 視為受信邊界（多數現代 MTA 預設）。
 /// - `Received-SPF`：僅提供 SPF 結果，不解析 DKIM / DMARC。
+/// - 第一個受信驗證標頭決定「我方收信伺服器」的 authserv-id；之後的標頭只有在
+///   authserv-id 相同時才補齊缺少的欄位（同一台 MTA 常分寫 A-R 與 ARC-A-R）。
+///   第一個標頭沒有 authserv-id 時不合併任何下層標頭，避免採用寄件者自帶的偽造結果。
 /// - `dmarc=reject` 視同 `fail`；`spf=softfail` 不視為偽造（常見於 forwarding / mailing list）。
 pub fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
     let mut status = EmailAuthStatus::default();
+    // 第一個受信驗證標頭的 authserv-id：None＝尚未遇到；Some(None)＝首個標頭未寫 id
+    let mut anchor_id: Option<Option<String>> = None;
     for header in &mail.headers {
         let key = header.get_key();
         let lower = header.get_value().to_lowercase();
@@ -219,6 +257,14 @@ pub fn check_auth_status(mail: &mailparse::ParsedMail<'_>) -> EmailAuthStatus {
         }
         if !matches!(parse_auth_results_instance(&lower), Some(1) | None) {
             continue;
+        }
+        let server_id = auth_results_server_id(&lower).map(str::to_string);
+        match &anchor_id {
+            // 首個受信標頭：記下收信伺服器 id
+            None => anchor_id = Some(server_id),
+            // 下層標頭：僅同一台收信伺服器（id 相同且非空）寫的才可補齊欄位
+            Some(Some(anchor)) if server_id.as_deref() == Some(anchor.as_str()) => {}
+            Some(_) => continue,
         }
         if status.dmarc.is_none() {
             status.dmarc = find_auth_result(&lower, "dmarc", &["pass", "fail", "reject", "none"])
@@ -360,9 +406,12 @@ pub fn is_trusted_sender(from: &str, trusted_domains: &[String]) -> Option<Strin
 
 /// 取最上層 Received 標頭的來源 IP（此行由我方收信伺服器加上，寄件端無法竄改）
 ///
-/// 優先取 from 段落中方括號內的 IP（伺服器實際看到的連線位址）；
-/// 沒有方括號時才取 from 後的第一個詞，且必須是合法 IP。
-/// from 後的名稱可能是寄件端 HELO 自報值，有方括號時一律不採用，避免偽造。
+/// 常見格式為 `from <HELO> (<反解名稱> [實際IP])`：from 後第一個詞是寄件端 HELO
+/// 自報值（可寫成 `[信任IP]` 偽造），伺服器實際看到的連線位址在括號註解內。規則：
+/// - from 段落有括號註解時，只採用括號內的 IP（優先方括號，其次括號內最後一個詞，
+///   相容 Exchange 的 `from HOST (IP)`）；Exim 的 `helo=` 值為自報，一律剔除。
+/// - 沒有任何括號註解時，才採用 from 後的第一個詞（或其方括號），且必須是合法 IP
+///   （部分閘道寫成 `from 203.69.82.82`）。
 pub fn top_received_ip(mail: &mailparse::ParsedMail<'_>) -> Option<std::net::IpAddr> {
     let val = mail.headers.get_first_value("Received")?;
     // 標頭可能折行，先將所有空白正規化為單一空格
@@ -371,13 +420,97 @@ pub fn top_received_ip(mail: &mailparse::ParsedMail<'_>) -> Option<std::net::IpA
     let rest = lower.strip_prefix("from ")?;
     // 只看 from 段落（" by " 之後是收信伺服器自己的資訊）
     let from_part = rest.split(" by ").next().unwrap_or(rest);
-    if let Some(start) = from_part.find('[') {
-        let inner = &from_part[start + 1..];
+    // 解析單一位址字串：去掉方括號與 IPv6 前綴（如 [IPv6:2001:db8::1]）
+    let parse_ip = |s: &str| -> Option<std::net::IpAddr> {
+        s.trim_matches(|c| c == '[' || c == ']')
+            .trim_start_matches("ipv6:")
+            .parse()
+            .ok()
+    };
+    // 第一個詞是 HELO，括號註解從第一個 '(' 開始；HELO 不含空白，故以空白後的 '(' 為準
+    let (helo, comment) = match from_part.split_once(" (") {
+        Some((helo, comment)) => (helo, Some(comment)),
+        None => (from_part, None),
+    };
+    let Some(comment) = comment else {
+        return parse_ip(helo.split_whitespace().next()?);
+    };
+    // 剔除 Exim 的 helo=xxx（寄件端自報值）後，再找括號內的方括號 IP
+    let cleaned: String = comment
+        .split_whitespace()
+        .filter(|word| !word.starts_with("helo="))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(start) = cleaned.find('[') {
+        let inner = &cleaned[start + 1..];
         let end = inner.find(']')?;
-        // IPv6 可能寫成 [IPv6:2001:db8::1]
-        return inner[..end].trim_start_matches("ipv6:").parse().ok();
+        return parse_ip(&inner[..end]);
     }
-    from_part.split_whitespace().next()?.parse().ok()
+    // 括號內無方括號：取第一段括號內最後一個詞（Exchange：from HOST (2603:10b6::1)）
+    let first_group = cleaned.split(')').next()?;
+    parse_ip(first_group.split_whitespace().last()?)
+}
+
+/// 信任清單判定結果
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrustDecision {
+    /// 不在信任清單
+    NotListed,
+    /// 豁免（說明供 log 顯示）
+    Exempt(String),
+    /// 命中信任清單但驗證不足，取消豁免（命中項目, 原因）
+    Rejected(String, String),
+}
+
+/// 綜合信任清單與安全驗證結果，決定是否豁免（CLI、GUI、.eml 模式共用同一規則）。
+///
+/// - 信任網域：From 網域可被任意偽造，必須由受信 MTA 判定 DMARC=pass 才豁免；
+///   沒有驗證標頭、dmarc=none 或有失敗警示都取消豁免。收信伺服器不寫 DMARC 結果時，
+///   信任網域豁免等同停用（改為照常送檢，屬安全側）。
+/// - 信任來源 IP：IP 取自我方收信伺服器所見的連線位址，無驗證失敗警示即豁免。
+pub fn trust_decision(
+    mail: &mailparse::ParsedMail<'_>,
+    from: &str,
+    detection: &DetectionConfig,
+    auth: &EmailAuthStatus,
+) -> TrustDecision {
+    let mut rejected = None;
+    if let Some(domain) = is_trusted_sender(from, &detection.trusted_sender_domains) {
+        if !auth.warnings.is_empty() {
+            rejected = Some((
+                domain,
+                format!("安全驗證失敗（{}）", auth.warnings.join("；")),
+            ));
+        } else if !auth.dmarc_pass() {
+            let dmarc = auth.dmarc.as_deref().unwrap_or("無結果");
+            rejected = Some((
+                domain,
+                format!("DMARC 未通過（{dmarc}），無法確認寄件網域未遭偽造"),
+            ));
+        } else {
+            return TrustDecision::Exempt(format!("寄件網域 {domain}，DMARC 通過"));
+        }
+    }
+    if let Some(ip) = top_received_ip(mail)
+        && detection
+            .trusted_relay_ips
+            .iter()
+            .any(|s| s.trim().parse::<std::net::IpAddr>().ok() == Some(ip))
+    {
+        if auth.warnings.is_empty() {
+            return TrustDecision::Exempt(format!("來源 IP {ip}"));
+        }
+        if rejected.is_none() {
+            rejected = Some((
+                format!("來源 IP {ip}"),
+                format!("安全驗證失敗（{}）", auth.warnings.join("；")),
+            ));
+        }
+    }
+    match rejected {
+        Some((matched, reason)) => TrustDecision::Rejected(matched, reason),
+        None => TrustDecision::NotListed,
+    }
 }
 
 /// 檢查信件是否來自信任來源：先比對寄件網域，再比對最上層 Received 來源 IP
@@ -432,7 +565,14 @@ pub fn phishing_score(
     auth_warnings: &[String],
     config: &DetectionConfig,
 ) -> (u32, Vec<String>) {
-    let text = format!("{subject}\n{body}").to_lowercase();
+    // 先清掉評分噪音：style/script、base64 內嵌圖（data: URI）、DOCTYPE 與 xmlns 網址。
+    // `raw` 保留標籤供連結、@ 混淆與 QR alt 比對；`text` 剝掉標籤只供關鍵字比對，
+    // 避免關鍵字（如 qr）命中 base64 內容或標籤屬性造成誤判。
+    let cleaned = RE_STYLE_SCRIPT.replace_all(body, " ");
+    let cleaned = RE_DATA_URI.replace_all(&cleaned, " ");
+    let cleaned = RE_NON_LINK_URL.replace_all(&cleaned, " ");
+    let raw = format!("{subject}\n{cleaned}").to_lowercase();
+    let text = format!("{subject}\n{}", html_to_text(&cleaned)).to_lowercase();
     let sender = parse_sender(from);
     let email_domain = sender.as_ref().map(|(_, domain)| domain.as_str());
     let mut score = 0;
@@ -455,17 +595,17 @@ pub fn phishing_score(
         score += count.min(3) as u32;
         reasons.push(format!("含 {count} 個可疑關鍵字"));
     }
-    let links = RE_ANY_LINK.find_iter(&text).count();
+    let links = RE_ANY_LINK.find_iter(&raw).count();
     if links >= 2 {
         score += 2;
         reasons.push("含多個連結".into());
     }
-    if RE_LINK_WITH_AT.is_match(&text) {
+    if RE_LINK_WITH_AT.is_match(&raw) {
         score += 3;
         reasons.push("連結含 @，可能偽裝網域".into());
     }
     // QR code 內嵌圖（quishing）：整封無連結、叫用戶拿手機掃碼
-    if RE_QR_IMAGE.is_match(&text) {
+    if RE_QR_IMAGE.is_match(&raw) {
         score += 4;
         reasons.push("含 QR code 圖片（quishing）".into());
     }
@@ -510,7 +650,10 @@ pub fn phishing_score(
         score += 4;
         reasons.push(auth_warnings.join("；"));
     }
-    if let Some(domain) = email_domain {
+    // 信任網域減分：驗證失敗（DMARC/SPF fail）時 From 網域可能遭偽造，不予減分
+    if let Some(domain) = email_domain
+        && auth_warnings.is_empty()
+    {
         if config
             .trusted_sender_domains
             .iter()
@@ -572,8 +715,15 @@ pub fn external_word_image_targets_from_word(bytes: &[u8]) -> Vec<String> {
             if entry.size() > MAX_DOCX_RELS_BYTES {
                 continue;
             }
+            // 標頭宣告的大小可被竄改，實際解壓也以 take 設上限（多讀 1 byte 用來判斷是否超限）
             let mut xml = String::new();
-            if entry.read_to_string(&mut xml).is_ok() {
+            let read = (&mut entry)
+                .take(MAX_DOCX_RELS_BYTES + 1)
+                .read_to_string(&mut xml);
+            if xml.len() as u64 > MAX_DOCX_RELS_BYTES {
+                continue;
+            }
+            if read.is_ok() {
                 targets.extend(external_image_targets_from_relationships(&xml));
             }
         }

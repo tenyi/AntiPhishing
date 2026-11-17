@@ -179,15 +179,52 @@ pub fn build_cli_command(config: &LlmConfig) -> Result<(String, Vec<String>)> {
     }
 }
 
+/// Windows：子行程不建立主控台視窗（GUI release 版每判一封才不會閃一個黑窗）
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 建立不顯示主控台視窗的 Command
+fn hidden_command(program: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// 逾時時終止子行程。Windows 上 `cmd /C` 或 npm 包裝的 CLI 會再開孫行程，
+/// `Child::kill` 只殺得到最外層，故先以 `taskkill /T /F` 連同整棵行程樹一起終止。
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = hidden_command("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// 執行外部 CLI 命令，透過 stdin 送入 prompt，並讀取 stdout 回傳純文字。
-/// 具備逾時防護與防管線緩衝區死鎖設計。
+///
+/// 逾時保護涵蓋整個流程：
+/// - 先啟動 stdout/stderr 讀取執行緒，再由獨立執行緒寫入 stdin，子行程不讀 stdin
+///   或輸出塞滿管線時都不會卡住主流程。
+/// - 讀取結果以 channel 搭配剩餘時間等待，絕不無限期 `join()`；子行程已結束但孫行程
+///   仍握著管線時，逾時後放棄讀取（執行緒留待孫行程結束自行收尾）並回報錯誤。
 pub fn run_cli_with_stdin(
     program: &str,
     args: &[String],
     prompt: &str,
     timeout: Duration,
 ) -> Result<String> {
-    let mut child = Command::new(program)
+    let mut child = hidden_command(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -195,28 +232,38 @@ pub fn run_cli_with_stdin(
         .spawn()
         .with_context(|| format!("無法啟動外部 CLI 命令：{program}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .with_context(|| format!("無法將 Prompt 寫入 {program} 的 stdin"))?;
-    }
-
     let mut stdout_pipe = child.stdout.take().context("無法取得子行程 stdout")?;
     let mut stderr_pipe = child.stderr.take().context("無法取得子行程 stderr")?;
-
-    let stdout_handle = thread::spawn(move || {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stdout_tx.send(buf);
     });
-    let stderr_handle = thread::spawn(move || {
+    thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
+        let _ = stderr_tx.send(buf);
     });
+
+    // stdin 於獨立執行緒寫入，寫完即 drop 關閉管線（讓子行程讀到 EOF）；
+    // 子行程不讀 stdin 時此執行緒會卡在 write，待子行程被終止後因管線斷開而結束。
+    if let Some(mut stdin) = child.stdin.take() {
+        let data = prompt.as_bytes().to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        });
+    }
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(50);
+    let timeout_error = || {
+        anyhow::anyhow!(
+            "CLI 命令 ({program}) 執行逾時（超過 {} 秒），已終止該行程",
+            timeout.as_secs()
+        )
+    };
     let status = loop {
         if let Some(status) = child
             .try_wait()
@@ -225,18 +272,23 @@ pub fn run_cli_with_stdin(
             break status;
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "CLI 命令 ({program}) 執行逾時（超過 {} 秒），已終止該行程",
-                timeout.as_secs()
-            );
+            kill_process_tree(&mut child);
+            return Err(timeout_error());
         }
         thread::sleep(poll_interval);
     };
 
-    let stdout_bytes = stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    // 子行程已結束：在剩餘時間內（至少保留 2 秒收尾）等待輸出讀完
+    let grace = timeout
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_secs(2));
+    let deadline = Instant::now() + grace;
+    let recv = |rx: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    };
+    let (Ok(stdout_bytes), Ok(stderr_bytes)) = (recv(&stdout_rx), recv(&stderr_rx)) else {
+        bail!("CLI 命令 ({program}) 已結束，但其衍生行程仍佔用輸出管線，逾時放棄讀取");
+    };
     let stdout_text = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
 

@@ -93,11 +93,9 @@ pub fn evaluate_mail(
         basis: "傳統規則",
     };
 
-    // 信任寄件者且驗證無失敗：與 IMAP 模式相同直接豁免（仍列出結果以便看出原因）
-    if let Some(matched) = trusted_source(&mail, &from, config)
-        && auth_warnings.is_empty()
-    {
-        ev.llm_text = format!("未送檢（寄件來源在信任清單：{matched}）");
+    // 信任來源豁免：與 IMAP 模式共用 trust_decision（信任網域須 DMARC 通過）
+    if let TrustDecision::Exempt(matched) = trust_decision(&mail, &from, config, &auth_status) {
+        ev.llm_text = format!("未送檢（信任來源：{matched}）");
         ev.basis = "信任寄件者豁免";
         return Ok(ev);
     }
@@ -137,6 +135,8 @@ pub fn evaluate_mail(
             &auth_warnings,
         ) {
             Ok(prob) => {
+                // 成功即歸零：熔斷只針對「連續」失敗
+                *failures = 0;
                 let points =
                     calculate_jev_points(prob, llm_config.jev_max_score, llm_config.jev_min_prob);
                 ev.llm_text = format!("Jev 釣魚機率 {:.1}%（+{points} 分）", prob * 100.0);
@@ -162,6 +162,8 @@ pub fn evaluate_mail(
             &auth_warnings,
         ) {
             Ok(verdict) => {
+                // 成功即歸零：熔斷只針對「連續」失敗
+                *failures = 0;
                 ev.llm_text = format!(
                     "LLM 判定{}：{}",
                     if verdict.is_phishing { "是" } else { "否" },

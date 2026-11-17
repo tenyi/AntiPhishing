@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "anti-phishing"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "antiphishing-core",
  "anyhow",
@@ -110,12 +110,11 @@ dependencies = [
  "serde_json",
  "toml",
  "ureq",
- "zip 8.6.0",
 ]
 
 [[package]]
 name = "antiphishing-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -127,7 +126,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
- "zip 9.0.0-pre3",
+ "zip",
 ]
 
 [[package]]
@@ -881,15 +880,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "lzma-rust2"
-version = "0.16.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
-dependencies = [
- "sha2",
-]
 
 [[package]]
 name = "lzma-rust2"
@@ -1952,33 +1942,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "aes",
- "bzip2",
- "constant_time_eq",
- "crc32fast",
- "deflate64",
- "flate2",
- "getrandom 0.4.3",
- "hmac",
- "indexmap",
- "lzma-rust2 0.16.5",
- "memchr",
- "pbkdf2",
- "ppmd-rust",
- "sha1",
- "time",
- "typed-path",
- "zeroize",
- "zopfli",
- "zstd",
-]
-
-[[package]]
-name = "zip"
 version = "9.0.0-pre3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58e8082c6efe6dbccc7e8ea3ebf6afe46a04847f2e0bcf772c8aebc933dd2ccf"
@@ -1992,7 +1955,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "indexmap",
- "lzma-rust2 0.18.1",
+ "lzma-rust2",
  "memchr",
  "pbkdf2",
  "ppmd-rust",

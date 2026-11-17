@@ -61,13 +61,15 @@ fn main() -> Result<()> {
         return run_eml_mode(&args.eml, &config);
     }
 
+    // backend 打錯字或缺參數直接報錯：靜默回退傳統模式會不經確認就搬移
+    let llm = llm_config_checked(&config.llm)?;
+
     let mut session = connect(&config.imap)?;
     let selected = session
         .select(&config.imap.source_mailbox)
         .with_context(|| format!("無法開啟來源信箱：{}", config.imap.source_mailbox))?;
     let original_uidvalidity = selected.uid_validity;
 
-    let llm = llm_config(&config.llm);
     let mut scanned = 0;
     // 待搬移清單（uid、主旨、評分、理由）：LLM 模式以 LLM 判定為準，啟發式評分僅供 log 參考；
     // 未設定 LLM 時沿用傳統門檻模式（評分 ≥ threshold）。
@@ -109,7 +111,8 @@ fn main() -> Result<()> {
                         }
                     },
                 };
-            let Some(message) = messages.iter().next() else {
+            // 伺服器可能在回應中夾帶其他郵件的旗標更新（未經要求的 FETCH），須以 UID 比對
+            let Some(message) = messages.iter().find(|m| m.uid == Some(uid)) else {
                 lines.push(format!("郵件 UID {uid} 內容為空，略過。"));
                 continue;
             };
@@ -144,25 +147,21 @@ fn main() -> Result<()> {
             let auth_warnings = auth_status.warnings.clone();
             let auth_summary = auth_status.summary();
 
-            // 白名單直接安全豁免檢查：若寄件來源符合 trusted_sender_domains，且安全驗證無失敗警告，直接豁免跳過
-            if let Some(matched) = trusted_source(&mail, &from, &config.detection) {
-                if auth_warnings.is_empty() {
-                    lines.push(format!(
-                        "略過〈{}〉（寄件來源在信任清單：{}，且通過安全驗證）",
-                        subject, matched
-                    ));
+            // 信任清單豁免：信任網域須 DMARC 通過、信任 IP 須無驗證失敗（規則見 trust_decision）
+            match trust_decision(&mail, &from, &config.detection, &auth_status) {
+                TrustDecision::Exempt(matched) => {
+                    lines.push(format!("略過〈{subject}〉（信任來源豁免：{matched}）"));
                     if used_fallback && was_unread {
                         let _ = restore_unread_status(&mut session, uid);
                     }
                     continue;
-                } else {
+                }
+                TrustDecision::Rejected(matched, reason) => {
                     lines.push(format!(
-                        "注意：〈{}〉寄件來源雖符合信任清單 ({})，但安全驗證失敗（{}），取消白名單豁免並送檢",
-                        subject,
-                        matched,
-                        auth_warnings.join("；")
+                        "注意：〈{subject}〉寄件來源雖符合信任清單（{matched}），但{reason}，取消白名單豁免並送檢"
                     ));
                 }
+                TrustDecision::NotListed => {}
             }
 
             let (score, reasons) = phishing_score(
@@ -178,16 +177,16 @@ fn main() -> Result<()> {
                 Some(llm_config) => {
                     if llm_config.effective_backend() == Some(LlmBackend::Jev) {
                         if llm_consecutive_failures >= 3 {
-                            lines.push(format!(
-                                "略過〈{}〉（Jev 連續失敗熔斷，採規則評分 {score}）",
-                                subject
-                            ));
                             if score >= config.detection.threshold {
                                 let fallback_reason = format!(
                                     "Jev 熔斷；規則評分達標（{score}分）：{}",
                                     reasons.join("；")
                                 );
                                 pending.push((uid, subject.clone(), score, fallback_reason));
+                            } else {
+                                lines.push(format!(
+                                    "略過〈{subject}〉（Jev 連續失敗熔斷，規則評分 {score} 未達門檻）"
+                                ));
                             }
                         } else {
                             match llm_judge_jev(
@@ -201,6 +200,8 @@ fn main() -> Result<()> {
                                 &auth_warnings,
                             ) {
                                 Ok(prob) => {
+                                    // 成功即歸零：熔斷只針對「連續」失敗
+                                    llm_consecutive_failures = 0;
                                     let jev_points = calculate_jev_points(
                                         prob,
                                         llm_config.jev_max_score,
@@ -254,16 +255,16 @@ fn main() -> Result<()> {
                         }
                     } else if llm_consecutive_failures >= 3 {
                         // 熔斷：本日期內已連續失敗 ≥3 次，跳過 LLM 直接採規則評分
-                        lines.push(format!(
-                            "略過〈{}〉（LLM 連續失敗熔斷，採規則評分 {score}）",
-                            subject
-                        ));
                         if score >= config.detection.threshold {
                             let fallback_reason = format!(
                                 "LLM 熔斷；規則評分達標（{score}分）：{}",
                                 reasons.join("；")
                             );
                             pending.push((uid, subject.clone(), score, fallback_reason));
+                        } else {
+                            lines.push(format!(
+                                "略過〈{subject}〉（LLM 連續失敗熔斷，規則評分 {score} 未達門檻）"
+                            ));
                         }
                     } else {
                         match llm_judge(
@@ -277,9 +278,11 @@ fn main() -> Result<()> {
                             &auth_warnings,
                         ) {
                             Ok(verdict) if verdict.is_phishing => {
+                                llm_consecutive_failures = 0;
                                 pending.push((uid, subject.clone(), score, verdict.reason));
                             }
                             Ok(verdict) => {
+                                llm_consecutive_failures = 0;
                                 lines.push(format!(
                                     "略過〈{}〉（評分 {score}；LLM：{}）",
                                     subject, verdict.reason
@@ -425,7 +428,8 @@ fn main() -> Result<()> {
     for line in &lines {
         println!("{line}");
     }
-    let scanned_dates = dates_summary(&args.date);
+    // 摘要列出實際掃描的日期（含自動納入的前一日）
+    let scanned_dates = dates_summary(&dates);
     if args.dry_run {
         println!(
             "{scanned_dates}：dry-run 完成，共掃描 {scanned} 封，{} 封符合搬移條件。",
@@ -457,7 +461,7 @@ fn run_eml_mode(inputs: &[PathBuf], config: &Config) -> Result<()> {
     if paths.is_empty() {
         bail!("指定的路徑中沒有 .eml 檔");
     }
-    let llm = llm_config(&config.llm);
+    let llm = llm_config_checked(&config.llm)?;
     let mut failures: u32 = 0;
     let (mut ok, mut flagged, mut errors) = (0, 0, 0);
     println!("注意：驗證結果取自檔案內最上層標頭，未經重新驗證。");

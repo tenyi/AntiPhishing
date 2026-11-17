@@ -151,8 +151,53 @@ impl LlmConfig {
 }
 
 /// 由 Config 取得有效的 LLM 設定；未設定（無法判定後端或缺少必要參數）回 None。
+/// 不區分「沒設定」與「設定錯誤」；需要對設定錯誤報錯的呼叫端請用 `llm_config_checked`。
 pub fn llm_config(llm: &LlmConfig) -> Option<LlmConfig> {
-    let backend = llm.effective_backend()?;
+    llm_config_checked(llm).ok().flatten()
+}
+
+/// 同 `llm_config`，但明確寫了 `backend` 卻無法辨識或缺少必要參數時回 Err。
+///
+/// `backend` 留空＝未設定 LLM（依文件回退規則評分），回 Ok(None)；
+/// 寫了 backend 卻打錯字（如 "claud"）若也靜默回退，CLI 會進入不經確認就搬移的傳統模式。
+pub fn llm_config_checked(llm: &LlmConfig) -> anyhow::Result<Option<LlmConfig>> {
+    let explicit = llm
+        .backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    let Some(backend) = llm.effective_backend() else {
+        if let Some(name) = explicit {
+            anyhow::bail!(
+                "[llm] backend = \"{name}\" 無法辨識（可用：api、claude、codex、agy、command、jev）"
+            );
+        }
+        return Ok(None);
+    };
+    let valid = llm_config_inner(llm, backend);
+    if valid.is_none()
+        && let Some(name) = explicit
+    {
+        anyhow::bail!(
+            "[llm] backend = \"{name}\" 缺少必要參數（{}）",
+            required_params(backend)
+        );
+    }
+    Ok(valid)
+}
+
+/// 各後端的必要參數說明（錯誤訊息用）
+fn required_params(backend: LlmBackend) -> &'static str {
+    match backend {
+        LlmBackend::Api => "base_url 與 model",
+        LlmBackend::Command => "command",
+        LlmBackend::Jev => "雲端 Jev 需 api_key；地端 nimble/clef 需 base_url",
+        LlmBackend::Claude | LlmBackend::Codex | LlmBackend::Agy => "無",
+    }
+}
+
+/// 檢查後端必要參數，齊全回 Some
+fn llm_config_inner(llm: &LlmConfig, backend: LlmBackend) -> Option<LlmConfig> {
     match backend {
         LlmBackend::Api => {
             if llm.base_url.trim().is_empty() || llm.model.trim().is_empty() {

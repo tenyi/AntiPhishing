@@ -192,15 +192,39 @@ struct PendingMoveItem {
     reason: String,
     #[serde(default = "default_true")]
     selected: bool,
+    /// 掃描當下來源信箱的 UIDVALIDITY：UID 只在同一信箱世代內有意義，
+    /// 搬移前不符即放棄，避免信箱重建後同一個 UID 指向別封信。舊版進度檔無此欄位時
+    /// 由 `App::new` 以進度檔的 uidvalidity 回填。
+    #[serde(default)]
+    uidvalidity: u32,
+    /// 掃描當下的來源信箱名稱；空字串＝舊版資料（不比對）
+    #[serde(default)]
+    source_mailbox: String,
 }
+
+impl PendingMoveItem {
+    /// 待隔離項目的唯一鍵（信箱世代, UID）：去重與移除皆以此為準
+    fn key(&self) -> (u32, u32) {
+        (self.uidvalidity, self.uid)
+    }
+}
+
+/// 重試清單上限：只保留最大（最新）的 UID，避免永久失敗的信件讓清單無限成長
+const MAX_RETRY_UIDS: usize = 200;
 
 /// 掃描進度狀態檔內容，存於執行檔所在目錄 `scan_state.toml`。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct LastScanState {
     /// 來源信箱 UIDVALIDITY（信箱世代）；不符時 `filter_new_uids` 自動放棄此斷點
     uidvalidity: u32,
-    /// 斷點：本世代已完整判定的最大 UID（LLM 判定失敗者不列入，下輪重試）
+    /// 斷點：本世代已檢查的最大 UID（LLM 失敗、熔斷或抓取失敗者另記於 retry_uids，下輪重試）
     max_checked_uid: u32,
+    /// 斷點所屬的來源信箱名稱；與目前設定不同時放棄斷點。空字串＝舊版資料（視為相同）
+    #[serde(default)]
+    source_mailbox: String,
+    /// 斷點以下仍需重試的 UID（LLM 判定失敗／熔斷且未達規則門檻、或抓取失敗）
+    #[serde(default)]
+    retry_uids: Vec<u32>,
     /// 最後完成判定郵件的 UID（參考資訊）
     last_mail_uid: u32,
     /// 最後完成判定郵件的主旨
@@ -497,11 +521,13 @@ fn main() -> eframe::Result {
 }
 
 /// 獨立搬移任務回報結果
+/// 各清單皆為待隔離項目鍵（信箱世代, UID），見 `PendingMoveItem::key`
 struct MoveOutcome {
     lines: Vec<String>,
-    moved_uids: Vec<u32>,
-    failed_uids: Vec<u32>,
-    not_found_uids: Vec<u32>,
+    moved_uids: Vec<(u32, u32)>,
+    failed_uids: Vec<(u32, u32)>,
+    /// 不再搬移並自清單移除者：已不存在，或信箱世代／來源信箱已變更
+    not_found_uids: Vec<(u32, u32)>,
 }
 
 /// 掃描工作執行緒送往 UI 的事件：
@@ -525,6 +551,55 @@ struct ScanOutcome {
     no_new_mail: bool,
     /// 本輪發現的疑似釣魚／惡意廣告郵件清單（若啟用確認，由 UI 入列處理）
     pending_moves: Vec<PendingMoveItem>,
+    /// 掃描的來源信箱名稱（斷點綁定用）
+    source_mailbox: String,
+    /// 本輪需下輪重試的 UID（LLM 失敗／熔斷且未達規則門檻、抓取失敗）
+    retry_uids: Vec<u32>,
+    /// 本輪已完成判定的 UID（自重試清單移除）
+    done_uids: Vec<u32>,
+    /// 本輪失敗（連線／搜尋失敗、執行緒異常、或所有信件皆抓取失敗）：
+    /// 不更新最後檢查時間，下次排程仍從原日期補掃
+    failed: bool,
+}
+
+impl ScanOutcome {
+    /// 整輪失敗的結果（只帶錯誤訊息）
+    fn failure(line: String) -> Self {
+        Self {
+            lines: vec![line],
+            uidvalidity: 0,
+            max_checked_uid: None,
+            last_checked: None,
+            no_new_mail: false,
+            pending_moves: Vec::new(),
+            source_mailbox: String::new(),
+            retry_uids: Vec::new(),
+            done_uids: Vec::new(),
+            failed: true,
+        }
+    }
+}
+
+/// 合併重試清單：同一信箱世代內＝(原清單 ∪ 本輪新增) − 本輪已完成；世代不同時只取本輪。
+/// 結果排序去重，並只保留最大的 `MAX_RETRY_UIDS` 筆。
+fn merge_retry_uids(
+    current: &[u32],
+    same_generation: bool,
+    new_retry: &[u32],
+    done: &[u32],
+) -> Vec<u32> {
+    let mut merged: Vec<u32> = if same_generation {
+        current.iter().chain(new_retry).copied().collect()
+    } else {
+        new_retry.to_vec()
+    };
+    merged.retain(|uid| !done.contains(uid));
+    merged.sort_unstable();
+    merged.dedup();
+    if merged.len() > MAX_RETRY_UIDS {
+        merged.drain(..merged.len() - MAX_RETRY_UIDS);
+    }
+    merged
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -580,6 +655,10 @@ struct App {
     mailbox_fetch_error: Option<String>,
     /// 上次檢查到的最後一封郵件（UIDVALIDITY、最大 UID）；排程掃描藉此跳過無新郵件的一輪
     last_seen: Option<(u32, u32)>,
+    /// `last_seen` 所屬的來源信箱名稱；空字串＝舊版資料（視為與目前設定相同）
+    last_seen_mailbox: String,
+    /// 斷點以下仍需重試的 UID（與 `last_seen` 同一信箱世代）
+    retry_uids: Vec<u32>,
     /// 上次完成掃描的時間（含無新郵件的空掃），顯示於狀態列下方；跨重啟由進度檔回復
     last_check: Option<DateTime<Local>>,
     /// 最後完成判定的郵件（UID、主旨、所屬搜尋日期），顯示於狀態列下方
@@ -654,9 +733,30 @@ impl App {
         let last_seen = scan_state
             .as_ref()
             .map(|state| (state.uidvalidity, state.max_checked_uid));
-        let pending_queue = scan_state
+        // 舊版進度檔的待隔離項目沒有信箱世代：以進度檔的 uidvalidity 回填
+        let pending_queue: Vec<PendingMoveItem> = scan_state
             .as_ref()
-            .map(|state| state.pending_moves.clone())
+            .map(|state| {
+                state
+                    .pending_moves
+                    .iter()
+                    .cloned()
+                    .map(|mut item| {
+                        if item.uidvalidity == 0 {
+                            item.uidvalidity = state.uidvalidity;
+                        }
+                        item
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let last_seen_mailbox = scan_state
+            .as_ref()
+            .map(|state| state.source_mailbox.clone())
+            .unwrap_or_default();
+        let retry_uids = scan_state
+            .as_ref()
+            .map(|state| state.retry_uids.clone())
             .unwrap_or_default();
         let show_confirm_dialog = !pending_queue.is_empty();
         Self {
@@ -683,6 +783,8 @@ impl App {
             mailbox_receiver: None,
             mailbox_fetch_error: None,
             last_seen,
+            last_seen_mailbox,
+            retry_uids,
             last_check: scan_state.as_ref().map(|state| state.checked_at),
             last_mail: scan_state.map(|state| {
                 (
@@ -759,18 +861,25 @@ impl App {
 
     /// 掃描結束後將最新進度寫回掃描進度檔（斷點＋最後一封郵件資訊＋待隔離清單）；失敗僅提示不中斷。
     fn persist_scan_state(&mut self) {
-        let (Some(last_seen), Some(last_check)) = (self.last_seen, self.last_check) else {
+        // 從未成功完成掃描時沒有可寫的檢查時間（寫入「現在」會讓重啟後補掃範圍縮水）
+        let Some(last_check) = self.last_check else {
             return;
         };
-        let Some((uid, subject, mail_date)) = &self.last_mail else {
-            return;
-        };
+        // 斷點或最後郵件尚未建立時以預設值補上，確保待隔離清單與重試清單照樣保存；
+        // uidvalidity 0 與真實信箱世代不符，重啟後 filter_new_uids 會保留全部（安全側）
+        let last_seen = self.last_seen.unwrap_or((0, 0));
+        let (uid, subject, mail_date) =
+            self.last_mail
+                .clone()
+                .unwrap_or((0, String::new(), last_check.date_naive()));
         let state = LastScanState {
             uidvalidity: last_seen.0,
             max_checked_uid: last_seen.1,
-            last_mail_uid: *uid,
-            last_mail_subject: subject.clone(),
-            last_mail_date: *mail_date,
+            source_mailbox: self.last_seen_mailbox.clone(),
+            retry_uids: self.retry_uids.clone(),
+            last_mail_uid: uid,
+            last_mail_subject: subject,
+            last_mail_date: mail_date,
             checked_at: last_check,
             pending_moves: self.pending_queue.clone(),
         };
@@ -804,7 +913,7 @@ impl App {
                     Ok(Err(error)) => MoveOutcome {
                         lines: vec![format!("隔離搬移失敗：{error:#}")],
                         moved_uids: Vec::new(),
-                        failed_uids: items.iter().map(|i| i.uid).collect(),
+                        failed_uids: items.iter().map(PendingMoveItem::key).collect(),
                         not_found_uids: Vec::new(),
                     },
                     Err(panic) => {
@@ -816,7 +925,7 @@ impl App {
                         MoveOutcome {
                             lines: vec![format!("隔離搬移執行緒異常中止：{detail}")],
                             moved_uids: Vec::new(),
-                            failed_uids: items.iter().map(|i| i.uid).collect(),
+                            failed_uids: items.iter().map(PendingMoveItem::key).collect(),
                             not_found_uids: Vec::new(),
                         }
                     }
@@ -825,16 +934,16 @@ impl App {
         });
     }
 
-    /// 跳過選取的待隔離郵件（不連線 IMAP，直接自清單移除）
-    fn skip_pending_items(&mut self, uids: &[u32]) {
-        if uids.is_empty() {
+    /// 跳過選取的待隔離郵件（不連線 IMAP，直接自清單移除）；`keys` 為 `PendingMoveItem::key`
+    fn skip_pending_items(&mut self, keys: &[(u32, u32)]) {
+        if keys.is_empty() {
             return;
         }
-        let uid_set: std::collections::HashSet<u32> = uids.iter().copied().collect();
+        let key_set: std::collections::HashSet<(u32, u32)> = keys.iter().copied().collect();
         let log_lines: Vec<String> = self
             .pending_queue
             .iter()
-            .filter(|item| uid_set.contains(&item.uid))
+            .filter(|item| key_set.contains(&item.key()))
             .map(|item| {
                 format!(
                     "跳過隔離〈{}〉（評分 {}；LLM：{}）",
@@ -845,7 +954,7 @@ impl App {
         for line in log_lines {
             self.push_log(line);
         }
-        self.pending_queue.retain(|i| !uid_set.contains(&i.uid));
+        self.pending_queue.retain(|i| !key_set.contains(&i.key()));
         self.persist_scan_state();
         if self.pending_queue.is_empty() {
             self.show_confirm_dialog = false;
@@ -882,6 +991,17 @@ impl App {
             self.status = problem;
             return;
         }
+        // 斷點只適用於同一個來源信箱（舊版進度檔未記信箱名稱時視為相同）
+        let last_seen = last_seen.filter(|_| {
+            self.last_seen_mailbox.is_empty()
+                || self.last_seen_mailbox == self.config.imap.source_mailbox
+        });
+        // 帶斷點掃描時一併帶入重試清單；全量掃描本來就涵蓋全部 UID
+        let retry_uids = if last_seen.is_some() {
+            self.retry_uids.clone()
+        } else {
+            Vec::new()
+        };
         let config = self.config.clone();
         let (sender, receiver) = mpsc::channel::<ScanEvent>();
         self.receiver = Some(receiver);
@@ -894,31 +1014,17 @@ impl App {
         thread::spawn(move || {
             // catch_unwind：worker panic 時仍回傳結果，避免 UI 端 receiver 永久卡住
             let outcome = match catch_unwind(AssertUnwindSafe(|| {
-                scan_mail(&config, &dates, last_seen, &sender)
+                scan_mail(&config, &dates, last_seen, &retry_uids, &sender)
             })) {
                 Ok(Ok(outcome)) => outcome,
-                Ok(Err(error)) => ScanOutcome {
-                    lines: vec![format!("掃描失敗：{error:#}")],
-                    uidvalidity: 0,
-                    max_checked_uid: None,
-                    last_checked: None,
-                    no_new_mail: false,
-                    pending_moves: Vec::new(),
-                },
+                Ok(Err(error)) => ScanOutcome::failure(format!("掃描失敗：{error:#}")),
                 Err(panic) => {
                     let detail = panic
                         .downcast_ref::<&str>()
                         .map(|s| (*s).to_string())
                         .or_else(|| panic.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "未知原因".into());
-                    ScanOutcome {
-                        lines: vec![format!("掃描執行緒異常中止：{detail}")],
-                        uidvalidity: 0,
-                        max_checked_uid: None,
-                        last_checked: None,
-                        no_new_mail: false,
-                        pending_moves: Vec::new(),
-                    }
+                    ScanOutcome::failure(format!("掃描執行緒異常中止：{detail}"))
                 }
             };
             let _ = sender.send(ScanEvent::Done(outcome));
@@ -1019,7 +1125,10 @@ impl App {
                     "掃描執行緒異常結束，未回傳任何結果。",
                 );
             } else if let Some(outcome) = done {
-                self.last_check = Some(Local::now());
+                // 失敗的一輪不更新最後檢查時間：下次排程仍從原日期補掃，避免漏掃中間數日
+                if !outcome.failed {
+                    self.last_check = Some(Local::now());
+                }
                 if outcome.no_new_mail {
                     // 無新郵件的排程空掃：只更新最後檢查時間，不寫入執行紀錄、日誌檔與進度檔
                     self.status =
@@ -1029,27 +1138,43 @@ impl App {
                         self.push_log(line.clone());
                     }
                     self.status = outcome.lines.last().cloned().unwrap_or_default();
+                    // 同一個斷點＝相同信箱世代且相同來源信箱（舊版未記信箱名稱視為相同）
+                    let same_generation = self
+                        .last_seen
+                        .is_some_and(|(validity, _)| validity == outcome.uidvalidity)
+                        && (self.last_seen_mailbox.is_empty()
+                            || self.last_seen_mailbox == outcome.source_mailbox);
+                    // 重試清單：整輪失敗（uidvalidity 0）時不動
+                    if outcome.uidvalidity != 0 || !outcome.failed {
+                        self.retry_uids = merge_retry_uids(
+                            &self.retry_uids,
+                            same_generation,
+                            &outcome.retry_uids,
+                            &outcome.done_uids,
+                        );
+                    }
                     // 記住本輪檢查進度：若在相同信箱世代下，取原有進度與本輪最大進度之較大者，
                     // 避免手動掃描過去歷史日期時將全域進度降級
                     if let Some(max_uid) = outcome.max_checked_uid {
                         self.last_seen = Some(match self.last_seen {
-                            Some((validity, seen_max)) if validity == outcome.uidvalidity => {
+                            Some((validity, seen_max)) if same_generation => {
                                 (validity, seen_max.max(max_uid))
                             }
                             _ => (outcome.uidvalidity, max_uid),
                         });
+                        self.last_seen_mailbox = outcome.source_mailbox.clone();
                     }
                     if let Some((mail_date, uid, subject)) = &outcome.last_checked {
                         self.last_mail = Some((*uid, subject.clone(), *mail_date));
                     }
                 }
-                // 將本輪發現的待隔離郵件加入 pending_queue（去重）
+                // 將本輪發現的待隔離郵件加入 pending_queue（以信箱世代＋UID 去重）
                 let mut new_pending_count = 0;
                 for item in outcome.pending_moves {
                     if !self
                         .pending_queue
                         .iter()
-                        .any(|existing| existing.uid == item.uid)
+                        .any(|existing| existing.key() == item.key())
                     {
                         self.pending_queue.push(item);
                         new_pending_count += 1;
@@ -1086,26 +1211,17 @@ impl App {
                 // 本輪有新檢查進度時才寫回進度檔，重啟後即可從斷點續掃
                 self.persist_scan_state();
                 // 失敗時以系統匣通知提醒（視窗可能縮在系統匣看不到）
-                if let Some(first_failure) = outcome
-                    .lines
-                    .iter()
-                    .find(|line| line.starts_with("掃描失敗") || line.starts_with("掃描執行緒異常"))
+                if outcome.failed
+                    && let Some(first_failure) = outcome.lines.first()
                 {
                     send_notification("AntiPhishing 掃描失敗", first_failure);
                 }
             }
             self.receiver = None;
             self.scan_progress.clear();
-            // 若上次掃描日期早於今日（如連假或多日未確認），立即觸發補掃直到最新；否則排入正常間隔
-            let today = Local::now().date_naive();
-            let checked_today = self.last_check.map_or(false, |dt| dt.date_naive() == today);
-            let needs_catchup =
-                !checked_today && self.last_scanned_date().map_or(false, |d| d < today);
-            self.next_check = if needs_catchup {
-                Instant::now()
-            } else {
-                Instant::now() + interval(&self.config)
-            };
+            // 一律排入正常間隔（失敗時不可立即重試，否則連線失敗會變成緊密重連迴圈）；
+            // 補掃範圍由 scan_dates_since_last 依 last_check 決定，失敗時 last_check 不前進
+            self.next_check = Instant::now() + interval(&self.config);
         }
         // 處理獨立搬移任務接收
         if let Some(receiver) = &self.move_receiver {
@@ -1116,13 +1232,14 @@ impl App {
                     }
                     let moved_count = outcome.moved_uids.len();
                     let failed_count = outcome.failed_uids.len();
-                    let removed_set: std::collections::HashSet<u32> = outcome
+                    let removed_set: std::collections::HashSet<(u32, u32)> = outcome
                         .moved_uids
                         .iter()
                         .chain(outcome.not_found_uids.iter())
                         .copied()
                         .collect();
-                    self.pending_queue.retain(|i| !removed_set.contains(&i.uid));
+                    self.pending_queue
+                        .retain(|i| !removed_set.contains(&i.key()));
                     if failed_count > 0 {
                         self.status = format!(
                             "隔離完成：成功搬移 {moved_count} 封，失敗 {failed_count} 封。"
@@ -1433,8 +1550,9 @@ impl App {
                 .collect();
             app.start_move_task(items);
         } else if trigger_skip {
-            let all_uids: Vec<u32> = app.pending_queue.iter().map(|i| i.uid).collect();
-            app.skip_pending_items(&all_uids);
+            let all_keys: Vec<(u32, u32)> =
+                app.pending_queue.iter().map(PendingMoveItem::key).collect();
+            app.skip_pending_items(&all_keys);
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         } else if close_dialog {
             app.show_confirm_dialog = false;
@@ -2491,15 +2609,29 @@ fn execute_move_task(config: &Config, items: &[PendingMoveItem]) -> Result<MoveO
     let mut not_found_uids = Vec::new();
 
     let mut session = connect(&config.imap).context("無法連線至 IMAP 伺服器")?;
-    let _ = session
+    let selected = session
         .select(&config.imap.source_mailbox)
         .with_context(|| format!("無法開啟來源信箱：{}", config.imap.source_mailbox))?;
+    // 與 scan_mail 相同：伺服器未回報 UIDVALIDITY 時視為 0
+    let current_uidvalidity = selected.uid_validity.unwrap_or(0);
 
     ensure_phishing_mailbox(&mut session, &config.imap.phishing_mailbox)
         .with_context(|| format!("目標信箱「{}」無法使用", config.imap.phishing_mailbox))?;
 
     let mut expunge_uids = Vec::new();
     for item in items {
+        // UID 只在同一信箱世代、同一來源信箱內有效：不符者絕不搬移（可能指向別封信），
+        // 直接自清單移除並記錄，使用者可改以手動掃描重新判定
+        let mailbox_changed =
+            !item.source_mailbox.is_empty() && item.source_mailbox != config.imap.source_mailbox;
+        if item.uidvalidity != current_uidvalidity || mailbox_changed {
+            lines.push(format!(
+                "郵件 UID {}〈{}〉的來源信箱已變更或重建（UIDVALIDITY {} → {}），為避免搬錯信不予搬移，已自清單移除。",
+                item.uid, item.subject, item.uidvalidity, current_uidvalidity
+            ));
+            not_found_uids.push(item.key());
+            continue;
+        }
         // 先以 UID SEARCH 檢查該郵件是否依然存在於來源信箱
         let exists = match session.uid_search(format!("UID {}", item.uid)) {
             Ok(uids) => uids.contains(&item.uid),
@@ -2510,7 +2642,7 @@ fn execute_move_task(config: &Config, items: &[PendingMoveItem]) -> Result<MoveO
                 "郵件 UID {}〈{}〉已不在來源信箱中（可能已於外部手動刪除），略過。",
                 item.uid, item.subject
             ));
-            not_found_uids.push(item.uid);
+            not_found_uids.push(item.key());
             continue;
         }
 
@@ -2520,7 +2652,7 @@ fn execute_move_task(config: &Config, items: &[PendingMoveItem]) -> Result<MoveO
                     "已隔離搬移〈{}〉（評分 {}；LLM：{}）",
                     item.subject, item.score, item.reason
                 ));
-                moved_uids.push(item.uid);
+                moved_uids.push(item.key());
                 expunge_uids.push(item.uid.to_string());
             }
             Err(error) => {
@@ -2533,10 +2665,10 @@ fn execute_move_task(config: &Config, items: &[PendingMoveItem]) -> Result<MoveO
                         "郵件 UID {}〈{}〉搬移時伺服器回報不存在（可能已手動刪除），略過。",
                         item.uid, item.subject
                     ));
-                    not_found_uids.push(item.uid);
+                    not_found_uids.push(item.key());
                 } else {
                     lines.push(format!("搬移〈{}〉失敗：{error:#}", item.subject));
-                    failed_uids.push(item.uid);
+                    failed_uids.push(item.key());
                 }
             }
         }
@@ -2569,6 +2701,7 @@ fn scan_mail(
     config: &Config,
     dates: &[NaiveDate],
     last_seen: Option<(u32, u32)>,
+    retry: &[u32],
     progress: &mpsc::Sender<ScanEvent>,
 ) -> Result<ScanOutcome> {
     let mut session = connect(&config.imap)?;
@@ -2576,11 +2709,23 @@ fn scan_mail(
         .select(&config.imap.source_mailbox)
         .with_context(|| format!("無法開啟來源信箱：{}", config.imap.source_mailbox))?;
     let original_uidvalidity = selected.uid_validity.unwrap_or(0);
-    let llm = llm_config(&config.llm);
     let mut lines: Vec<String> = Vec::new();
+    // backend 寫錯（打錯字或缺參數）時明確提示；GUI 未設定 LLM 時本來就不搬移，故照常掃描
+    let llm = match llm_config_checked(&config.llm) {
+        Ok(llm) => llm,
+        Err(error) => {
+            lines.push(format!("LLM 設定錯誤，本輪不使用 LLM：{error:#}"));
+            None
+        }
+    };
     let mut scanned = 0;
+    // 抓取失敗次數：全部抓取失敗（scanned == 0）時視為整輪失敗，不可回報成「無新郵件」
+    let mut fetch_failures = 0;
     let mut max_checked_uid: Option<u32> = None;
     let mut last_checked: Option<(NaiveDate, u32, String)> = None;
+    // 下輪需重試的 UID 與本輪已完成判定的 UID（見 merge_retry_uids）
+    let mut retry_uids: Vec<u32> = Vec::new();
+    let mut done_uids: Vec<u32> = Vec::new();
     let mut pending: Vec<(u32, String, u32, String)> = Vec::new();
     let mut sorted_dates = dates.to_vec();
     sorted_dates.sort_unstable();
@@ -2593,7 +2738,7 @@ fn scan_mail(
             .into_iter()
             .collect();
         uids.sort_unstable();
-        uids = filter_new_uids(uids, last_seen, original_uidvalidity);
+        uids = filter_new_uids(uids, last_seen, retry, original_uidvalidity);
         // LLM 連續失敗熔斷：本日期內連續失敗 ≥3 次後，本輪剩餘信件直接採規則評分，
         // 避免 LLM 服務當機時每封都等待逾時上限。
         let mut llm_consecutive_failures: u32 = 0;
@@ -2615,19 +2760,28 @@ fn scan_mail(
                     Err(_) => match session.uid_fetch(uid.to_string(), "(FLAGS RFC822)") {
                         Ok(messages) => (messages, true),
                         Err(error) => {
-                            lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
+                            // 抓取失敗多為暫時性（網路），列入重試；斷點仍可越過它前進
+                            lines.push(format!(
+                                "無法讀取郵件 UID {uid}（略過，下輪重試）：{error:#}"
+                            ));
+                            fetch_failures += 1;
+                            retry_uids.push(uid);
                             continue;
                         }
                     },
                 };
-            let Some(message) = messages.iter().next() else {
+            // 伺服器可能在回應中夾帶其他郵件的旗標更新（未經要求的 FETCH），須以 UID 比對
+            let Some(message) = messages.iter().find(|m| m.uid == Some(uid)) else {
                 lines.push(format!("郵件 UID {uid} 內容為空或已被刪除，略過。"));
                 continue;
             };
             // 記錄掃描當下是否為未讀取狀態（不含 \Seen 旗標）
             let was_unread = is_message_unread(message.flags());
+            // 內文為空或無法解析屬永久性問題，重試無益：斷點越過它，避免每輪重複記錄
             let Some(bytes) = message.body() else {
                 lines.push(format!("郵件 UID {uid} 內容為空或已被刪除，略過。"));
+                max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                done_uids.push(uid);
                 if used_fallback && was_unread {
                     let _ = restore_unread_status(&mut session, uid);
                 }
@@ -2637,6 +2791,8 @@ fn scan_mail(
                 Ok(mail) => mail,
                 Err(error) => {
                     lines.push(format!("無法解析郵件 UID {uid} 內容（略過）：{error:#}"));
+                    max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+                    done_uids.push(uid);
                     if used_fallback && was_unread {
                         let _ = restore_unread_status(&mut session, uid);
                     }
@@ -2660,27 +2816,24 @@ fn scan_mail(
             let auth_warnings = auth_status.warnings.clone();
             let auth_summary = auth_status.summary();
 
-            // 白名單直接安全豁免檢查：若寄件來源符合 trusted_sender_domains，且安全驗證無失敗警告，直接豁免跳過
-            if let Some(matched) = trusted_source(&mail, &from, &config.detection) {
-                if auth_warnings.is_empty() {
+            // 信任清單豁免：信任網域須 DMARC 通過、信任 IP 須無驗證失敗（規則見 trust_decision）
+            match trust_decision(&mail, &from, &config.detection, &auth_status) {
+                TrustDecision::Exempt(matched) => {
                     max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                     last_checked = Some((*date, uid, subject.clone()));
-                    lines.push(format!(
-                        "略過〈{}〉（寄件來源在信任清單：{}，且通過安全驗證）",
-                        subject, matched
-                    ));
+                    done_uids.push(uid);
+                    lines.push(format!("略過〈{subject}〉（信任來源豁免：{matched}）"));
                     if used_fallback && was_unread {
                         let _ = restore_unread_status(&mut session, uid);
                     }
                     continue;
-                } else {
+                }
+                TrustDecision::Rejected(matched, reason) => {
                     lines.push(format!(
-                        "注意：〈{}〉寄件來源雖符合信任清單 ({})，但安全驗證失敗（{}），取消白名單豁免並送檢",
-                        subject,
-                        matched,
-                        auth_warnings.join("；")
+                        "注意：〈{subject}〉寄件來源雖符合信任清單（{matched}），但{reason}，取消白名單豁免並送檢"
                     ));
                 }
+                TrustDecision::NotListed => {}
             }
 
             let (score, reasons) = phishing_score(
@@ -2698,16 +2851,19 @@ fn scan_mail(
                         max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                         last_checked = Some((*date, uid, subject.clone()));
                         if llm_consecutive_failures >= 3 {
-                            lines.push(format!(
-                                "略過〈{}〉（Jev 連續失敗熔斷，採規則評分 {score}）",
-                                subject
-                            ));
                             if score >= config.detection.threshold {
                                 let fallback_reason = format!(
                                     "Jev 熔斷；規則評分達標（{score}分）：{}",
                                     reasons.join("；")
                                 );
                                 pending.push((uid, subject.clone(), score, fallback_reason));
+                                done_uids.push(uid);
+                            } else {
+                                // 未經 Jev 判定：列入重試，待服務恢復後重新判定
+                                lines.push(format!(
+                                    "暫緩〈{subject}〉（Jev 連續失敗熔斷，規則評分 {score} 未達門檻，下輪重試）"
+                                ));
+                                retry_uids.push(uid);
                             }
                         } else {
                             match llm_judge_jev(
@@ -2721,6 +2877,9 @@ fn scan_mail(
                                 &auth_warnings,
                             ) {
                                 Ok(prob) => {
+                                    // 成功即歸零：熔斷只針對「連續」失敗
+                                    llm_consecutive_failures = 0;
+                                    done_uids.push(uid);
                                     let jev_points = calculate_jev_points(
                                         prob,
                                         llm_config.jev_max_score,
@@ -2763,11 +2922,12 @@ fn scan_mail(
                                             score,
                                             fallback_reason,
                                         ));
+                                        done_uids.push(uid);
                                     } else {
                                         lines.push(format!(
-                                            "略過〈{}〉（評分 {score}，未達門檻；Jev 判定失敗）",
-                                            subject
+                                            "暫緩〈{subject}〉（評分 {score}，未達門檻；Jev 判定失敗，下輪重試）"
                                         ));
+                                        retry_uids.push(uid);
                                     }
                                 }
                             }
@@ -2776,16 +2936,19 @@ fn scan_mail(
                         // 熔斷：本日期內已連續失敗 ≥3 次，跳過 LLM 直接採規則評分
                         max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                         last_checked = Some((*date, uid, subject.clone()));
-                        lines.push(format!(
-                            "略過〈{}〉（LLM 連續失敗熔斷，採規則評分 {score}）",
-                            subject
-                        ));
                         if score >= config.detection.threshold {
                             let fallback_reason = format!(
                                 "LLM 熔斷；規則評分達標（{score}分）：{}",
                                 reasons.join("；")
                             );
                             pending.push((uid, subject.clone(), score, fallback_reason));
+                            done_uids.push(uid);
+                        } else {
+                            // 未經 LLM 判定：列入重試，待服務恢復後重新判定
+                            lines.push(format!(
+                                "暫緩〈{subject}〉（LLM 連續失敗熔斷，規則評分 {score} 未達門檻，下輪重試）"
+                            ));
+                            retry_uids.push(uid);
                         }
                     } else {
                         match llm_judge(
@@ -2799,6 +2962,9 @@ fn scan_mail(
                             &auth_warnings,
                         ) {
                             Ok(verdict) => {
+                                // 成功即歸零：熔斷只針對「連續」失敗
+                                llm_consecutive_failures = 0;
+                                done_uids.push(uid);
                                 max_checked_uid =
                                     Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                                 last_checked = Some((*date, uid, subject.clone()));
@@ -2825,17 +2991,19 @@ fn scan_mail(
                                         reasons.join("；")
                                     );
                                     pending.push((uid, subject.clone(), score, fallback_reason));
+                                    done_uids.push(uid);
                                 } else {
                                     lines.push(format!(
-                                        "略過〈{}〉（評分 {score}，未達門檻；LLM 判定失敗）",
-                                        subject
+                                        "暫緩〈{subject}〉（評分 {score}，未達門檻；LLM 判定失敗，下輪重試）"
                                     ));
+                                    retry_uids.push(uid);
                                 }
                             }
                         }
                     }
                 }
                 None => {
+                    // 未設定 LLM：GUI 不搬移，斷點照常前進（不列入重試，避免每輪重複記錄）
                     max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
                     last_checked = Some((*date, uid, subject.clone()));
                 }
@@ -2847,13 +3015,42 @@ fn scan_mail(
     }
     if scanned == 0 {
         session.logout().ok();
+        // 本輪只有永久性略過（空內文／無法解析）時，斷點也要前進
+        if let Some(max_uid) = max_checked_uid {
+            return Ok(ScanOutcome {
+                lines,
+                uidvalidity: original_uidvalidity,
+                max_checked_uid: Some(max_uid),
+                last_checked: None,
+                no_new_mail: false,
+                pending_moves: Vec::new(),
+                source_mailbox: config.imap.source_mailbox.clone(),
+                retry_uids,
+                done_uids,
+                failed: false,
+            });
+        }
+        // 有抓取失敗＝整輪失敗（不可回報成無新郵件）；只有其他提示行（如 LLM 設定錯誤、
+        // 內容為空）時照常寫日誌；完全沒有內容才是真正的空掃
+        let failed = fetch_failures > 0;
+        let no_new_mail = lines.is_empty();
+        if failed {
+            lines.insert(
+                0,
+                format!("掃描失敗：{fetch_failures} 封郵件皆無法讀取，下輪重試。"),
+            );
+        }
         return Ok(ScanOutcome {
-            lines: Vec::new(),
+            lines,
             uidvalidity: original_uidvalidity,
             max_checked_uid: None,
             last_checked: None,
-            no_new_mail: true,
+            no_new_mail,
             pending_moves: Vec::new(),
+            source_mailbox: config.imap.source_mailbox.clone(),
+            retry_uids,
+            done_uids,
+            failed,
         });
     }
 
@@ -2874,6 +3071,8 @@ fn scan_mail(
                 score,
                 reason,
                 selected: true,
+                uidvalidity: original_uidvalidity,
+                source_mailbox: config.imap.source_mailbox.clone(),
             });
         }
     } else if !pending.is_empty() {
@@ -2904,7 +3103,9 @@ fn scan_mail(
                 let uid_set = moved_uids.join(",");
                 if let Err(error) = session.uid_expunge(&uid_set) {
                     lines.push(format!("UID EXPUNGE 失敗（改用 EXPUNGE）：{error:#}"));
-                    let _ = session.expunge();
+                    if let Err(error) = session.expunge() {
+                        lines.push(format!("清除來源信箱中已搬移郵件失敗：{error:#}"));
+                    }
                 }
             }
         }
@@ -2941,16 +3142,27 @@ fn scan_mail(
         last_checked,
         no_new_mail: false,
         pending_moves,
+        source_mailbox: config.imap.source_mailbox.clone(),
+        retry_uids,
+        done_uids,
+        failed: false,
     })
 }
 
-/// 過濾掉已檢查過的 UID：僅在相同 UIDVALIDITY（信箱世代）下，捨棄 ≤ 上次最大 UID 的舊信。
+/// 過濾掉已檢查過的 UID：僅在相同 UIDVALIDITY（信箱世代）下，捨棄 ≤ 上次最大 UID 的舊信，
+/// 但保留重試清單中的 UID（上輪 LLM 失敗／熔斷或抓取失敗者）。
 /// 信箱世代不同（重建、換信箱）時保留全部，避免誤跳過。
-fn filter_new_uids(uids: Vec<u32>, last_seen: Option<(u32, u32)>, uidvalidity: u32) -> Vec<u32> {
+fn filter_new_uids(
+    uids: Vec<u32>,
+    last_seen: Option<(u32, u32)>,
+    retry: &[u32],
+    uidvalidity: u32,
+) -> Vec<u32> {
     match last_seen {
-        Some((seen_validity, seen_max)) if seen_validity == uidvalidity => {
-            uids.into_iter().filter(|&uid| uid > seen_max).collect()
-        }
+        Some((seen_validity, seen_max)) if seen_validity == uidvalidity => uids
+            .into_iter()
+            .filter(|uid| *uid > seen_max || retry.contains(uid))
+            .collect(),
         _ => uids,
     }
 }
@@ -2996,7 +3208,7 @@ fn evaluate_eml_batch(inputs: &[PathBuf], config: &Config) -> Result<Vec<EmlRow>
     if paths.is_empty() {
         bail!("指定的路徑中沒有 .eml 檔");
     }
-    let llm = llm_config(&config.llm);
+    let llm = llm_config_checked(&config.llm)?;
     let mut failures: u32 = 0;
     Ok(paths
         .iter()
@@ -3128,39 +3340,62 @@ mod tests {
         assert_eq!(cleanup_retention_days(7), Some(7));
     }
 
-    #[test]
-    fn pending_queue_deduplicates_by_uid() {
-        let mut queue = vec![PendingMoveItem {
-            uid: 101,
-            subject: "信件A".into(),
+    /// 測試用待隔離項目（信箱世代 42、來源 INBOX）
+    fn pending_item(uid: u32, subject: &str) -> PendingMoveItem {
+        PendingMoveItem {
+            uid,
+            subject: subject.into(),
             score: 3,
             reason: "垃圾推銷".into(),
             selected: true,
-        }];
+            uidvalidity: 42,
+            source_mailbox: "INBOX".into(),
+        }
+    }
+
+    #[test]
+    fn pending_queue_deduplicates_by_generation_and_uid() {
+        let mut queue = vec![pending_item(101, "信件A")];
+        // 不同信箱世代的同一個 UID 是不同封信，不可被去重吃掉
+        let mut other_generation = pending_item(101, "重建後的信件");
+        other_generation.uidvalidity = 43;
         let new_items = vec![
-            PendingMoveItem {
-                uid: 101,
-                subject: "信件A重複".into(),
-                score: 3,
-                reason: "垃圾推銷".into(),
-                selected: true,
-            },
-            PendingMoveItem {
-                uid: 102,
-                subject: "信件B".into(),
-                score: 4,
-                reason: "釣魚信件".into(),
-                selected: true,
-            },
+            pending_item(101, "信件A重複"),
+            pending_item(102, "信件B"),
+            other_generation,
         ];
         for item in new_items {
-            if !queue.iter().any(|existing| existing.uid == item.uid) {
+            if !queue.iter().any(|existing| existing.key() == item.key()) {
                 queue.push(item);
             }
         }
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue[0].uid, 101);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].subject, "信件A");
         assert_eq!(queue[1].uid, 102);
+        assert_eq!(queue[2].key(), (43, 101));
+    }
+
+    // 舊版進度檔的待隔離項目沒有信箱世代欄位：仍可解析（由 App::new 回填）
+    #[test]
+    fn legacy_pending_item_without_generation_parses() {
+        let item: PendingMoveItem =
+            toml::from_str("uid = 7\nsubject = \"s\"\nscore = 1\nreason = \"r\"").unwrap();
+        assert_eq!(item.uidvalidity, 0);
+        assert!(item.source_mailbox.is_empty());
+        assert!(item.selected);
+    }
+
+    #[test]
+    fn retry_uids_merge_within_generation_and_reset_otherwise() {
+        // 同世代：原清單 ∪ 新增 − 已完成
+        assert_eq!(merge_retry_uids(&[5, 9], true, &[12, 9], &[5]), [9, 12]);
+        // 世代不同：舊清單作廢
+        assert_eq!(merge_retry_uids(&[5, 9], false, &[3], &[]), [3]);
+        // 上限：只留最大的 MAX_RETRY_UIDS 筆
+        let many: Vec<u32> = (1..=(MAX_RETRY_UIDS as u32 + 10)).collect();
+        let merged = merge_retry_uids(&[], true, &many, &[]);
+        assert_eq!(merged.len(), MAX_RETRY_UIDS);
+        assert_eq!(merged[0], 11);
     }
 
     // 掃描進度文字：含計數與主旨；無主旨時以「(無主旨)」後備
@@ -3194,7 +3429,7 @@ mod tests {
         });
 
         let outcome =
-            scan_mail(&config, &[date], None, &progress_tx).expect("scan_mail 應成功執行");
+            scan_mail(&config, &[date], None, &[], &progress_tx).expect("scan_mail 應成功執行");
         println!("\n=== 2026-08-19 掃描日誌結果 ===");
         for log in outcome.lines {
             println!("{log}");
@@ -3211,19 +3446,24 @@ mod tests {
     fn filters_already_checked_uids_within_same_validity() {
         let uids = vec![3, 7, 9];
         // 上輪檢查到 UID 7：只剩 9 是新信
-        assert_eq!(filter_new_uids(uids, Some((42, 7)), 42), [9]);
+        assert_eq!(filter_new_uids(uids, Some((42, 7)), &[], 42), [9]);
         // 上輪檢查到 UID 3：7、9 皆為新信
-        assert_eq!(filter_new_uids(vec![3, 7, 9], Some((42, 3)), 42), [7, 9]);
+        assert_eq!(
+            filter_new_uids(vec![3, 7, 9], Some((42, 3)), &[], 42),
+            [7, 9]
+        );
         // 全部都檢查過：空掃
-        assert!(filter_new_uids(vec![3, 7], Some((42, 9)), 42).is_empty());
+        assert!(filter_new_uids(vec![3, 7], Some((42, 9)), &[], 42).is_empty());
+        // 重試清單中的 UID 即使在斷點以下也要重新檢查
+        assert_eq!(filter_new_uids(vec![3, 7, 9], Some((42, 9)), &[3], 42), [3]);
     }
 
     #[test]
     fn keeps_all_uids_when_validity_changes_or_unknown() {
         // 信箱重建（UIDVALIDITY 改變）：保留全部，避免誤跳過新信
-        assert_eq!(filter_new_uids(vec![3, 7], Some((42, 9)), 43), [3, 7]);
+        assert_eq!(filter_new_uids(vec![3, 7], Some((42, 9)), &[], 43), [3, 7]);
         // 從未掃描過：保留全部
-        assert_eq!(filter_new_uids(vec![3, 7], None, 42), [3, 7]);
+        assert_eq!(filter_new_uids(vec![3, 7], None, &[], 42), [3, 7]);
     }
 
     // ===== 掃描進度檔與每日日誌 =====
@@ -3244,6 +3484,8 @@ mod tests {
         let state = LastScanState {
             uidvalidity: 42,
             max_checked_uid: 999,
+            source_mailbox: "INBOX".into(),
+            retry_uids: vec![990, 995],
             last_mail_uid: 999,
             last_mail_subject: "DHL：包裹待領取「引號」".into(),
             last_mail_date: NaiveDate::from_ymd_opt(2026, 8, 25).unwrap(),
@@ -3251,13 +3493,7 @@ mod tests {
                 .with_ymd_and_hms(2026, 8, 25, 10, 30, 0)
                 .single()
                 .expect("應可建構時間"),
-            pending_moves: vec![PendingMoveItem {
-                uid: 999,
-                subject: "DHL：包裹待領取「引號」".into(),
-                score: 5,
-                reason: "釣魚郵件".into(),
-                selected: true,
-            }],
+            pending_moves: vec![pending_item(999, "DHL：包裹待領取「引號」")],
         };
         let text = toml::to_string_pretty(&state).expect("應可序列化");
         let parsed: LastScanState = toml::from_str(&text).expect("應可反序列化");
@@ -3401,42 +3637,16 @@ mod tests {
     }
 
     #[test]
-    fn needs_catchup_does_not_busy_loop_when_checked_today() {
-        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
-        // 假設今天已經檢查過（last_check 為今天），即使最後郵件是昨天的，也不應需要立即補掃
-        let last_check_today = true;
-        let last_scanned_yesterday = Some(NaiveDate::from_ymd_opt(2026, 9, 9).unwrap());
-        let needs_catchup =
-            !last_check_today && last_scanned_yesterday.map_or(false, |d| d < today);
-        assert!(!needs_catchup);
-    }
-
-    #[test]
     fn pending_queue_removal_after_successful_move() {
-        let mut queue = vec![
-            PendingMoveItem {
-                uid: 10,
-                subject: "信件10".into(),
-                score: 3,
-                reason: "理由10".into(),
-                selected: true,
-            },
-            PendingMoveItem {
-                uid: 20,
-                subject: "信件20".into(),
-                score: 4,
-                reason: "理由20".into(),
-                selected: true,
-            },
-        ];
-        let moved_uids = vec![10];
-        let not_found_uids: Vec<u32> = vec![];
-        let removed_set: std::collections::HashSet<u32> = moved_uids
+        let mut queue = vec![pending_item(10, "信件10"), pending_item(20, "信件20")];
+        let moved_uids = vec![(42, 10)];
+        let not_found_uids: Vec<(u32, u32)> = vec![];
+        let removed_set: std::collections::HashSet<(u32, u32)> = moved_uids
             .iter()
             .chain(not_found_uids.iter())
             .copied()
             .collect();
-        queue.retain(|i| !removed_set.contains(&i.uid));
+        queue.retain(|i| !removed_set.contains(&i.key()));
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].uid, 20);
     }

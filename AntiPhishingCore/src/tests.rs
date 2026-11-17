@@ -2,6 +2,7 @@ use crate::*;
 use mailparse::{MailHeaderMap, parse_mail};
 use serde::Deserialize;
 use std::fs;
+use std::time::{Duration, Instant};
 
 /// 只含 `[llm]` 段的測試用設定（其他段落由 serde 忽略）。
 #[derive(Deserialize)]
@@ -33,17 +34,6 @@ fn config() -> DetectionConfig {
         trusted_sender_domains: vec!["company.test".into()],
         trusted_relay_ips: Vec::new(),
         suspicious_keywords: vec!["verify".into(), "password".into()],
-        external_word_image_score: 6,
-    }
-}
-
-fn bare_config() -> DetectionConfig {
-    DetectionConfig {
-        threshold: 8,
-        suspicious_sender_domains: Vec::new(),
-        trusted_sender_domains: Vec::new(),
-        trusted_relay_ips: Vec::new(),
-        suspicious_keywords: Vec::new(),
         external_word_image_score: 6,
     }
 }
@@ -1471,4 +1461,217 @@ fn external_word_image_scores_configured_value() {
         &config(),
     );
     assert_eq!(score, 6);
+}
+
+// ===== Code review 修正回歸測試 =====
+
+// 信任網域豁免必須 DMARC 通過：沒有驗證標頭、dmarc=none、spf=softfail 都不得豁免
+#[test]
+fn trusted_domain_requires_dmarc_pass() {
+    let config = eml_test_config("trusted_sender_domains = [\"example.com\"]");
+    let mut failures = 0;
+    for headers in [
+        "",
+        "Authentication-Results: mx.local; dmarc=none\r\n",
+        "Authentication-Results: mx.local; spf=softfail; dkim=pass\r\n",
+    ] {
+        let raw = format!("{headers}From: a@example.com\r\nSubject: s\r\n\r\nb\r\n");
+        let ev = evaluate_mail(raw.as_bytes(), &config, &None, &mut failures).unwrap();
+        assert_ne!(ev.basis, "信任寄件者豁免", "headers = {headers:?}");
+    }
+    // 下層偽造的 Received-SPF pass 不能讓信任網域通過
+    let forged = "Received-SPF: pass\r\nFrom: a@example.com\r\nSubject: s\r\n\r\nb\r\n";
+    let ev = evaluate_mail(forged.as_bytes(), &config, &None, &mut failures).unwrap();
+    assert_ne!(ev.basis, "信任寄件者豁免");
+}
+
+#[test]
+fn trust_decision_reports_reason_when_rejected() {
+    let config = eml_test_config("trusted_sender_domains = [\"example.com\"]");
+    let raw = "From: a@example.com\r\n\r\nb\r\n";
+    let mail = parse_mail(raw.as_bytes()).unwrap();
+    let auth = check_auth_status(&mail);
+    match trust_decision(&mail, "a@example.com", &config, &auth) {
+        TrustDecision::Rejected(matched, reason) => {
+            assert_eq!(matched, "example.com");
+            assert!(reason.contains("DMARC"), "reason = {reason}");
+        }
+        other => panic!("應取消豁免，實際：{other:?}"),
+    }
+    let other = parse_mail(b"From: a@other.org\r\n\r\nb\r\n").unwrap();
+    assert_eq!(
+        trust_decision(&other, "a@other.org", &config, &check_auth_status(&other)),
+        TrustDecision::NotListed
+    );
+}
+
+// 首個驗證標頭沒有 authserv-id 時，不得採用下層（可能偽造）標頭補齊欄位
+#[test]
+fn auth_status_does_not_merge_lower_headers_without_server_id() {
+    let raw = concat!(
+        "Authentication-Results: i=1; spf=pass\r\n",
+        "Authentication-Results: forged.example; dmarc=pass\r\n",
+        "From: a@example.com\r\n\r\nb\r\n"
+    );
+    let mail = parse_mail(raw.as_bytes()).unwrap();
+    let status = check_auth_status(&mail);
+    assert_eq!(status.spf.as_deref(), Some("pass"));
+    assert_eq!(status.dmarc, None);
+    // 不同 authserv-id 的下層標頭同樣不可補齊
+    let raw = concat!(
+        "Authentication-Results: mx.local; spf=pass\r\n",
+        "Authentication-Results: forged.example; dmarc=pass\r\n",
+        "From: a@example.com\r\n\r\nb\r\n"
+    );
+    let status = check_auth_status(&parse_mail(raw.as_bytes()).unwrap());
+    assert_eq!(status.dmarc, None);
+}
+
+// HELO 自報 [信任IP] 不可冒充實際連線 IP
+#[test]
+fn top_received_ip_ignores_helo_brackets() {
+    let ip = |raw: &str| top_received_ip(&parse_mail(raw.as_bytes()).unwrap());
+    assert_eq!(
+        ip("Received: from [192.168.10.254] (evil.example [198.51.100.9]) by mx\r\n\r\nb"),
+        Some("198.51.100.9".parse().unwrap())
+    );
+    // 括號內無可用 IP：不得退回 HELO 值
+    assert_eq!(
+        ip("Received: from [192.168.10.254] (evil.example) by mx\r\n\r\nb"),
+        None
+    );
+    // Exim：helo= 值為自報，必須剔除
+    assert_eq!(
+        ip("Received: from host.example ([203.0.113.5] helo=[192.168.10.254]) by mx\r\n\r\nb"),
+        Some("203.0.113.5".parse().unwrap())
+    );
+    assert_eq!(
+        ip("Received: from x (helo=[192.168.10.254]) by mx\r\n\r\nb"),
+        None
+    );
+    // Exchange：括號內直接寫 IP
+    assert_eq!(
+        ip("Received: from SN1PR01 (2603:10b6::1) by mx\r\n\r\nb"),
+        Some("2603:10b6::1".parse().unwrap())
+    );
+}
+
+// 原始 HTML 噪音不得造成誤判：base64 內的 qr、DOCTYPE/xmlns 網址、跨標籤的 @
+#[test]
+fn rule_score_ignores_html_noise() {
+    let mut cfg = test_detection_config();
+    cfg.suspicious_keywords = vec!["QR".into()];
+    let html = concat!(
+        "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1.dtd\">",
+        "<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:o=\"urn:schemas-microsoft-com:office:office\">",
+        "<img src=\"data:image/png;base64,AAqrBBQRcc\" alt=\"logo\">",
+        "<a href=\"https://a.example/x\">user@a.example</a>",
+        "</html>"
+    );
+    let (score, reasons) = phishing_score("x@a.example", "hi", html, &[], &[], &[], &cfg);
+    assert_eq!(score, 0, "reasons = {reasons:?}");
+}
+
+#[test]
+fn trusted_domain_reduction_skipped_when_auth_fails() {
+    let warnings = vec!["DMARC 驗證失敗".to_string()];
+    let (_, reasons) = phishing_score(
+        "notice@company.test",
+        "Verify",
+        "",
+        &[],
+        &[],
+        &warnings,
+        &config(),
+    );
+    assert!(!reasons.iter().any(|r| r.contains("信任清單")));
+}
+
+// LLM 內文 HTML 優先：塞長段 text/plain 不能把 HTML 內容擠出截斷範圍
+#[test]
+fn llm_body_puts_html_before_plain() {
+    let raw = format!(
+        concat!(
+            "Content-Type: multipart/alternative; boundary=b\r\n\r\n",
+            "--b\r\nContent-Type: text/plain\r\n\r\n{}\r\n",
+            "--b\r\nContent-Type: text/html\r\n\r\n<p>MALICIOUS</p>\r\n",
+            "--b--\r\n"
+        ),
+        "x".repeat(10_000)
+    );
+    let mail = parse_mail(raw.as_bytes()).unwrap();
+    let (llm_body, _) = extract_body_text(&mail);
+    let prompt = llm_user_prompt("a@b", "s", &llm_body, 100, &[], &[], "", &[]);
+    assert!(prompt.contains("MALICIOUS"));
+}
+
+// 熔斷只針對連續失敗：成功一次即歸零
+#[test]
+fn evaluate_mail_resets_failure_counter_on_success() {
+    let config = eml_test_config("");
+    // 自訂命令輸出檔案內的合法判定 JSON（避開命令列引號跳脫差異；type/cat 不讀 stdin）
+    let json_path = std::env::temp_dir().join(format!("ap_verdict_{}.json", std::process::id()));
+    fs::write(&json_path, r#"{"is_phishing": false, "reason": "ok"}"#).unwrap();
+    let reader = if cfg!(windows) { "type" } else { "cat" };
+    let mut llm_config = LlmConfig::default();
+    llm_config.backend = Some("command".into());
+    llm_config.command = format!("{reader} {}", json_path.display());
+    let llm = Some(llm_config);
+    let mut failures = 2;
+    let mail = "From: a@example.org\r\nSubject: hi\r\n\r\nbody\r\n";
+    let ev = evaluate_mail(mail.as_bytes(), &config, &llm, &mut failures).unwrap();
+    let _ = fs::remove_file(&json_path);
+    assert_eq!(ev.basis, "LLM", "llm_text = {}", ev.llm_text);
+    assert_eq!(failures, 0);
+}
+
+// backend 打錯字或缺參數必須報錯；留空才是「未設定」
+#[test]
+fn llm_config_checked_rejects_typo_and_missing_params() {
+    let parse = |s: &str| toml::from_str::<LlmConfig>(s).unwrap();
+    assert!(llm_config_checked(&parse("backend = \"claud\"")).is_err());
+    assert!(llm_config_checked(&parse("backend = \"command\"")).is_err());
+    assert!(llm_config_checked(&parse("backend = \"api\"\nbase_url = \"http://x\"")).is_err());
+    assert!(llm_config_checked(&parse("")).unwrap().is_none());
+    assert!(
+        llm_config_checked(&parse("backend = \"\""))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        llm_config_checked(&parse("backend = \"claude\""))
+            .unwrap()
+            .is_some()
+    );
+    // 舊版只寫 base_url 未寫 model：維持回退（未明確指定 backend）
+    assert!(
+        llm_config_checked(&parse("base_url = \"http://x\""))
+            .unwrap()
+            .is_none()
+    );
+}
+
+// 子行程不讀 stdin 且不結束：大量 prompt 也必須在逾時內返回
+#[test]
+fn run_cli_times_out_when_child_ignores_stdin() {
+    #[cfg(windows)]
+    let (program, args) = (
+        "powershell",
+        vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 30".to_string(),
+        ],
+    );
+    #[cfg(not(windows))]
+    let (program, args) = ("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+    let prompt = "x".repeat(4 * 1024 * 1024);
+    let start = Instant::now();
+    let result = run_cli_with_stdin(program, &args, &prompt, Duration::from_secs(2));
+    assert!(result.is_err());
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "逾時保護失效：{:?}",
+        start.elapsed()
+    );
 }
