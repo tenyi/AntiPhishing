@@ -1675,3 +1675,198 @@ fn run_cli_times_out_when_child_ignores_stdin() {
         start.elapsed()
     );
 }
+
+#[test]
+fn shared_evaluation_preserves_rule_fallback_and_retry_policy() {
+    let config = eml_test_config("threshold = 2\nsuspicious_keywords = [\"verify\", \"password\"]");
+    let bytes = b"From: a@example.org\r\nSubject: verify password\r\n\r\nbody";
+    let mut failures = 0;
+    let rules = evaluate_mail(bytes, &config, &None, &mut failures).unwrap();
+    assert!(rules.flagged);
+    assert!(!rules.retry_needed);
+    let mut llm = LlmConfig::default();
+    llm.backend = Some("command".into());
+    // 無效命令回傳失敗；確認低分信重試、高分信仍可交給前端隔離。
+    llm.command = "exit 1".into();
+    for body in [
+        bytes.as_slice(),
+        b"From: a@example.org\r\nSubject: hello\r\n\r\nbody",
+    ] {
+        failures = 0;
+        let failed = evaluate_mail(body, &config, &Some(llm.clone()), &mut failures).unwrap();
+        assert_eq!(failures, 1);
+        assert!(failed.retry_needed);
+        assert_eq!(failed.flagged, failed.rule_score >= config.threshold);
+        failures = 3;
+        let blocked = evaluate_mail(body, &config, &Some(llm.clone()), &mut failures).unwrap();
+        assert_eq!(failures, 3);
+        assert!(blocked.retry_needed);
+        assert_eq!(blocked.flagged, failed.flagged);
+        assert_eq!(blocked.basis, "規則（LLM 熔斷）");
+    }
+}
+
+#[test]
+fn shared_evaluation_uses_llm_verdict_instead_of_rule_threshold() {
+    let config = eml_test_config("threshold = 1\nsuspicious_keywords = [\"verify\"]");
+    let path = std::env::temp_dir().join(format!("ap_policy_{}.json", std::process::id()));
+    let mut llm = LlmConfig::default();
+    llm.backend = Some("command".into());
+    let reader = if cfg!(windows) { "type" } else { "cat" };
+    llm.command = format!("{reader} {}", path.display());
+    let mut failures = 2;
+    for verdict in [false, true] {
+        fs::write(
+            &path,
+            format!(r#"{{"is_phishing": {verdict}, "reason": "測試"}}"#),
+        )
+        .unwrap();
+        let result = evaluate_mail(
+            b"From: a@example.org\r\nSubject: verify\r\n\r\nbody",
+            &config,
+            &Some(llm.clone()),
+            &mut failures,
+        )
+        .unwrap();
+        assert!(result.rule_score >= config.threshold);
+        assert_eq!(result.flagged, verdict, "{}", result.llm_text);
+        assert!(!result.retry_needed);
+        assert_eq!(failures, 0);
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn jev_boolean_entry_rejects_fixed_probability_threshold() {
+    let mut config = LlmConfig::default();
+    config.backend = Some("jev".into());
+    let error = llm_judge(&config, "", "", "", &[], &[], "", &[])
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("混合評分"));
+}
+
+/// 使用本機假 IMAP 伺服器驗證實際指令：拒絕 PEEK 可後備，斷線則不得再發 FETCH。
+#[test]
+fn fetch_falls_back_only_after_explicit_rejection() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    for status in ["NO", "BAD", "BYE"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            write!(socket, "* OK 測試伺服器\r\n").unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let tag = line.split_whitespace().next().unwrap();
+            write!(socket, "{tag} OK login\r\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("BODY.PEEK[]"));
+            let tag = line.split_whitespace().next().unwrap();
+            if status == "BYE" {
+                write!(socket, "* BYE closing\r\n").unwrap();
+            } else {
+                write!(socket, "{tag} {status} unsupported\r\n").unwrap();
+            }
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if status == "BYE" {
+                assert!(line.is_empty(), "斷線後不應送出後備指令：{line}");
+            } else {
+                assert!(line.contains("RFC822"));
+                let tag = line.split_whitespace().next().unwrap();
+                write!(socket, "{tag} OK fetch\r\n").unwrap();
+            }
+        });
+        let socket = std::net::TcpStream::connect(addr).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut client = imap::Client::new(Box::new(socket) as imap::Connection);
+        client.read_greeting().unwrap();
+        let mut session = client
+            .login("test", "test")
+            .map_err(|(error, _)| error)
+            .unwrap();
+        let result = fetch_message(&mut session, 42);
+        if status == "BYE" {
+            assert!(result.is_err());
+            assert!(!imap_command_rejected(&result.err().unwrap()));
+        } else {
+            assert!(result.unwrap().1);
+        }
+        drop(session);
+        server.join().unwrap();
+    }
+    assert!(!imap_command_rejected(&imap::Error::ConnectionLost));
+    assert!(!imap_command_rejected(&imap::Error::Io(
+        std::io::ErrorKind::TimedOut.into()
+    )));
+}
+
+#[test]
+fn shared_jev_evaluation_obeys_configured_scoring() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("POST /v1/systemone "));
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let response = r#"{"answers":{"is_phishing":{"noul":0.7}}}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        }
+    });
+    let config = eml_test_config("threshold = 6\nsuspicious_keywords = []");
+    let mut llm = LlmConfig::default();
+    llm.backend = Some("jev".into());
+    llm.base_url = format!("http://{addr}");
+    llm.timeout_secs = 3;
+    let mut failures = 2;
+    // 70% 低於舊版寫死的 75%，仍應依可設定的混合評分決定。
+    for (max_score, min_prob, points, flagged) in
+        [(10, 0.0, 7, true), (5, 0.0, 4, false), (10, 0.8, 0, false)]
+    {
+        llm.jev_max_score = max_score;
+        llm.jev_min_prob = min_prob;
+        let ev = evaluate_mail(
+            b"From: a@example.org\r\nSubject: hello\r\n\r\nbody",
+            &config,
+            &Some(llm.clone()),
+            &mut failures,
+        )
+        .unwrap();
+        assert_eq!(ev.basis, "混合評分（規則＋Jev）", "{}", ev.llm_text);
+        assert_eq!(ev.final_score, points);
+        assert_eq!(ev.flagged, flagged);
+        assert!(!ev.retry_needed);
+        assert_eq!(failures, 0);
+    }
+    server.join().unwrap();
+}

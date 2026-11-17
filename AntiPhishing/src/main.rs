@@ -100,17 +100,17 @@ fn main() -> Result<()> {
         for (index, uid) in uids.into_iter().enumerate() {
             // BODY.PEEK[] 依 RFC 3501 § 6.4.5 不會觸發 \Seen；RFC822 fallback 在多數伺服器上會。
             // 只在 fallback 路徑才還原未讀，避免對未讀信件多發一次無意義的 STORE。
-            let (messages, used_fallback) =
-                match session.uid_fetch(uid.to_string(), "(FLAGS BODY.PEEK[])") {
-                    Ok(messages) => (messages, false),
-                    Err(_) => match session.uid_fetch(uid.to_string(), "(FLAGS RFC822)") {
-                        Ok(messages) => (messages, true),
-                        Err(error) => {
-                            lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
-                            continue;
-                        }
-                    },
-                };
+            let (messages, used_fallback) = match fetch_message(&mut session, uid) {
+                Ok(result) => result,
+                Err(error) if imap_command_rejected(&error) => {
+                    lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
+                    continue;
+                }
+                // 不在失效連線上重試後續郵件；整輪不推進進度，下一輪重新連線補掃。
+                Err(error) => {
+                    return Err(error).context(format!("IMAP 連線無法繼續，停止掃描（UID {uid}）"));
+                }
+            };
             // 伺服器可能在回應中夾帶其他郵件的旗標更新（未經要求的 FETCH），須以 UID 比對
             let Some(message) = messages.iter().find(|m| m.uid == Some(uid)) else {
                 lines.push(format!("郵件 UID {uid} 內容為空，略過。"));
@@ -135,185 +135,26 @@ fn main() -> Result<()> {
                     continue;
                 }
             };
-            let from = mail.headers.get_first_value("From").unwrap_or_default();
             let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
-            // mailparse 對 multipart 的 get_body() 回傳空，改從 subparts 提取
-            let (body, score_body) = extract_body_text(&mail);
             scanned += 1;
             show_progress(&progress_width, progress_text(index + 1, total, &subject));
-            let attachments = extract_attachment_filenames(&mail);
-            let targets = external_word_image_targets(&mail);
-            let auth_status = check_auth_status(&mail);
-            let auth_warnings = auth_status.warnings.clone();
-            let auth_summary = auth_status.summary();
-
-            // 信任清單豁免：信任網域須 DMARC 通過、信任 IP 須無驗證失敗（規則見 trust_decision）
-            match trust_decision(&mail, &from, &config.detection, &auth_status) {
-                TrustDecision::Exempt(matched) => {
-                    lines.push(format!("略過〈{subject}〉（信任來源豁免：{matched}）"));
-                    if used_fallback && was_unread {
-                        let _ = restore_unread_status(&mut session, uid);
-                    }
-                    continue;
-                }
-                TrustDecision::Rejected(matched, reason) => {
-                    lines.push(format!(
-                        "注意：〈{subject}〉寄件來源雖符合信任清單（{matched}），但{reason}，取消白名單豁免並送檢"
-                    ));
-                }
-                TrustDecision::NotListed => {}
-            }
-
-            let (score, reasons) = phishing_score(
-                &from,
-                &subject,
-                &score_body,
-                &attachments,
-                &targets,
-                &auth_warnings,
+            let ev = evaluate_parsed_mail(
+                &mail,
                 &config.detection,
+                &llm,
+                &mut llm_consecutive_failures,
             );
-            match &llm {
-                Some(llm_config) => {
-                    if llm_config.effective_backend() == Some(LlmBackend::Jev) {
-                        if llm_consecutive_failures >= 3 {
-                            if score >= config.detection.threshold {
-                                let fallback_reason = format!(
-                                    "Jev 熔斷；規則評分達標（{score}分）：{}",
-                                    reasons.join("；")
-                                );
-                                pending.push((uid, subject.clone(), score, fallback_reason));
-                            } else {
-                                lines.push(format!(
-                                    "略過〈{subject}〉（Jev 連續失敗熔斷，規則評分 {score} 未達門檻）"
-                                ));
-                            }
-                        } else {
-                            match llm_judge_jev(
-                                llm_config,
-                                &from,
-                                &subject,
-                                &body,
-                                &attachments,
-                                &targets,
-                                &auth_summary,
-                                &auth_warnings,
-                            ) {
-                                Ok(prob) => {
-                                    // 成功即歸零：熔斷只針對「連續」失敗
-                                    llm_consecutive_failures = 0;
-                                    let jev_points = calculate_jev_points(
-                                        prob,
-                                        llm_config.jev_max_score,
-                                        llm_config.jev_min_prob,
-                                    );
-                                    let final_score = score + jev_points;
-                                    let mut combined_reasons = reasons.clone();
-                                    combined_reasons.push(format!(
-                                        "Jev 評定釣魚機率 {:.0}%（+{jev_points}分）",
-                                        prob * 100.0
-                                    ));
-                                    if final_score >= config.detection.threshold {
-                                        pending.push((
-                                            uid,
-                                            subject.clone(),
-                                            final_score,
-                                            combined_reasons.join("；"),
-                                        ));
-                                    } else {
-                                        lines.push(format!(
-                                            "略過〈{}〉（評分 {final_score}，未達門檻；Jev 機率 {:.0}%）",
-                                            subject,
-                                            prob * 100.0
-                                        ));
-                                    }
-                                }
-                                Err(error) => {
-                                    llm_consecutive_failures += 1;
-                                    lines.push(format!(
-                                        "Jev 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
-                                    ));
-                                    if score >= config.detection.threshold {
-                                        let fallback_reason = format!(
-                                            "Jev 判定失敗，退回規則評分達標（{score}分）：{}",
-                                            reasons.join("；")
-                                        );
-                                        pending.push((
-                                            uid,
-                                            subject.clone(),
-                                            score,
-                                            fallback_reason,
-                                        ));
-                                    } else {
-                                        lines.push(format!(
-                                            "略過〈{}〉（評分 {score}，未達門檻；Jev 判定失敗）",
-                                            subject
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    } else if llm_consecutive_failures >= 3 {
-                        // 熔斷：本日期內已連續失敗 ≥3 次，跳過 LLM 直接採規則評分
-                        if score >= config.detection.threshold {
-                            let fallback_reason = format!(
-                                "LLM 熔斷；規則評分達標（{score}分）：{}",
-                                reasons.join("；")
-                            );
-                            pending.push((uid, subject.clone(), score, fallback_reason));
-                        } else {
-                            lines.push(format!(
-                                "略過〈{subject}〉（LLM 連續失敗熔斷，規則評分 {score} 未達門檻）"
-                            ));
-                        }
-                    } else {
-                        match llm_judge(
-                            llm_config,
-                            &from,
-                            &subject,
-                            &body,
-                            &attachments,
-                            &targets,
-                            &auth_summary,
-                            &auth_warnings,
-                        ) {
-                            Ok(verdict) if verdict.is_phishing => {
-                                llm_consecutive_failures = 0;
-                                pending.push((uid, subject.clone(), score, verdict.reason));
-                            }
-                            Ok(verdict) => {
-                                llm_consecutive_failures = 0;
-                                lines.push(format!(
-                                    "略過〈{}〉（評分 {score}；LLM：{}）",
-                                    subject, verdict.reason
-                                ));
-                            }
-                            Err(error) => {
-                                llm_consecutive_failures += 1;
-                                lines.push(format!(
-                                    "LLM 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
-                                ));
-                                if score >= config.detection.threshold {
-                                    let fallback_reason = format!(
-                                        "LLM 判定失敗，退回規則評分達標（{score}分）：{}",
-                                        reasons.join("；")
-                                    );
-                                    pending.push((uid, subject.clone(), score, fallback_reason));
-                                } else {
-                                    lines.push(format!(
-                                        "略過〈{}〉（評分 {score}，未達門檻；LLM 判定失敗）",
-                                        subject
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                None => {
-                    if score >= config.detection.threshold {
-                        pending.push((uid, subject.clone(), score, reasons.join("；")));
-                    }
-                }
+            if let Some(warning) = &ev.trust_warning {
+                lines.push(format!("注意：〈{subject}〉{warning}"));
+            }
+            let reason = format!("{}；{}", ev.llm_text, ev.rule_reasons.join("；"));
+            if ev.flagged {
+                pending.push((uid, subject, ev.final_score, reason));
+            } else {
+                lines.push(format!(
+                    "略過〈{subject}〉（評分 {}；{reason}）",
+                    ev.final_score
+                ));
             }
             if used_fallback && was_unread {
                 let _ = restore_unread_status(&mut session, uid);

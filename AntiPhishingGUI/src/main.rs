@@ -616,8 +616,27 @@ enum SettingsTab {
     Schedule,
 }
 
+/// 寫檔成功才發布設定；寫入失敗時背景作業維持原設定。
+fn save_config(draft: &Config, active: &mut Config, path: &Path) -> Result<()> {
+    let text = toml::to_string_pretty(draft)?;
+    safe_write_file(path, &text)?;
+    *active = draft.clone();
+    Ok(())
+}
+
+fn same_source_mailbox(a: &ImapConfig, b: &ImapConfig) -> bool {
+    a.host == b.host
+        && a.port == b.port
+        && a.protocol == b.protocol
+        && a.username == b.username
+        && a.source_mailbox == b.source_mailbox
+}
+
 struct App {
+    /// 設定頁的編輯草稿。
     config: Config,
+    /// 僅在寫檔成功後更新，供掃描、搬移及排程使用。
+    saved_config: Config,
     status: String,
     /// 目前顯示的視圖（主畫面或設定各大項）
     active_view: ActiveView,
@@ -761,6 +780,7 @@ impl App {
         let show_confirm_dialog = !pending_queue.is_empty();
         Self {
             next_check: Instant::now() + interval(&config),
+            saved_config: config.clone(),
             config,
             status,
             active_view,
@@ -829,13 +849,36 @@ impl App {
     }
 
     fn save(&mut self) {
-        let result: Result<()> = (|| {
-            let text = toml::to_string_pretty(&self.config)?;
-            safe_write_file(&config_path(), &text)?;
-            Ok(())
-        })();
-        match result {
+        self.settings_saved_toast = None;
+        // 舊 worker 的結果不能套用到新帳號／信箱；作業結束後再儲存。
+        if self.receiver.is_some() || self.move_receiver.is_some() || self.eml_receiver.is_some() {
+            self.status = "背景作業進行中，請待完成後再儲存設定。".into();
+            return;
+        }
+        let mailbox_changed = !same_source_mailbox(&self.saved_config.imap, &self.config.imap);
+        // 先移除舊進度再切換設定；移除失敗時保留原設定，避免重啟誤用舊 UID。
+        if mailbox_changed
+            && let Err(error) = fs::remove_file(scan_state_path())
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.status = format!("無法清除舊信箱進度，設定未儲存：{error}");
+            return;
+        }
+        match save_config(&self.config, &mut self.saved_config, &config_path()) {
             Ok(()) => {
+                if mailbox_changed {
+                    self.last_seen = None;
+                    self.last_seen_mailbox.clear();
+                    self.retry_uids.clear();
+                    self.last_check = None;
+                    self.last_mail = None;
+                    self.pending_queue.clear();
+                    self.show_confirm_dialog = false;
+                    self.push_log(
+                        "來源帳號或信箱已變更，已清除舊掃描進度與待確認清單；郵件未搬移。".into(),
+                    );
+                }
+                self.next_check = Instant::now() + interval(&self.saved_config);
                 self.status = "設定已儲存。".into();
                 self.settings_saved_toast = Some(Instant::now());
             }
@@ -900,7 +943,7 @@ impl App {
         if items.is_empty() {
             return;
         }
-        let config = self.config.clone();
+        let config = self.saved_config.clone();
         let (sender, receiver) = mpsc::channel::<MoveOutcome>();
         self.move_receiver = Some(receiver);
         let count = items.len();
@@ -983,18 +1026,18 @@ impl App {
             return;
         }
         // 掃描前先驗證設定，避免啟動時帶著空設定連線失敗卻無明確提示
-        if let Some(problem) = imap_credentials_problem(&self.config.imap) {
+        if let Some(problem) = imap_credentials_problem(&self.saved_config.imap) {
             self.status = problem;
             return;
         }
-        if let Some(problem) = imap_mailbox_problem(&self.config.imap) {
+        if let Some(problem) = imap_mailbox_problem(&self.saved_config.imap) {
             self.status = problem;
             return;
         }
         // 斷點只適用於同一個來源信箱（舊版進度檔未記信箱名稱時視為相同）
         let last_seen = last_seen.filter(|_| {
             self.last_seen_mailbox.is_empty()
-                || self.last_seen_mailbox == self.config.imap.source_mailbox
+                || self.last_seen_mailbox == self.saved_config.imap.source_mailbox
         });
         // 帶斷點掃描時一併帶入重試清單；全量掃描本來就涵蓋全部 UID
         let retry_uids = if last_seen.is_some() {
@@ -1002,7 +1045,7 @@ impl App {
         } else {
             Vec::new()
         };
-        let config = self.config.clone();
+        let config = self.saved_config.clone();
         let (sender, receiver) = mpsc::channel::<ScanEvent>();
         self.receiver = Some(receiver);
         self.scan_progress.clear();
@@ -1037,7 +1080,7 @@ impl App {
             self.status = "已有掃描或 .eml 判定進行中，請稍候。".into();
             return;
         }
-        let config = self.config.clone();
+        let config = self.saved_config.clone();
         let (sender, receiver) = mpsc::channel();
         self.eml_receiver = Some(receiver);
         self.status = "本機 .eml 判定中…".into();
@@ -1221,7 +1264,7 @@ impl App {
             self.scan_progress.clear();
             // 一律排入正常間隔（失敗時不可立即重試，否則連線失敗會變成緊密重連迴圈）；
             // 補掃範圍由 scan_dates_since_last 依 last_check 決定，失敗時 last_check 不前進
-            self.next_check = Instant::now() + interval(&self.config);
+            self.next_check = Instant::now() + interval(&self.saved_config);
         }
         // 處理獨立搬移任務接收
         if let Some(receiver) = &self.move_receiver {
@@ -1704,7 +1747,7 @@ impl App {
                 }
             });
             if !self.eml_results.is_empty() {
-                let threshold = self.config.detection.threshold;
+                let threshold = self.saved_config.detection.threshold;
                 let mut clear = false;
                 egui::CollapsingHeader::new(format!(
                     "本機 .eml 判定結果（{} 封，唯讀）",
@@ -2171,11 +2214,11 @@ impl eframe::App for App {
         self.poll(ctx);
         if !self.allow_exit
             && ctx.input(|input| input.viewport().close_requested())
-            && self.config.gui.minimize_to_tray
+            && self.saved_config.gui.minimize_to_tray
             && self.tray.is_some()
         {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            if self.config.gui.hide_taskbar_when_minimized {
+            if self.saved_config.gui.hide_taskbar_when_minimized {
                 ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             } else {
                 ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
@@ -2754,22 +2797,19 @@ fn scan_mail(
         for (index, uid) in uids.into_iter().enumerate() {
             // BODY.PEEK[] 依 RFC 3501 § 6.4.5 不會觸發 \Seen；RFC822 fallback 在多數伺服器上會。
             // 只在 fallback 路徑才還原未讀，避免對未讀信件多發一次無意義的 STORE。
-            let (messages, used_fallback) =
-                match session.uid_fetch(uid.to_string(), "(FLAGS BODY.PEEK[])") {
-                    Ok(messages) => (messages, false),
-                    Err(_) => match session.uid_fetch(uid.to_string(), "(FLAGS RFC822)") {
-                        Ok(messages) => (messages, true),
-                        Err(error) => {
-                            // 抓取失敗多為暫時性（網路），列入重試；斷點仍可越過它前進
-                            lines.push(format!(
-                                "無法讀取郵件 UID {uid}（略過，下輪重試）：{error:#}"
-                            ));
-                            fetch_failures += 1;
-                            retry_uids.push(uid);
-                            continue;
-                        }
-                    },
-                };
+            let (messages, used_fallback) = match fetch_message(&mut session, uid) {
+                Ok(result) => result,
+                Err(error) if imap_command_rejected(&error) => {
+                    lines.push(format!("無法讀取郵件 UID {uid}（略過）：{error:#}"));
+                    fetch_failures += 1;
+                    retry_uids.push(uid);
+                    continue;
+                }
+                // 不在失效連線上重試後續郵件；整輪不推進進度，下一輪重新連線補掃。
+                Err(error) => {
+                    return Err(error).context(format!("IMAP 連線無法繼續，停止掃描（UID {uid}）"));
+                }
+            };
             // 伺服器可能在回應中夾帶其他郵件的旗標更新（未經要求的 FETCH），須以 UID 比對
             let Some(message) = messages.iter().find(|m| m.uid == Some(uid)) else {
                 lines.push(format!("郵件 UID {uid} 內容為空或已被刪除，略過。"));
@@ -2799,9 +2839,7 @@ fn scan_mail(
                     continue;
                 }
             };
-            let from = mail.headers.get_first_value("From").unwrap_or_default();
             let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
-            let (body, score_body) = extract_body_text(&mail);
             scanned += 1;
             progress
                 .send(ScanEvent::Progress(progress_text(
@@ -2810,203 +2848,31 @@ fn scan_mail(
                     &subject,
                 )))
                 .ok();
-            let attachments = extract_attachment_filenames(&mail);
-            let targets = external_word_image_targets(&mail);
-            let auth_status = check_auth_status(&mail);
-            let auth_warnings = auth_status.warnings.clone();
-            let auth_summary = auth_status.summary();
-
-            // 信任清單豁免：信任網域須 DMARC 通過、信任 IP 須無驗證失敗（規則見 trust_decision）
-            match trust_decision(&mail, &from, &config.detection, &auth_status) {
-                TrustDecision::Exempt(matched) => {
-                    max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
-                    last_checked = Some((*date, uid, subject.clone()));
-                    done_uids.push(uid);
-                    lines.push(format!("略過〈{subject}〉（信任來源豁免：{matched}）"));
-                    if used_fallback && was_unread {
-                        let _ = restore_unread_status(&mut session, uid);
-                    }
-                    continue;
-                }
-                TrustDecision::Rejected(matched, reason) => {
-                    lines.push(format!(
-                        "注意：〈{subject}〉寄件來源雖符合信任清單（{matched}），但{reason}，取消白名單豁免並送檢"
-                    ));
-                }
-                TrustDecision::NotListed => {}
-            }
-
-            let (score, reasons) = phishing_score(
-                &from,
-                &subject,
-                &score_body,
-                &attachments,
-                &targets,
-                &auth_warnings,
+            let ev = evaluate_parsed_mail(
+                &mail,
                 &config.detection,
+                &llm,
+                &mut llm_consecutive_failures,
             );
-            match &llm {
-                Some(llm_config) => {
-                    if llm_config.effective_backend() == Some(LlmBackend::Jev) {
-                        max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
-                        last_checked = Some((*date, uid, subject.clone()));
-                        if llm_consecutive_failures >= 3 {
-                            if score >= config.detection.threshold {
-                                let fallback_reason = format!(
-                                    "Jev 熔斷；規則評分達標（{score}分）：{}",
-                                    reasons.join("；")
-                                );
-                                pending.push((uid, subject.clone(), score, fallback_reason));
-                                done_uids.push(uid);
-                            } else {
-                                // 未經 Jev 判定：列入重試，待服務恢復後重新判定
-                                lines.push(format!(
-                                    "暫緩〈{subject}〉（Jev 連續失敗熔斷，規則評分 {score} 未達門檻，下輪重試）"
-                                ));
-                                retry_uids.push(uid);
-                            }
-                        } else {
-                            match llm_judge_jev(
-                                llm_config,
-                                &from,
-                                &subject,
-                                &body,
-                                &attachments,
-                                &targets,
-                                &auth_summary,
-                                &auth_warnings,
-                            ) {
-                                Ok(prob) => {
-                                    // 成功即歸零：熔斷只針對「連續」失敗
-                                    llm_consecutive_failures = 0;
-                                    done_uids.push(uid);
-                                    let jev_points = calculate_jev_points(
-                                        prob,
-                                        llm_config.jev_max_score,
-                                        llm_config.jev_min_prob,
-                                    );
-                                    let final_score = score + jev_points;
-                                    let mut combined_reasons = reasons.clone();
-                                    combined_reasons.push(format!(
-                                        "Jev 評定釣魚機率 {:.0}%（+{jev_points}分）",
-                                        prob * 100.0
-                                    ));
-                                    if final_score >= config.detection.threshold {
-                                        pending.push((
-                                            uid,
-                                            subject.clone(),
-                                            final_score,
-                                            combined_reasons.join("；"),
-                                        ));
-                                    } else {
-                                        lines.push(format!(
-                                            "略過〈{}〉（評分 {final_score}，未達門檻；Jev 機率 {:.0}%）",
-                                            subject,
-                                            prob * 100.0
-                                        ));
-                                    }
-                                }
-                                Err(error) => {
-                                    llm_consecutive_failures += 1;
-                                    lines.push(format!(
-                                        "Jev 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
-                                    ));
-                                    if score >= config.detection.threshold {
-                                        let fallback_reason = format!(
-                                            "Jev 判定失敗，退回規則評分達標（{score}分）：{}",
-                                            reasons.join("；")
-                                        );
-                                        pending.push((
-                                            uid,
-                                            subject.clone(),
-                                            score,
-                                            fallback_reason,
-                                        ));
-                                        done_uids.push(uid);
-                                    } else {
-                                        lines.push(format!(
-                                            "暫緩〈{subject}〉（評分 {score}，未達門檻；Jev 判定失敗，下輪重試）"
-                                        ));
-                                        retry_uids.push(uid);
-                                    }
-                                }
-                            }
-                        }
-                    } else if llm_consecutive_failures >= 3 {
-                        // 熔斷：本日期內已連續失敗 ≥3 次，跳過 LLM 直接採規則評分
-                        max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
-                        last_checked = Some((*date, uid, subject.clone()));
-                        if score >= config.detection.threshold {
-                            let fallback_reason = format!(
-                                "LLM 熔斷；規則評分達標（{score}分）：{}",
-                                reasons.join("；")
-                            );
-                            pending.push((uid, subject.clone(), score, fallback_reason));
-                            done_uids.push(uid);
-                        } else {
-                            // 未經 LLM 判定：列入重試，待服務恢復後重新判定
-                            lines.push(format!(
-                                "暫緩〈{subject}〉（LLM 連續失敗熔斷，規則評分 {score} 未達門檻，下輪重試）"
-                            ));
-                            retry_uids.push(uid);
-                        }
-                    } else {
-                        match llm_judge(
-                            llm_config,
-                            &from,
-                            &subject,
-                            &body,
-                            &attachments,
-                            &targets,
-                            &auth_summary,
-                            &auth_warnings,
-                        ) {
-                            Ok(verdict) => {
-                                // 成功即歸零：熔斷只針對「連續」失敗
-                                llm_consecutive_failures = 0;
-                                done_uids.push(uid);
-                                max_checked_uid =
-                                    Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
-                                last_checked = Some((*date, uid, subject.clone()));
-                                if verdict.is_phishing {
-                                    pending.push((uid, subject.clone(), score, verdict.reason));
-                                } else {
-                                    lines.push(format!(
-                                        "略過〈{}〉（評分 {score}；LLM：{}）",
-                                        subject, verdict.reason
-                                    ));
-                                }
-                            }
-                            Err(error) => {
-                                llm_consecutive_failures += 1;
-                                max_checked_uid =
-                                    Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
-                                last_checked = Some((*date, uid, subject.clone()));
-                                lines.push(format!(
-                                    "LLM 判斷失敗（{error:#}），退回規則評分判定：〈{subject}〉"
-                                ));
-                                if score >= config.detection.threshold {
-                                    let fallback_reason = format!(
-                                        "LLM 判定失敗，退回規則評分達標（{score}分）：{}",
-                                        reasons.join("；")
-                                    );
-                                    pending.push((uid, subject.clone(), score, fallback_reason));
-                                    done_uids.push(uid);
-                                } else {
-                                    lines.push(format!(
-                                        "暫緩〈{subject}〉（評分 {score}，未達門檻；LLM 判定失敗，下輪重試）"
-                                    ));
-                                    retry_uids.push(uid);
-                                }
-                            }
-                        }
-                    }
-                }
-                None => {
-                    // 未設定 LLM：GUI 不搬移，斷點照常前進（不列入重試，避免每輪重複記錄）
-                    max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
-                    last_checked = Some((*date, uid, subject.clone()));
-                }
+            max_checked_uid = Some(max_checked_uid.map_or(uid, |seen| seen.max(uid)));
+            last_checked = Some((*date, uid, subject.clone()));
+            if let Some(warning) = &ev.trust_warning {
+                lines.push(format!("注意：〈{subject}〉{warning}"));
+            }
+            let reason = format!("{}；{}", ev.llm_text, ev.rule_reasons.join("；"));
+            // GUI 未設定 LLM 時只記錄結果；CLI 與 .eml 仍採用規則判定。
+            if llm.is_some() && ev.flagged {
+                pending.push((uid, subject.clone(), ev.final_score, reason));
+                done_uids.push(uid);
+            } else if ev.retry_needed {
+                retry_uids.push(uid);
+                lines.push(format!("暫緩〈{subject}〉（{reason}，下輪重試）"));
+            } else {
+                done_uids.push(uid);
+                lines.push(format!(
+                    "略過〈{subject}〉（評分 {}；{reason}）",
+                    ev.final_score
+                ));
             }
             if used_fallback && was_unread {
                 let _ = restore_unread_status(&mut session, uid);
@@ -3224,6 +3090,49 @@ fn evaluate_eml_batch(inputs: &[PathBuf], config: &Config) -> Result<Vec<EmlRow>
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn unsaved_and_failed_settings_do_not_change_active_config() {
+        let dir = temp_test_dir("config_activation");
+        let mut active = Config::default();
+        let mut draft = active.clone();
+        draft.imap.source_mailbox = "新信箱".into();
+        draft.llm.backend = Some("claude".into());
+        draft.gui.confirm_before_move = false;
+        assert_eq!(active.imap.source_mailbox, "INBOX");
+        assert!(active.gui.confirm_before_move);
+        // 目標是資料夾，寫入必須失敗。
+        assert!(save_config(&draft, &mut active, &dir).is_err());
+        assert_eq!(active.imap.source_mailbox, "INBOX");
+        assert!(active.llm.backend.is_none());
+        assert!(active.gui.confirm_before_move);
+        let path = dir.join("config.toml");
+        save_config(&draft, &mut active, &path).unwrap();
+        assert_eq!(active.imap.source_mailbox, "新信箱");
+        assert_eq!(active.llm.backend.as_deref(), Some("claude"));
+        assert!(!active.gui.confirm_before_move);
+        let saved: Config = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved.imap.source_mailbox, active.imap.source_mailbox);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mailbox_identity_includes_account_and_server() {
+        let original = Config::default().imap;
+        assert!(same_source_mailbox(&original, &original));
+        for field in ["host", "username", "source_mailbox", "port", "protocol"] {
+            let mut changed = original.clone();
+            match field {
+                "host" => changed.host = "other.test".into(),
+                "username" => changed.username = "other".into(),
+                "source_mailbox" => changed.source_mailbox = "other".into(),
+                "port" => changed.port += 1,
+                "protocol" => changed.protocol = "starttls".into(),
+                _ => unreachable!(),
+            }
+            assert!(!same_source_mailbox(&original, &changed), "{field}");
+        }
+    }
 
     #[test]
     fn initial_view_routes_to_settings_when_config_is_invalid() {

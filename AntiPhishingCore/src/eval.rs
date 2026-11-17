@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
-use mailparse::{MailHeaderMap, parse_mail};
+use mailparse::{MailHeaderMap, ParsedMail, parse_mail};
 
 use crate::*;
 
@@ -23,6 +23,10 @@ pub struct MailEvaluation {
     pub flagged: bool,
     /// 判定依據（混合評分／LLM／規則／信任寄件者豁免）
     pub basis: &'static str,
+    /// LLM 失敗或熔斷；GUI 可據此安排重試。
+    pub retry_needed: bool,
+    /// 信任來源未獲豁免時的說明。
+    pub trust_warning: Option<String>,
 }
 
 /// 去掉 UTF-8 BOM 與 mbox 格式開頭的 `From ` 行（不是 `From:` 標頭）
@@ -70,6 +74,16 @@ pub fn evaluate_mail(
     failures: &mut u32,
 ) -> Result<MailEvaluation> {
     let mail = parse_mail(normalize_eml_bytes(bytes)).context("無法解析郵件內容")?;
+    Ok(evaluate_parsed_mail(&mail, config, llm, failures))
+}
+
+/// 共用判定流程；前端只負責搬移政策與掃描進度。
+pub fn evaluate_parsed_mail(
+    mail: &ParsedMail<'_>,
+    config: &DetectionConfig,
+    llm: &Option<LlmConfig>,
+    failures: &mut u32,
+) -> MailEvaluation {
     let from = mail.headers.get_first_value("From").unwrap_or_default();
     let subject = mail.headers.get_first_value("Subject").unwrap_or_default();
     let (body, score_body) = extract_body_text(&mail);
@@ -91,13 +105,23 @@ pub fn evaluate_mail(
         final_score: 0,
         flagged: false,
         basis: "傳統規則",
+        retry_needed: false,
+        trust_warning: None,
     };
 
     // 信任來源豁免：與 IMAP 模式共用 trust_decision（信任網域須 DMARC 通過）
-    if let TrustDecision::Exempt(matched) = trust_decision(&mail, &from, config, &auth_status) {
-        ev.llm_text = format!("未送檢（信任來源：{matched}）");
-        ev.basis = "信任寄件者豁免";
-        return Ok(ev);
+    match trust_decision(mail, &from, config, &auth_status) {
+        TrustDecision::Exempt(matched) => {
+            ev.llm_text = format!("未送檢（信任來源：{matched}）");
+            ev.basis = "信任寄件者豁免";
+            return ev;
+        }
+        TrustDecision::Rejected(matched, reason) => {
+            ev.trust_warning = Some(format!(
+                "寄件來源雖符合信任清單（{matched}），但{reason}，取消白名單豁免並送檢"
+            ));
+        }
+        TrustDecision::NotListed => {}
     }
 
     let (score, reasons) = phishing_score(
@@ -116,12 +140,13 @@ pub fn evaluate_mail(
 
     let Some(llm_config) = llm else {
         ev.llm_text = "未設定 LLM".into();
-        return Ok(ev);
+        return ev;
     };
     if *failures >= 3 {
+        ev.retry_needed = true;
         ev.llm_text = "LLM 連續失敗熔斷，採規則評分".into();
         ev.basis = "規則（LLM 熔斷）";
-        return Ok(ev);
+        return ev;
     }
     if llm_config.effective_backend() == Some(LlmBackend::Jev) {
         match llm_judge_jev(
@@ -146,6 +171,7 @@ pub fn evaluate_mail(
             }
             Err(error) => {
                 *failures += 1;
+                ev.retry_needed = true;
                 ev.llm_text = format!("Jev 判定失敗：{error:#}");
                 ev.basis = "規則（Jev 失敗）";
             }
@@ -174,12 +200,13 @@ pub fn evaluate_mail(
             }
             Err(error) => {
                 *failures += 1;
+                ev.retry_needed = true;
                 ev.llm_text = format!("LLM 判定失敗：{error:#}");
                 ev.basis = "規則（LLM 失敗）";
             }
         }
     }
-    Ok(ev)
+    ev
 }
 
 /// 讀檔並判定單一 .eml（含大小檢查）

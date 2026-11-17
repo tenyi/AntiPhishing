@@ -116,32 +116,25 @@ dependencies = [
 
 [[package]]
 name = "anti-phishing-gui"
-version = "2.8.2"
+version = "2.8.3"
 dependencies = [
  "antiphishing-core",
  "anyhow",
  "chrono",
  "eframe",
  "image",
- "imap",
  "mailparse",
- "native-tls",
  "notify-rust",
- "quick-xml",
- "regex",
  "serde",
- "serde_json",
  "single-instance",
  "toml 1.1.6+spec-1.1.0",
  "tray-icon",
- "ureq",
  "winres",
- "zip",
 ]
 
 [[package]]
 name = "antiphishing-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",

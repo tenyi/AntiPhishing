@@ -1,6 +1,6 @@
 [package]
 name = "anti-phishing"
-version = "2.7.1"
+version = "2.7.2"
 edition = "2024"
 
 [dependencies]
@@ -8,12 +8,6 @@ antiphishing-core = { path = "../AntiPhishingCore" }
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6", features = ["derive"] }
-imap = "3.0.0-alpha.15"
 mailparse = "0.16"
-native-tls = "0.2"
-regex = "1.13"
-quick-xml = "0.41"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1"
 toml = "1.1"
-ureq = { version = "3", features = ["json"] }

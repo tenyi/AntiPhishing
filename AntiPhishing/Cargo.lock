@@ -95,26 +95,20 @@ dependencies = [
 
 [[package]]
 name = "anti-phishing"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "antiphishing-core",
  "anyhow",
  "chrono",
  "clap",
- "imap",
  "mailparse",
- "native-tls",
- "quick-xml",
- "regex",
  "serde",
- "serde_json",
  "toml",
- "ureq",
 ]
 
 [[package]]
 name = "antiphishing-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",

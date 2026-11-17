@@ -618,22 +618,7 @@ pub fn llm_judge(
             )
         }
         LlmBackend::Jev => {
-            let prob = llm_judge_jev(
-                config,
-                from,
-                subject,
-                body,
-                attachments,
-                docx_targets,
-                auth_summary,
-                auth_warnings,
-            )?;
-            let is_phishing = prob >= 0.75;
-            let reason = format!("Jev 評定釣魚機率 {:.0}%", prob * 100.0);
-            Ok(LlmVerdict {
-                is_phishing,
-                reason,
-            })
+            bail!("Jev 須使用機率與規則混合評分，請呼叫 evaluate_mail 或 llm_judge_jev")
         }
     }
 }

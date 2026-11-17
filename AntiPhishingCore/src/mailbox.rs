@@ -132,6 +132,25 @@ pub fn finish_login(
         .context("IMAP 登入失敗")
 }
 
+/// 只有完整的 NO／BAD 回應代表連線仍可繼續使用；逾時或協定錯誤須結束本輪。
+pub fn imap_command_rejected(error: &imap::Error) -> bool {
+    matches!(error, imap::Error::No(_) | imap::Error::Bad(_))
+}
+
+/// 僅在伺服器明確拒絕 BODY.PEEK 時改用 RFC822，斷線後不再送第二次指令。
+pub fn fetch_message(
+    session: &mut Session<imap::Connection>,
+    uid: u32,
+) -> imap::error::Result<(imap::types::Fetches, bool)> {
+    match session.uid_fetch(uid.to_string(), "(FLAGS BODY.PEEK[])") {
+        Ok(messages) => Ok((messages, false)),
+        Err(error) if imap_command_rejected(&error) => session
+            .uid_fetch(uid.to_string(), "(FLAGS RFC822)")
+            .map(|messages| (messages, true)),
+        Err(error) => Err(error),
+    }
+}
+
 /// 判斷郵件旗標清單中是否為未讀（不含 \Seen 旗標）。
 pub fn is_message_unread(flags: &[imap::types::Flag]) -> bool {
     !flags.iter().any(|f| matches!(f, imap::types::Flag::Seen))
